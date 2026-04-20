@@ -350,7 +350,7 @@ void TrackManager::restoreTrack(const TrackInfo& trackInfo) {
     DBG("Restored track: " << trackInfo.name << " (id=" << trackInfo.id << ")");
 }
 
-TrackId TrackManager::duplicateTrack(TrackId trackId) {
+TrackId TrackManager::duplicateTrack(TrackId trackId, bool includeDevices) {
     auto it = std::find_if(tracks_.begin(), tracks_.end(),
                            [trackId](const TrackInfo& t) { return t.id == trackId; });
 
@@ -362,6 +362,11 @@ TrackId TrackManager::duplicateTrack(TrackId trackId) {
     newTrack.id = nextTrackId_++;
     newTrack.name = it->name + " Copy";
     newTrack.childIds.clear();  // Don't duplicate children references
+
+    // Content-only duplication: strip the FX chain so the duplicate starts clean.
+    if (!includeDevices) {
+        newTrack.chainElements.clear();
+    }
 
     // Reassign all device/rack/chain IDs so the duplicate gets its own
     // plugin instances in the audio engine (sharing IDs = no audio).
@@ -630,17 +635,21 @@ void TrackManager::setTrackColour(TrackId trackId, juce::Colour colour) {
     }
 }
 
-void TrackManager::setTrackVolume(TrackId trackId, float volume) {
+void TrackManager::setTrackVolume(TrackId trackId, float volume, bool fromAutomation) {
     if (auto* track = getTrack(trackId)) {
         // Allow up to +6dB gain (10^(6/20) ≈ 2.0)
         track->volume = juce::jlimit(0.0f, 2.0f, volume);
+        if (!fromAutomation)
+            track->manualVolume = track->volume;
         notifyTrackPropertyChanged(trackId);
     }
 }
 
-void TrackManager::setTrackPan(TrackId trackId, float pan) {
+void TrackManager::setTrackPan(TrackId trackId, float pan, bool fromAutomation) {
     if (auto* track = getTrack(trackId)) {
         track->pan = juce::jlimit(-1.0f, 1.0f, pan);
+        if (!fromAutomation)
+            track->manualPan = track->pan;
         notifyTrackPropertyChanged(trackId);
     }
 }
@@ -951,7 +960,8 @@ void TrackManager::removeSend(TrackId sourceTrackId, int busIndex) {
     notifyTrackDevicesChanged(sourceTrackId);
 }
 
-void TrackManager::setSendLevel(TrackId sourceTrackId, int busIndex, float level) {
+void TrackManager::setSendLevel(TrackId sourceTrackId, int busIndex, float level,
+                                bool /*fromAutomation*/) {
     auto* source = getTrack(sourceTrackId);
     if (!source) {
         return;
@@ -1781,6 +1791,14 @@ void TrackManager::notifyDeviceModifiersChanged(TrackId trackId) {
     for (size_t i = 0; i < listeners_.size(); ++i) {
         if (listeners_[i])
             listeners_[i]->deviceModifiersChanged(trackId);
+    }
+}
+
+void TrackManager::notifyAudioSidechainTriggered(TrackId sourceTrackId) {
+    ScopedNotifyGuard guard(*this);
+    for (size_t i = 0; i < listeners_.size(); ++i) {
+        if (listeners_[i])
+            listeners_[i]->audioSidechainTriggered(sourceTrackId);
     }
 }
 

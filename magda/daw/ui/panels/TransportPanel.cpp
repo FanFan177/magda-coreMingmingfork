@@ -1,9 +1,12 @@
 #include "TransportPanel.hpp"
 
+#include "../../audio/QwertyMidiKeyboard.hpp"
+#include "../components/common/QwertyKeyboardPopup.hpp"
 #include "../themes/DarkTheme.hpp"
 #include "../themes/FontManager.hpp"
 #include "../themes/SmallButtonLookAndFeel.hpp"
 #include "BinaryData.h"
+#include "core/StringTable.hpp"
 
 namespace magda {
 
@@ -13,7 +16,7 @@ TransportPanel::TransportPanel() {
     setupTempoAndQuantize();
 
     // CPU usage — title label + value label stacked
-    cpuTitleLabel = std::make_unique<juce::Label>("cpuTitle", "CPU");
+    cpuTitleLabel = std::make_unique<juce::Label>("cpuTitle", tr("transport.cpu.cpu"));
     cpuTitleLabel->setColour(juce::Label::textColourId,
                              DarkTheme::getColour(DarkTheme::TEXT_SECONDARY));
     cpuTitleLabel->setFont(FontManager::getInstance().getUIFont(8.0f));
@@ -26,6 +29,16 @@ TransportPanel::TransportPanel() {
     cpuValueLabel->setFont(FontManager::getInstance().getMonoFont(11.0f));
     cpuValueLabel->setJustificationType(juce::Justification::centred);
     addAndMakeVisible(*cpuValueLabel);
+
+    // Automation write indicator label — purple text, visible only when write mode on
+    automationWriteLabel = std::make_unique<juce::Label>("automationWrite", "AUTOMATION WRITE");
+    automationWriteLabel->setColour(juce::Label::textColourId,
+                                    DarkTheme::getColour(DarkTheme::ACCENT_PURPLE));
+    automationWriteLabel->setColour(juce::Label::backgroundColourId,
+                                    juce::Colours::transparentBlack);
+    automationWriteLabel->setFont(FontManager::getInstance().getUIFont(10.0f).boldened());
+    automationWriteLabel->setJustificationType(juce::Justification::centredRight);
+    addChildComponent(*automationWriteLabel);
 }
 
 TransportPanel::~TransportPanel() {
@@ -87,8 +100,9 @@ void TransportPanel::paint(juce::Graphics& g) {
     drawGroupWrapper(autoGridButton->getBounds().getUnion(snapButton->getBounds()), "",
                      DarkTheme::getColour(DarkTheme::ACCENT_PURPLE));
 
-    // CPU frame — rounded rectangle matching transport group wrapper style
-    {
+    // CPU frame — rounded rectangle matching transport group wrapper style.
+    // Skipped entirely when the panel is too narrow to host the meter.
+    if (cpuVisible_) {
         auto cpuArea = getCpuArea().reduced(4, 3);
         auto frameBounds = cpuArea.toFloat();
         g.setColour(DarkTheme::getColour(DarkTheme::SURFACE));
@@ -135,9 +149,25 @@ void TransportPanel::paint(juce::Graphics& g) {
 void TransportPanel::resized() {
     auto transportArea = getTransportControlsArea();
     auto timeArea = getTimeDisplayArea();
+
+    // Decide whether the CPU meter fits before any area that depends on
+    // getCpuArea() is computed. It reserves 70px on the right when visible;
+    // we hide it entirely (and reclaim that slot) once the grid-quantize
+    // cluster on the left would otherwise overlap it.
+    {
+        const int fixedLeftWidth = getTransportControlsArea().getWidth() + 106 + 440;
+        const int gridMinWidth = 6 + 30 + 4 + 44;  // pad + numDen + gap + btn
+        const int cpuWidth = 70;
+        const int minGap = 8;
+        cpuVisible_ = getWidth() >= fixedLeftWidth + gridMinWidth + minGap + cpuWidth;
+    }
+    cpuTitleLabel->setVisible(cpuVisible_);
+    cpuValueLabel->setVisible(cpuVisible_);
+
     auto tempoArea = getTempoQuantizeArea();
 
-    // Transport controls layout — order: Home, Prev, Next, Play, Stop, Rec, Loop, BackToArr
+    // Transport controls layout — order: Home, Prev, Next, Play, Stop, Rec, AutoWrite, Loop,
+    // BackToArr
     auto buttonMargin = 3;
     auto buttonSize = transportArea.getHeight() - buttonMargin * 2;
     auto buttonY = buttonMargin;
@@ -161,6 +191,9 @@ void TransportPanel::resized() {
     x += buttonSize + buttonSpacing;
 
     recordButton->setBounds(x, buttonY, buttonSize, buttonSize);
+    x += buttonSize + buttonSpacing;
+
+    automationWriteButton->setBounds(x, buttonY, buttonSize, buttonSize);
     x += buttonSize + buttonSpacing;
 
     loopButton->setBounds(x, buttonY, buttonSize, buttonSize);
@@ -258,19 +291,46 @@ void TransportPanel::resized() {
     gridSlashLabel->setBounds(0, 0, 0, 0);
     gridSlashLabel->setVisible(false);
 
+    // QWERTY keyboard toggle — just left of CPU (or the panel's right edge
+    // when CPU is hidden). Hidden itself when the window is narrow enough
+    // that it would overlap the grid-quantize cluster on the left.
+    auto cpuBounds = getCpuArea();
+    const int rightAnchor = cpuVisible_ ? cpuBounds.getX() : getWidth();
+    const int qwertyX = rightAnchor - buttonSize - 4;
+    const int gridRight = gridBtnX + btnWidth;
+    const int minGapToQwerty = 8;
+    const bool qwertyFits = qwertyX >= gridRight + minGapToQwerty;
+
+    qwertyKeyboardButton->setVisible(qwertyFits);
+    if (qwertyFits) {
+        qwertyKeyboardButton->setBounds(qwertyX, buttonY, buttonSize, buttonSize);
+    }
+
+    // Automation write indicator — fills whatever gap is left between the grid
+    // quantize cluster and whichever right-side control is currently visible.
+    // Only shown while write mode is actually on.
+    const int autoWriteLeft = gridRight + minGapToQwerty;
+    const int autoWriteRight = (qwertyFits ? qwertyX : rightAnchor) - 4;
+    const bool autoWriteFits = autoWriteRight > autoWriteLeft;
+    automationWriteLabel->setVisible(isAutomationWriteEnabled && autoWriteFits);
+    if (autoWriteFits) {
+        automationWriteLabel->setBounds(autoWriteLeft, 0, autoWriteRight - autoWriteLeft,
+                                        getHeight());
+    }
+
     // CPU usage — rounded frame: header (20%) + value
-    auto cpuArea = getCpuArea().reduced(4, 3);
+    auto cpuArea = cpuBounds.reduced(4, 3);
     int headerHeight = juce::roundToInt(cpuArea.getHeight() * 0.20f);
     cpuTitleLabel->setBounds(cpuArea.removeFromTop(headerHeight));
     cpuValueLabel->setBounds(cpuArea);
 }
 
 juce::Rectangle<int> TransportPanel::getTransportControlsArea() const {
-    // 8 square buttons + punch stacked box (boxWidth=130)
+    // 9 square buttons + punch stacked box (boxWidth=130)
     int buttonSize = getHeight() - 6;
     int boxWidth = 130;
-    // 6px left pad + 8 buttons + 7*1px spacing + 3px gap + punch box + 6px right pad
-    int width = 6 + 8 * buttonSize + 7 + 3 + boxWidth + 6;
+    // 6px left pad + 9 buttons + 8*1px spacing + 3px gap + punch box + 6px right pad
+    int width = 6 + 9 * buttonSize + 8 + 3 + boxWidth + 6;
     return getLocalBounds().removeFromLeft(width);
 }
 
@@ -294,6 +354,8 @@ juce::Rectangle<int> TransportPanel::getTempoQuantizeArea() const {
 }
 
 juce::Rectangle<int> TransportPanel::getCpuArea() const {
+    if (!cpuVisible_)
+        return {};
     return getLocalBounds().removeFromRight(70);
 }
 
@@ -336,6 +398,16 @@ void TransportPanel::setupTransportButtons() {
         isRecording = false;
         playButton->setActive(false);
         recordButton->setActive(false);
+        // Pressing stop also disarms automation write mode, matching the
+        // transport-centric mental model (stop = end of pass).
+        if (isAutomationWriteEnabled) {
+            isAutomationWriteEnabled = false;
+            automationWriteButton->setActive(false);
+            if (automationWriteLabel)
+                automationWriteLabel->setVisible(false);
+            if (onAutomationWriteToggle)
+                onAutomationWriteToggle(false);
+        }
         if (onStop)
             onStop();
         repaint();
@@ -355,6 +427,25 @@ void TransportPanel::setupTransportButtons() {
         repaint();
     };
     addAndMakeVisible(*recordButton);
+
+    // Automation Write button — purple when enabled (write mode),
+    // grey when disabled. Matches the purple automation accent used on
+    // lane headers and control tints.
+    automationWriteButton = std::make_unique<SvgButton>(
+        "Automation Write", BinaryData::automation_off_svg, BinaryData::automation_off_svgSize,
+        BinaryData::automation_on_svg, BinaryData::automation_on_svgSize);
+    styleTransportButton(*automationWriteButton, DarkTheme::getColour(DarkTheme::ACCENT_PURPLE));
+    automationWriteButton->setActive(false);
+    automationWriteButton->onClick = [this]() {
+        isAutomationWriteEnabled = !isAutomationWriteEnabled;
+        automationWriteButton->setActive(isAutomationWriteEnabled);
+        if (automationWriteLabel)
+            automationWriteLabel->setVisible(isAutomationWriteEnabled);
+        if (onAutomationWriteToggle)
+            onAutomationWriteToggle(isAutomationWriteEnabled);
+        repaint();
+    };
+    addAndMakeVisible(*automationWriteButton);
 
     // Pause button
     pauseButton = std::make_unique<SvgButton>(
@@ -422,6 +513,19 @@ void TransportPanel::setupTransportButtons() {
             onBackToArrangement();
     };
     addAndMakeVisible(*backToArrangementButton);
+
+    // QWERTY MIDI keyboard toggle
+    qwertyKeyboardButton = std::make_unique<SvgButton>(
+        "QwertyKeyboard", BinaryData::midi_qwerty_off_svg, BinaryData::midi_qwerty_off_svgSize,
+        BinaryData::midi_qwerty_on_svg, BinaryData::midi_qwerty_on_svgSize);
+    qwertyKeyboardButton->onClick = [this]() {
+        bool active = !qwertyKeyboardButton->isActive();
+        qwertyKeyboardButton->setActive(active);
+        if (onQwertyKeyboardToggled)
+            onQwertyKeyboardToggled(active);
+    };
+    qwertyKeyboardButton->addMouseListener(this, false);
+    addAndMakeVisible(*qwertyKeyboardButton);
 
     // Punch In button (dual-icon: off/on)
     punchInButton =
@@ -937,6 +1041,20 @@ void TransportPanel::setTempo(double bpm) {
     setPunchRegion(cachedPunchStart, cachedPunchEnd, cachedPunchInEnabled, cachedPunchOutEnabled);
 }
 
+void TransportPanel::setAutomationWriteEnabled(bool enabled) {
+    if (isAutomationWriteEnabled != enabled) {
+        isAutomationWriteEnabled = enabled;
+        automationWriteButton->setActive(isAutomationWriteEnabled);
+        if (automationWriteLabel)
+            automationWriteLabel->setVisible(isAutomationWriteEnabled);
+    }
+}
+
+void TransportPanel::setQwertyKeyboardEnabled(bool enabled) {
+    if (qwertyKeyboardButton)
+        qwertyKeyboardButton->setActive(enabled);
+}
+
 void TransportPanel::setPlaybackState(bool playing) {
     if (isPlaying != playing) {
         DBG("[TransportPanel] setPlaybackState: " << (int)isPlaying << " -> " << (int)playing);
@@ -1042,22 +1160,25 @@ void TransportPanel::setAudioDeviceInfo(const juce::String& deviceName, double s
 void TransportPanel::updateCpuTooltip() {
     juce::String tip;
     if (audioDeviceName_.isNotEmpty())
-        tip << "Device: " << audioDeviceName_ << "\n";
+        tip << tr("transport.cpu.device") << ": " << audioDeviceName_ << "\n";
     if (audioSampleRate_ > 0)
-        tip << "Sample rate: " << juce::String(audioSampleRate_ / 1000.0, 1) << " kHz\n";
+        tip << tr("transport.cpu.sample_rate") << ": " << juce::String(audioSampleRate_ / 1000.0, 1)
+            << " kHz\n";
     if (audioBufferSize_ > 0) {
         double latencyMs =
             (audioSampleRate_ > 0) ? (audioBufferSize_ / audioSampleRate_) * 1000.0 : 0.0;
-        tip << "Buffer: " << audioBufferSize_ << " samples";
+        tip << tr("transport.cpu.buffer") << ": " << audioBufferSize_ << " samples";
         if (latencyMs > 0)
             tip << " (" << juce::String(latencyMs, 1) << " ms)";
         tip << "\n";
     }
-    tip << "CPU: " << juce::String(juce::roundToInt(currentCpuUsage * 100.0f)) << "%";
+    tip << tr("transport.cpu.cpu") << ": "
+        << juce::String(juce::roundToInt(currentCpuUsage * 100.0f)) << "%";
     if (peakCpuUsage > currentCpuUsage + 0.02f)
-        tip << " (peak " << juce::String(juce::roundToInt(peakCpuUsage * 100.0f)) << "%)";
+        tip << " (" << tr("transport.cpu.peak") << " "
+            << juce::String(juce::roundToInt(peakCpuUsage * 100.0f)) << "%)";
     if (currentXrunCount_ > 0)
-        tip << "\nXruns: " << currentXrunCount_;
+        tip << "\n" << tr("transport.cpu.xruns") << ": " << currentXrunCount_;
     tip = tip.trimEnd();
 
     if (tip == lastTooltip_)
@@ -1073,16 +1194,28 @@ void TransportPanel::updateCpuTooltip() {
 void TransportPanel::mouseDown(const juce::MouseEvent& e) {
     if (e.originalComponent == metronomeButton.get() && e.mods.isRightButtonDown()) {
         showCountInMenu();
+    } else if (e.originalComponent == qwertyKeyboardButton.get() && e.mods.isRightButtonDown() &&
+               qwertyKeyboard_ != nullptr) {
+        // TODO: CallOutBox steals keyboard focus, which silences the
+        // QwertyMidiKeyboard key listener while the popup is visible. The
+        // popup's own setWantsKeyboardFocus(false) + addKeyListener(keyboard_)
+        // don't restore routing — a proper fix probably needs a non-modal
+        // floating window instead of a CallOutBox. For now the popup is
+        // effectively a static layout reference; live key highlighting won't
+        // update while it's open.
+        auto popup = std::make_unique<QwertyKeyboardPopup>(*qwertyKeyboard_);
+        auto area = qwertyKeyboardButton->getScreenBounds();
+        juce::CallOutBox::launchAsynchronously(std::move(popup), area, nullptr);
     }
 }
 
 void TransportPanel::showCountInMenu() {
     juce::PopupMenu menu;
-    menu.addItem(1, "Off", true, countInMode_ == 0);
-    menu.addItem(5, "1 Beat", true, countInMode_ == 4);
-    menu.addItem(4, "2 Beats", true, countInMode_ == 3);
-    menu.addItem(2, "1 Bar", true, countInMode_ == 1);
-    menu.addItem(3, "2 Bars", true, countInMode_ == 2);
+    menu.addItem(1, tr("transport.count_in.off"), true, countInMode_ == 0);
+    menu.addItem(5, tr("transport.count_in.1_beat"), true, countInMode_ == 4);
+    menu.addItem(4, tr("transport.count_in.2_beats"), true, countInMode_ == 3);
+    menu.addItem(2, tr("transport.count_in.1_bar"), true, countInMode_ == 1);
+    menu.addItem(3, tr("transport.count_in.2_bars"), true, countInMode_ == 2);
 
     menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(metronomeButton.get()),
                        [this](int result) {

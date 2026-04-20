@@ -263,6 +263,20 @@ class Config {
         browserFavorites = paths;
     }
 
+    // Auto-update check
+    bool getAutoCheckUpdates() const {
+        return autoCheckUpdates;
+    }
+    void setAutoCheckUpdates(bool enabled) {
+        autoCheckUpdates = enabled;
+    }
+    int64_t getLastUpdateCheckTimestamp() const {
+        return lastUpdateCheckTimestamp;
+    }
+    void setLastUpdateCheckTimestamp(int64_t ms) {
+        lastUpdateCheckTimestamp = ms;
+    }
+
     // Browser filter settings
     bool getBrowserFilterAudio() const {
         return browserFilterAudio;
@@ -557,6 +571,14 @@ class Config {
         previewOutputChannel = channel;
     }
 
+    // Language / Localization
+    std::string getLanguage() const {
+        return language;
+    }
+    void setLanguage(const std::string& lang) {
+        language = lang;
+    }
+
     // Auto-save Configuration
     bool getAutoSaveEnabled() const {
         return autoSaveEnabled;
@@ -663,6 +685,10 @@ class Config {
     std::vector<std::string> browserFavorites;
     std::string browserDefaultDirectory = "";  // empty = user home
 
+    // Auto-update check
+    bool autoCheckUpdates = true;          // Check GitHub for newer releases on startup
+    int64_t lastUpdateCheckTimestamp = 0;  // ms since epoch; rate-limit at 24h
+
     // Export audio settings
     std::string exportFormat = "WAV24";  // WAV16, WAV24, WAV32, FLAC
     double exportSampleRate = 48000.0;   // 44100, 48000, 96000, 192000
@@ -682,6 +708,9 @@ class Config {
     std::string preferredOutputDevice = "";  // Preferred output device (empty = system default)
     int preferredInputChannels = 0;   // Preferred input channel count (0 = use device default)
     int preferredOutputChannels = 0;  // Preferred output channel count (0 = use device default)
+
+    // Language
+    std::string language = "en";  // Language code, matches lang/<code>.json
 
     // AI settings
     std::string aiPreset = "local_embedded";

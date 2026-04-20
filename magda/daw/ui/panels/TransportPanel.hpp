@@ -10,6 +10,8 @@
 
 namespace magda {
 
+class QwertyMidiKeyboard;
+
 class TransportPanel : public juce::Component {
   public:
     TransportPanel();
@@ -30,6 +32,7 @@ class TransportPanel : public juce::Component {
     std::function<void(bool)> onSnapToggle;
     std::function<void(int, int)> onTimeSignatureChange;
     std::function<void(bool, int, int)> onGridQuantizeChange;  // (autoGrid, numerator, denominator)
+    std::function<void(bool)> onAutomationWriteToggle;
 
     // Navigation callbacks
     std::function<void()> onGoHome;
@@ -56,6 +59,17 @@ class TransportPanel : public juce::Component {
     void setGridQuantize(bool autoGrid, int numerator, int denominator, bool isBars = false);
     void setPunchRegion(double startTime, double endTime, bool punchInEnabled,
                         bool punchOutEnabled);
+
+    void setAutomationWriteEnabled(bool enabled);
+    void setQwertyKeyboardEnabled(bool enabled);
+
+    /** Handed in from MainWindow so right-clicking the QWERTY toggle can pop
+     *  up the interactive keyboard layout hint. */
+    void setQwertyKeyboard(QwertyMidiKeyboard* keyboard) {
+        qwertyKeyboard_ = keyboard;
+    }
+
+    std::function<void(bool)> onQwertyKeyboardToggled;
 
     void mouseDown(const juce::MouseEvent& e) override;
 
@@ -87,11 +101,19 @@ class TransportPanel : public juce::Component {
     std::unique_ptr<SvgButton> prevButton;
     std::unique_ptr<SvgButton> nextButton;
 
+    // Automation write button
+    std::unique_ptr<SvgButton> automationWriteButton;
+    std::unique_ptr<juce::Label> automationWriteLabel;
+
     // Loop button
     std::unique_ptr<SvgButton> loopButton;
 
     // Back to arrangement button
     std::unique_ptr<SvgButton> backToArrangementButton;
+
+    // QWERTY MIDI keyboard toggle
+    std::unique_ptr<SvgButton> qwertyKeyboardButton;
+    QwertyMidiKeyboard* qwertyKeyboard_ = nullptr;  // owned by MainWindow
 
     // Punch in/out button
     std::unique_ptr<SvgButton> punchInButton;
@@ -137,6 +159,11 @@ class TransportPanel : public juce::Component {
     juce::Rectangle<int> getTempoQuantizeArea() const;
     juce::Rectangle<int> getCpuArea() const;
 
+    // CPU meter is hidden (and its right-edge slot reclaimed) when the panel
+    // is too narrow to fit it without overlapping the grid-quantize cluster.
+    // Updated in resized() before any area-dependent layout runs.
+    bool cpuVisible_ = true;
+
     // Button styling
     void styleTransportButton(SvgButton& button, juce::Colour accentColor);
     void setupTransportButtons();
@@ -149,6 +176,7 @@ class TransportPanel : public juce::Component {
     bool isRecording = false;
     bool isPaused = false;
     bool isLooping = false;
+    bool isAutomationWriteEnabled = false;
     bool isSnapEnabled = true;
     bool isAutoGrid = true;
     int gridNumerator = 1;

@@ -16,6 +16,7 @@
 #include "../themes/DarkTheme.hpp"
 #include "../themes/FontManager.hpp"
 #include "core/SelectionManager.hpp"
+#include "core/StringTable.hpp"
 #include "core/TrackCommands.hpp"
 #include "core/TrackPropertyCommands.hpp"
 #include "core/UndoManager.hpp"
@@ -228,7 +229,8 @@ void MixerView::ChannelStrip::updateFromTrack(const TrackInfo& track) {
         repaint();
 
     if (trackLabel) {
-        trackLabel->setText(isMaster_ ? "Master" : track.name, juce::dontSendNotification);
+        trackLabel->setText(isMaster_ ? tr("common.master") : track.name,
+                            juce::dontSendNotification);
     }
     if (volumeSlider && !volumeSlider->isBeingDragged()) {
         float db = gainToDb(track.volume);
@@ -310,7 +312,7 @@ void MixerView::ChannelStrip::updateFromTrack(const TrackInfo& track) {
 void MixerView::ChannelStrip::setupControls() {
     // Track label
     trackLabel = std::make_unique<juce::Label>();
-    trackLabel->setText(isMaster_ ? "Master" : trackName_, juce::dontSendNotification);
+    trackLabel->setText(isMaster_ ? tr("common.master") : trackName_, juce::dontSendNotification);
     trackLabel->setJustificationType(juce::Justification::centred);
     trackLabel->setColour(juce::Label::textColourId, DarkTheme::getColour(DarkTheme::TEXT_PRIMARY));
     trackLabel->setColour(juce::Label::backgroundColourId, juce::Colours::transparentBlack);
@@ -328,6 +330,12 @@ void MixerView::ChannelStrip::setupControls() {
         UndoManager::getInstance().executeCommand(
             std::make_unique<SetTrackPanCommand>(trackId_, static_cast<float>(val)));
     };
+    if (!isMaster_) {
+        AutomationTarget panTarget;
+        panTarget.type = AutomationTargetType::TrackPan;
+        panTarget.trackId = trackId_;
+        panSlider->setAutomationTarget(panTarget);
+    }
     addAndMakeVisible(*panSlider);
 
     // Level meter
@@ -378,6 +386,12 @@ void MixerView::ChannelStrip::setupControls() {
         UndoManager::getInstance().executeCommand(
             std::make_unique<SetTrackVolumeCommand>(trackId_, gain));
     };
+    if (!isMaster_) {
+        AutomationTarget volTarget;
+        volTarget.type = AutomationTargetType::TrackVolume;
+        volTarget.trackId = trackId_;
+        volumeSlider->setAutomationTarget(volTarget);
+    }
     addAndMakeVisible(*volumeSlider);
 
     // Mute button (square corners, compact)
@@ -1278,11 +1292,25 @@ MixerView::MixerView(AudioEngine* audioEngine) : audioEngine_(audioEngine) {
     // debugPanel_->onMetricsChanged = [this]() { rebuildChannelStrips(); };
     // addAndMakeVisible(*debugPanel_);
 
+    // Listen for MIDI device list changes
+    if (audioEngine_) {
+        if (auto* mb = audioEngine_->getMidiBridge())
+            mb->addMidiDeviceListListener(this);
+    }
+
     // Start timer for meter animation (30fps)
     startTimer(33);
 }
 
+void MixerView::midiDeviceListChanged() {
+    juce::MessageManager::callAsync([this]() { tracksChanged(); });
+}
+
 MixerView::~MixerView() {
+    if (audioEngine_) {
+        if (auto* mb = audioEngine_->getMidiBridge())
+            mb->removeMidiDeviceListListener(this);
+    }
     stopTimer();
     TrackManager::getInstance().removeListener(this);
     ViewModeController::getInstance().removeListener(this);

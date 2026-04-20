@@ -1,5 +1,6 @@
 #include "../../core/ClipCommands.hpp"
 #include "../../core/ClipManager.hpp"
+#include "../../core/UpdateChecker.hpp"
 #include "../dialogs/AISettingsDialog.hpp"
 #include "../dialogs/AboutDialog.hpp"
 #include "../dialogs/AudioSettingsDialog.hpp"
@@ -15,6 +16,7 @@
 #include "MainWindow.hpp"
 #include "MenuManager.hpp"
 #include "core/Config.hpp"
+#include "core/StringTable.hpp"
 #include "core/TrackCommands.hpp"
 #include "core/TrackManager.hpp"
 #include "core/TrackPropertyCommands.hpp"
@@ -23,6 +25,47 @@
 #include "project/ProjectManager.hpp"
 
 namespace magda {
+
+void MainWindow::openProjectFile(const juce::File& file) {
+    if (!file.existsAsFile())
+        return;
+
+    if (mainComponent)
+        mainComponent->showLoadingMessage(tr("dialogs.loading_project"));
+
+    SelectionManager::getInstance().clearSelection();
+    if (mainComponent && mainComponent->mainView)
+        mainComponent->mainView->getTimelineController().dispatch(ClearTimeSelectionEvent{});
+
+    auto& projectManager = ProjectManager::getInstance();
+    auto safeThis = juce::Component::SafePointer<MainWindow>(this);
+    projectManager.loadProjectAsync(
+        file,
+        [safeThis](const ProjectInfo& info) {
+            if (!safeThis || !safeThis->mainComponent || !safeThis->mainComponent->mainView)
+                return;
+            auto& tc = safeThis->mainComponent->mainView->getTimelineController();
+            tc.restoreProjectState(info.tempo, info.timeSignatureNumerator,
+                                   info.timeSignatureDenominator, info.loopEnabled,
+                                   info.loopStartBeats, info.loopEndBeats);
+        },
+        [safeThis, file](bool success, const juce::String& error) {
+            if (!safeThis)
+                return;
+            if (safeThis->mainComponent)
+                safeThis->mainComponent->hideLoadingMessage();
+
+            if (!success) {
+                juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::WarningIcon,
+                                                       tr("dialogs.open_project"), error);
+            } else {
+                auto& config = Config::getInstance();
+                config.addRecentProject(file.getFullPathName().toStdString());
+                config.save();
+                MenuManager::getInstance().menuItemsChanged();
+            }
+        });
+}
 
 // ============================================================================
 // Menu Callbacks Implementation
@@ -38,13 +81,13 @@ void MainWindow::setupMenuCallbacks() {
             mainComponent->mainView->getTimelineController().dispatch(ClearTimeSelectionEvent{});
         auto& projectManager = ProjectManager::getInstance();
         if (!projectManager.newProject()) {
-            auto message = juce::String("Could not create new project.");
+            auto message = tr("dialogs.error.new_project");
             const auto lastError = projectManager.getLastError();
             if (lastError.isNotEmpty())
                 message += juce::String("\n\n") + lastError;
 
-            juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::WarningIcon, "New Project",
-                                                   message);
+            juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::WarningIcon,
+                                                   tr("dialogs.new_project"), message);
         } else {
             // Reset timeline/transport to defaults
             if (mainComponent && mainComponent->mainView) {
@@ -65,8 +108,8 @@ void MainWindow::setupMenuCallbacks() {
             return;
 
         fileChooser_ = std::make_unique<juce::FileChooser>(
-            "Open Project", juce::File::getSpecialLocation(juce::File::userDocumentsDirectory),
-            "*.mgd", true);
+            tr("dialogs.open_project"),
+            juce::File::getSpecialLocation(juce::File::userDocumentsDirectory), "*.mgd", true);
 
         auto flags =
             juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles;
@@ -78,85 +121,20 @@ void MainWindow::setupMenuCallbacks() {
             if (!file.existsAsFile())
                 return;  // User cancelled
 
-            // Show loading overlay
-            if (mainComponent)
-                mainComponent->showLoadingMessage("Loading project...");
-
-            SelectionManager::getInstance().clearSelection();
-            if (mainComponent && mainComponent->mainView)
-                mainComponent->mainView->getTimelineController().dispatch(
-                    ClearTimeSelectionEvent{});
-            auto& projectManager = ProjectManager::getInstance();
-            projectManager.loadProjectAsync(
-                file,
-                // onBeforeCommit: set tempo/time sig/loop on the audio engine BEFORE
-                // clips are committed, so clip sync uses the correct BPM.
-                [this](const ProjectInfo& info) {
-                    if (mainComponent && mainComponent->mainView) {
-                        auto& tc = mainComponent->mainView->getTimelineController();
-                        tc.restoreProjectState(info.tempo, info.timeSignatureNumerator,
-                                               info.timeSignatureDenominator, info.loopEnabled,
-                                               info.loopStartBeats, info.loopEndBeats);
-                    }
-                },
-                [this, file](bool success, const juce::String& error) {
-                    // Hide loading overlay
-                    if (mainComponent)
-                        mainComponent->hideLoadingMessage();
-
-                    if (!success) {
-                        juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::WarningIcon,
-                                                               "Open Project", error);
-                    } else {
-                        auto& config = Config::getInstance();
-                        config.addRecentProject(file.getFullPathName().toStdString());
-                        config.save();
-                        MenuManager::getInstance().menuItemsChanged();
-                    }
-                });
+            openProjectFile(file);
         });
     };
 
     callbacks.onOpenRecentProject = [this](const juce::String& path) {
         juce::File file(path);
         if (!file.existsAsFile()) {
-            juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::WarningIcon, "Open Recent",
-                                                   "Project file not found:\n" + path);
+            juce::AlertWindow::showMessageBoxAsync(
+                juce::AlertWindow::WarningIcon, tr("dialogs.open_project"),
+                tr("dialogs.error.file_not_found") + "\n" + path);
             return;
         }
 
-        if (mainComponent)
-            mainComponent->showLoadingMessage("Loading project...");
-
-        SelectionManager::getInstance().clearSelection();
-        if (mainComponent && mainComponent->mainView)
-            mainComponent->mainView->getTimelineController().dispatch(ClearTimeSelectionEvent{});
-
-        auto& projectManager = ProjectManager::getInstance();
-        projectManager.loadProjectAsync(
-            file,
-            [this](const ProjectInfo& info) {
-                if (mainComponent && mainComponent->mainView) {
-                    auto& tc = mainComponent->mainView->getTimelineController();
-                    tc.restoreProjectState(info.tempo, info.timeSignatureNumerator,
-                                           info.timeSignatureDenominator, info.loopEnabled,
-                                           info.loopStartBeats, info.loopEndBeats);
-                }
-            },
-            [this, file](bool success, const juce::String& error) {
-                if (mainComponent)
-                    mainComponent->hideLoadingMessage();
-
-                if (!success) {
-                    juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::WarningIcon,
-                                                           "Open Recent", error);
-                } else {
-                    auto& config = Config::getInstance();
-                    config.addRecentProject(file.getFullPathName().toStdString());
-                    config.save();
-                    MenuManager::getInstance().menuItemsChanged();
-                }
-            });
+        openProjectFile(file);
     };
 
     callbacks.onCloseProject = [this]() {
@@ -165,9 +143,9 @@ void MainWindow::setupMenuCallbacks() {
             mainComponent->mainView->getTimelineController().dispatch(ClearTimeSelectionEvent{});
         auto& projectManager = ProjectManager::getInstance();
         if (!projectManager.closeProject()) {
-            juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::WarningIcon, "Close Project",
-                                                   "Failed to close project: " +
-                                                       projectManager.getLastError());
+            juce::AlertWindow::showMessageBoxAsync(
+                juce::AlertWindow::WarningIcon, tr("dialogs.close_project"),
+                tr("dialogs.error.close_failed") + " " + projectManager.getLastError());
         } else {
             // Reset timeline/transport to defaults
             if (mainComponent && mainComponent->mainView) {
@@ -193,8 +171,8 @@ void MainWindow::setupMenuCallbacks() {
 
             auto initialDir = juce::File::getSpecialLocation(juce::File::userDocumentsDirectory);
 
-            fileChooser_ =
-                std::make_unique<juce::FileChooser>("Save Project As", initialDir, "*.mgd", true);
+            fileChooser_ = std::make_unique<juce::FileChooser>(tr("dialogs.save_project_as"),
+                                                               initialDir, "*.mgd", true);
 
             auto flags = juce::FileBrowserComponent::saveMode |
                          juce::FileBrowserComponent::canSelectFiles |
@@ -215,8 +193,8 @@ void MainWindow::setupMenuCallbacks() {
                 auto& projectManager = ProjectManager::getInstance();
                 if (!projectManager.saveProjectAs(file)) {
                     juce::AlertWindow::showMessageBoxAsync(
-                        juce::AlertWindow::WarningIcon, "Save Project As",
-                        "Failed to save project: " + projectManager.getLastError());
+                        juce::AlertWindow::WarningIcon, tr("dialogs.save_project_as"),
+                        tr("dialogs.error.save_failed") + " " + projectManager.getLastError());
                 } else {
                     // Use actual saved path (saveProjectAs may wrap in subdirectory)
                     auto& config = Config::getInstance();
@@ -231,9 +209,9 @@ void MainWindow::setupMenuCallbacks() {
 
         // File path exists, just save
         if (!projectManager.saveProject()) {
-            juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::WarningIcon, "Save Project",
-                                                   "Failed to save project: " +
-                                                       projectManager.getLastError());
+            juce::AlertWindow::showMessageBoxAsync(
+                juce::AlertWindow::WarningIcon, tr("dialogs.save_project"),
+                tr("dialogs.error.save_failed") + " " + projectManager.getLastError());
         }
     };
 
@@ -248,8 +226,8 @@ void MainWindow::setupMenuCallbacks() {
                               ? currentFile.getParentDirectory()
                               : juce::File::getSpecialLocation(juce::File::userDocumentsDirectory);
 
-        fileChooser_ =
-            std::make_unique<juce::FileChooser>("Save Project As", initialDir, "*.mgd", true);
+        fileChooser_ = std::make_unique<juce::FileChooser>(tr("dialogs.save_project_as"),
+                                                           initialDir, "*.mgd", true);
 
         auto flags = juce::FileBrowserComponent::saveMode |
                      juce::FileBrowserComponent::canSelectFiles |
@@ -293,7 +271,7 @@ void MainWindow::setupMenuCallbacks() {
 
         // Create file chooser for audio files
         fileChooser_ = std::make_unique<juce::FileChooser>(
-            "Select Audio Files to Import",
+            tr("dialogs.import_audio"),
             juce::File::getSpecialLocation(juce::File::userMusicDirectory),
             "*.wav;*.aiff;*.aif;*.mp3;*.ogg;*.flac",  // Supported formats
             true,                                     // use native dialog
@@ -324,9 +302,9 @@ void MainWindow::setupMenuCallbacks() {
             }
 
             if (targetTrackId == INVALID_TRACK_ID) {
-                juce::AlertWindow::showMessageBoxAsync(
-                    juce::AlertWindow::WarningIcon, "Import Audio",
-                    "No audio track found. Please create an audio track first.");
+                juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::WarningIcon,
+                                                       tr("dialogs.import_audio"),
+                                                       tr("dialogs.error.no_audio_track"));
                 return;
             }
 
@@ -362,14 +340,13 @@ void MainWindow::setupMenuCallbacks() {
 
             if (numImported > 0) {
                 juce::String message =
-                    juce::String(numImported) + " audio file(s) imported successfully.";
-                juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::InfoIcon, "Import Audio",
-                                                       message);
+                    juce::String(numImported) + " " + tr("dialogs.success.import");
+                juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::InfoIcon,
+                                                       tr("dialogs.import_audio"), message);
             } else {
-                juce::AlertWindow::showMessageBoxAsync(
-                    juce::AlertWindow::WarningIcon, "Import Audio",
-                    "No valid audio files could be imported. The selected files may be "
-                    "unsupported or corrupt.");
+                juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::WarningIcon,
+                                                       tr("dialogs.import_audio"),
+                                                       tr("dialogs.error.import_failed"));
             }
 
             fileChooser_.reset();
@@ -384,8 +361,9 @@ void MainWindow::setupMenuCallbacks() {
 
         auto* engine = dynamic_cast<TracktionEngineWrapper*>(mainComponent->getAudioEngine());
         if (!engine || !engine->getEdit()) {
-            juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::WarningIcon, "Export Audio",
-                                                   "Cannot export: no Edit loaded");
+            juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::WarningIcon,
+                                                   tr("dialogs.export_audio"),
+                                                   tr("dialogs.error.export_no_edit"));
             return;
         }
 
@@ -693,7 +671,19 @@ void MainWindow::setupMenuCallbacks() {
     callbacks.onDuplicateTrackNoContent = []() {
         TrackId selectedTrack = SelectionManager::getInstance().getSelectedTrack();
         if (selectedTrack != INVALID_TRACK_ID) {
-            auto cmd = std::make_unique<DuplicateTrackCommand>(selectedTrack, false);
+            auto cmd = std::make_unique<DuplicateTrackCommand>(selectedTrack,
+                                                               /*duplicateContent=*/false,
+                                                               /*duplicateDevices=*/true);
+            UndoManager::getInstance().executeCommand(std::move(cmd));
+        }
+    };
+
+    callbacks.onDuplicateTrackContentOnly = []() {
+        TrackId selectedTrack = SelectionManager::getInstance().getSelectedTrack();
+        if (selectedTrack != INVALID_TRACK_ID) {
+            auto cmd = std::make_unique<DuplicateTrackCommand>(selectedTrack,
+                                                               /*duplicateContent=*/true,
+                                                               /*duplicateDevices=*/false);
             UndoManager::getInstance().executeCommand(std::move(cmd));
         }
     };
@@ -749,6 +739,34 @@ void MainWindow::setupMenuCallbacks() {
 
     callbacks.onOpenManual = []() {
         juce::URL("https://Conceptual-Machines.github.io/magda-core/").launchInDefaultBrowser();
+    };
+
+    callbacks.onCheckForUpdates = []() {
+        UpdateChecker::checkAsync([](const UpdateChecker::Result& r) {
+            if (!r.success) {
+                juce::AlertWindow::showMessageBoxAsync(
+                    juce::AlertWindow::WarningIcon, tr("dialogs.updates.title"),
+                    tr("dialogs.updates.error_prefix") + " " + r.errorMessage);
+                return;
+            }
+            UpdateChecker::markChecked();
+            if (r.updateAvailable) {
+                juce::AlertWindow::showOkCancelBox(
+                    juce::AlertWindow::InfoIcon, tr("dialogs.updates.title"),
+                    tr("dialogs.updates.available_body_prefix") + " " + r.latestVersion + " " +
+                        tr("dialogs.updates.available_body_suffix") + " (" +
+                        tr("dialogs.updates.current_label") + " " + r.currentVersion + ").",
+                    tr("dialogs.updates.view_release"), tr("dialogs.cancel"), nullptr,
+                    juce::ModalCallbackFunction::create([url = r.releaseUrl](int result) {
+                        if (result == 1 && url.isNotEmpty())
+                            juce::URL(url).launchInDefaultBrowser();
+                    }));
+            } else {
+                juce::AlertWindow::showMessageBoxAsync(
+                    juce::AlertWindow::InfoIcon, tr("dialogs.updates.title"),
+                    tr("dialogs.updates.up_to_date") + " (MAGDA " + r.currentVersion + ")");
+            }
+        });
     };
 
     callbacks.onAbout = []() { AboutDialog::show(); };

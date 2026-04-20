@@ -41,6 +41,7 @@ nav:
   - Getting Started:
       - Installation: getting-started/installation.md
       - First Session: getting-started/first-session.md
+      - Localization: localization.md
   - Interface Layout:
       - Overview: interface/overview.md
       - Menus: interface/menus.md
@@ -50,6 +51,7 @@ nav:
   - Tracks: tracks.md
   - Clips: clips.md
   - FX Chain & Racks: fx-chain.md
+  - Plugin Parameters: plugin-parameters.md
   - Arrangement View: arrangement-view.md
   - Session View: session-view.md
   - Mixer View: mixer-view.md

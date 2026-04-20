@@ -28,6 +28,7 @@ class MixerView;
 class BottomPanel;
 class FooterBar;
 class AudioEngine;
+class QwertyMidiKeyboard;
 class PlaybackPositionTimer;
 
 class MainWindow : public juce::DocumentWindow, public ProjectManagerListener {
@@ -42,6 +43,9 @@ class MainWindow : public juce::DocumentWindow, public ProjectManagerListener {
     void projectSaved(const ProjectInfo& info) override;
     void projectClosed() override;
     void projectDirtyStateChanged(bool isDirty) override;
+
+    /** Open a .mgd project file (used by menu, command line, and OS file association). */
+    void openProjectFile(const juce::File& file);
 
     /** Re-read panel visibility from Config and apply immediately. */
     void applyPanelVisibilityFromConfig();
@@ -123,6 +127,10 @@ class MainWindow::MainComponent : public juce::Component,
     std::unique_ptr<MixerView> mixerView;
     std::unique_ptr<FooterBar> footerBar;
 
+    QwertyMidiKeyboard* getQwertyKeyboard() {
+        return qwertyKeyboard_.get();
+    }
+
     // Access to audio engine for settings dialog
     AudioEngine* getAudioEngine() {
         // Return external engine if provided, otherwise return owned engine
@@ -144,6 +152,7 @@ class MainWindow::MainComponent : public juce::Component,
     std::unique_ptr<AudioEngine> audioEngine_;    // Owned engine (if no external engine)
     AudioEngine* externalAudioEngine_ = nullptr;  // Non-owning pointer to external engine
     std::unique_ptr<PlaybackPositionTimer> positionTimer_;
+    std::unique_ptr<QwertyMidiKeyboard> qwertyKeyboard_;
 
     // Main layout panels
     std::unique_ptr<LeftPanel> leftPanel;

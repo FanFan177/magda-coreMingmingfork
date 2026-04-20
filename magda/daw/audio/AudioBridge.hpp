@@ -10,6 +10,8 @@
 #include "../core/DeviceInfo.hpp"
 #include "../core/TrackManager.hpp"
 #include "../core/TypeIds.hpp"
+#include "AutomationPlaybackEngine.hpp"
+#include "AutomationRecordingEngine.hpp"
 #include "ClipSynchronizer.hpp"
 #include "DeviceMeteringManager.hpp"
 #include "DeviceProcessor.hpp"
@@ -68,6 +70,7 @@ class AudioBridge : public TrackManagerListener, public ClipManagerListener, pub
     void trackSelectionChanged(TrackId trackId) override;
     void trackDevicesChanged(TrackId trackId) override;
     void deviceModifiersChanged(TrackId trackId) override;
+    void audioSidechainTriggered(TrackId sourceTrackId) override;
     void devicePropertyChanged(DeviceId deviceId) override;
     void deviceParameterChanged(DeviceId deviceId, int paramIndex, float newValue) override;
     void macroValueChanged(TrackId trackId, bool isRack, int id, int macroIndex,
@@ -306,6 +309,12 @@ class AudioBridge : public TrackManagerListener, public ClipManagerListener, pub
     DeviceProcessor* getDeviceProcessor(DeviceId deviceId) const;
 
     /**
+     * @brief Get (or lazily create) the virtual MIDI input device used by
+     *        the QWERTY keyboard. Returns nullptr if creation fails.
+     */
+    te::VirtualMidiInputDevice* getQwertyMidiDevice();
+
+    /**
      * @brief Create a Tracktion AudioTrack for a MAGDA track
      * @param trackId MAGDA track ID
      * @param name Track name
@@ -434,8 +443,10 @@ class AudioBridge : public TrackManagerListener, public ClipManagerListener, pub
         midiActivity_.triggerActivity(trackId);
         // Write to sidechain trigger bus so updateAllMods() picks up live MIDI too
         SidechainTriggerBus::getInstance().triggerNoteOn(trackId);
-        // Trigger all cached sidechain LFOs (self-track + cross-track) via pre-computed cache
-        pluginManager_.triggerSidechainNoteOn(trackId);
+        // LFO retrigger is handled on the audio thread by SidechainMonitorPlugin
+        // (which calls PluginManager::triggerSidechainNoteOn). Calling it here
+        // from the MIDI thread would double-trigger and race with the audio
+        // thread's ramp state (non-atomic floats in TE's Ramp).
     }
 
     /**
@@ -446,6 +457,21 @@ class AudioBridge : public TrackManagerListener, public ClipManagerListener, pub
     uint32_t getMidiActivityCounter(TrackId trackId) const {
         return midiActivity_.getActivityCounter(trackId);
     }
+
+    // =========================================================================
+    // Automation Recording
+    // =========================================================================
+
+    /**
+     * @brief Enable/disable global automation write mode
+     * @param enabled When true, parameter changes during playback are recorded to armed lanes
+     */
+    void setAutomationWriteEnabled(bool enabled);
+
+    /**
+     * @brief Check if automation write mode is enabled
+     */
+    bool isAutomationWriteEnabled() const;
 
     // =========================================================================
     // Mixer Controls
@@ -714,6 +740,9 @@ class AudioBridge : public TrackManagerListener, public ClipManagerListener, pub
     te::Engine& engine_;
     te::Edit& edit_;
 
+    // Virtual MIDI device for QWERTY keyboard (lazily created)
+    std::shared_ptr<te::MidiInputDevice> qwertyMidiDevice_;
+
     // Bidirectional mappings
     std::map<TrackId, std::string> trackIdToEngineId_;  // MAGDA TrackId → Engine string ID
 
@@ -738,6 +767,12 @@ class AudioBridge : public TrackManagerListener, public ClipManagerListener, pub
     ClipSynchronizer clipSynchronizer_;
     SessionClipAudioMonitor sessionAudioMonitor_;
     SessionMonitorPlugin* sessionMonitorPlugin_ = nullptr;
+
+    // Automation playback (samples curves at 30Hz, applies to parameters)
+    AutomationPlaybackEngine automationPlayback_;
+
+    // Automation recording (writes parameter changes to armed lanes during playback)
+    AutomationRecordingEngine automationRecording_;
 
     // Per-device metering (LevelMeasurer per device, polled on timer)
     DeviceMeteringManager deviceMetering_;

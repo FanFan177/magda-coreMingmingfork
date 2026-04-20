@@ -5,6 +5,10 @@
 
 #include <functional>
 
+#include "core/AutomationInfo.hpp"
+#include "core/AutomationManager.hpp"
+#include "core/ParameterInfo.hpp"
+#include "core/ParameterUtils.hpp"
 #include "ui/themes/DarkTheme.hpp"
 #include "ui/themes/FontManager.hpp"
 
@@ -15,7 +19,9 @@ namespace magda::daw::ui {
  *
  * Click to edit, drag to change value. Supports dB and pan formatting.
  */
-class TextSlider : public juce::Component, public juce::Label::Listener {
+class TextSlider : public juce::Component,
+                   public juce::Label::Listener,
+                   public magda::AutomationManagerListener {
   public:
     enum class Format { Decimal, Decibels, Pan };
     enum class Orientation { Horizontal, Vertical };
@@ -39,7 +45,12 @@ class TextSlider : public juce::Component, public juce::Label::Listener {
         updateLabel();
     }
 
-    ~TextSlider() override = default;
+    ~TextSlider() override {
+        if (listeningToAutomation_) {
+            magda::AutomationManager::getInstance().removeListener(this);
+            listeningToAutomation_ = false;
+        }
+    }
 
     void setRange(double min, double max, double interval = 0.01) {
         minValue_ = min;
@@ -59,13 +70,68 @@ class TextSlider : public juce::Component, public juce::Label::Listener {
         }
     }
 
-    void setValue(double newValue, juce::NotificationType notification = juce::sendNotification) {
-        newValue = juce::jlimit(minValue_, maxValue_, newValue);
-        if (interval_ > 0) {
-            newValue = minValue_ + interval_ * std::round((newValue - minValue_) / interval_);
+    /**
+     * Single-call configuration from ParameterInfo. This is the path consumers
+     * should use — range/skew/formatter/parser are all derived from the
+     * parameter's metadata so the slider, automation lane, playback engine,
+     * and UI echo all compute values via the same ParameterUtils helpers.
+     *
+     * Sets: range, skew (from scaleAnchor if set), valueFormatter and
+     * valueParser (delegating to ParameterUtils::formatValue/parseValue).
+     */
+    void setParameterInfo(const magda::ParameterInfo& info) {
+        setRange(static_cast<double>(info.minValue), static_cast<double>(info.maxValue));
+
+        // Map scaleAnchor into TextSlider's linear-ratio skew so the drag
+        // behaviour lines up with ParameterUtils' anchor handling. Exact
+        // display/parse still goes through ParameterUtils below, so the
+        // slider and the automation lane cannot disagree on values.
+        skewFactor_ = 1.0;
+        if (info.scaleAnchor > info.minValue && info.scaleAnchor < info.maxValue &&
+            info.maxValue > info.minValue) {
+            // Use log-space anchor ratio for logarithmic params to match
+            // ParameterUtils::normalizedToReal/realToNormalized.
+            double anchorRatio;
+            if (info.scale == magda::ParameterScale::Logarithmic && info.minValue > 0.0f) {
+                anchorRatio = std::log(static_cast<double>(info.scaleAnchor) / info.minValue) /
+                              std::log(static_cast<double>(info.maxValue) / info.minValue);
+            } else {
+                anchorRatio = (info.scaleAnchor - info.minValue) / (info.maxValue - info.minValue);
+            }
+            if (anchorRatio > 0.0 && anchorRatio < 1.0)
+                skewFactor_ = std::log(0.5) / std::log(anchorRatio);
         }
 
-        if (std::abs(value_ - newValue) > 0.0001) {
+        paramInfoCopy_ = info;
+        hasParamInfo_ = true;
+
+        valueFormatter_ = [this](double real) {
+            return magda::ParameterUtils::formatValue(static_cast<float>(real), paramInfoCopy_);
+        };
+        valueParser_ = [this](const juce::String& text) {
+            auto parsed = magda::ParameterUtils::parseValue(text, paramInfoCopy_);
+            return parsed.has_value() ? static_cast<double>(*parsed) : value_;  // keep on failure
+        };
+
+        updateLabel();
+    }
+
+    void setValue(double newValue, juce::NotificationType notification = juce::sendNotification) {
+        setValueWithInterval(newValue, interval_, notification);
+    }
+
+    /** Like setValue() but snaps to a caller-supplied interval instead of the
+     *  configured `interval_`. Used by the drag path to honour fine-tune
+     *  modifiers (Shift/Cmd) — the default interval is coarser than cent-level
+     *  for most plugin parameters. Pass interval <= 0 to skip quantization. */
+    void setValueWithInterval(double newValue, double interval,
+                              juce::NotificationType notification = juce::sendNotification) {
+        newValue = juce::jlimit(minValue_, maxValue_, newValue);
+        if (interval > 0) {
+            newValue = minValue_ + interval * std::round((newValue - minValue_) / interval);
+        }
+
+        if (std::abs(value_ - newValue) > 1.0e-9) {
             value_ = newValue;
             updateLabel();
             if (notification != juce::dontSendNotification && onValueChanged) {
@@ -145,6 +211,40 @@ class TextSlider : public juce::Component, public juce::Label::Listener {
         return isLeftButtonDrag_;
     }
 
+    // Bind this slider to an automation target so mouseDown/mouseUp automatically
+    // pause the lane's baking for the duration of a gesture (kills fader-vs-curve
+    // fighting during playback) and so we can paint the "automated" state.
+    void setAutomationTarget(const magda::AutomationTarget& target) {
+        automationTarget_ = target;
+        const bool nowHas = target.isValid();
+        if (nowHas && !listeningToAutomation_) {
+            magda::AutomationManager::getInstance().addListener(this);
+            listeningToAutomation_ = true;
+        } else if (!nowHas && listeningToAutomation_) {
+            magda::AutomationManager::getInstance().removeListener(this);
+            listeningToAutomation_ = false;
+        }
+        hasAutomationTarget_ = nowHas;
+        refreshAutomationVisualState();
+    }
+    void clearAutomationTarget() {
+        setAutomationTarget({});
+    }
+    magda::AutomationVisualState automationVisualState() const {
+        return automationVisualState_;
+    }
+    bool isAutomated() const {
+        return automationVisualState_ != magda::AutomationVisualState::None;
+    }
+
+    // AutomationManagerListener
+    void automationLanesChanged() override {
+        refreshAutomationVisualState();
+    }
+    void automationLanePropertyChanged(magda::AutomationLaneId /*laneId*/) override {
+        refreshAutomationVisualState();
+    }
+
     double getNormalizedValue() const {
         if (maxValue_ <= minValue_)
             return 0.0;
@@ -157,7 +257,13 @@ class TextSlider : public juce::Component, public juce::Label::Listener {
     std::function<void(float)>
         onShiftDragStart;  // Called when Shift+drag starts, param is start value (0-1)
     std::function<void(float)> onShiftDrag;  // Called during Shift+drag with new value (0-1)
-    std::function<void()> onShiftDragEnd;    // Called when Shift+drag ends
+    // Predicate consulted on mouseDown with Shift held. If provided and returns
+    // false, the Shift+drag path is skipped and the gesture runs through the
+    // normal drag (which still honours Shift as a fine-tune modifier).
+    // Callers (e.g. ParamSlotComponent) use this to keep Shift+drag reserved
+    // for mod-amount editing only when a mod is actually selected.
+    std::function<bool()> canStartShiftDrag;
+    std::function<void()> onShiftDragEnd;  // Called when Shift+drag ends
     std::function<void()>
         onRightClicked;  // Called on right-click (when rightClickEditsText_ is false)
 
@@ -255,6 +361,21 @@ class TextSlider : public juce::Component, public juce::Label::Listener {
 
             // 0dB tick mark removed - shown on level meters instead
         }
+
+        // Automation highlight: purple tint when the lane is driving the
+        // parameter, grey when the user has taken over. Drawn last so it
+        // sits on top of meter bars and value fills.
+        if (automationVisualState_ != magda::AutomationVisualState::None) {
+            auto boundsF = getLocalBounds().toFloat();
+            const juce::Colour tint =
+                automationVisualState_ == magda::AutomationVisualState::Overridden
+                    ? juce::Colour(DarkTheme::TEXT_DISABLED)
+                    : juce::Colour(DarkTheme::ACCENT_PURPLE);
+            g.setColour(tint.withAlpha(0.18f));
+            g.fillRect(boundsF);
+            g.setColour(tint);
+            g.drawRect(boundsF, 1.5f);
+        }
     }
 
     void resized() override {
@@ -267,13 +388,34 @@ class TextSlider : public juce::Component, public juce::Label::Listener {
             dragStartY_ = e.y;
             dragStartX_ = e.x;
             hasDragged_ = false;
+            overrideLatchedThisGesture_ = false;
             isLeftButtonDrag_ = true;
-            isShiftDrag_ = e.mods.isShiftDown();
+            // Only enter Shift+drag mode if the owner actually wants to take
+            // the gesture (e.g. a mod is currently selected for amount edit).
+            // Otherwise Shift falls through to the normal drag path so its
+            // fine-tune behaviour still applies.
+            bool ownerTakesShiftDrag = e.mods.isShiftDown() && onShiftDragStart &&
+                                       (!canStartShiftDrag || canStartShiftDrag());
+            isShiftDrag_ = ownerTakesShiftDrag;
 
-            // If Shift is held and we have a callback, notify start
-            if (isShiftDrag_ && onShiftDragStart) {
+            if (isShiftDrag_) {
                 shiftDragStartValue_ = 0.5f;  // Default start value for new links
                 onShiftDragStart(shiftDragStartValue_);
+            }
+
+            // Transient touch-suppression so playback doesn't fight the
+            // gesture. The persistent override/bypass only latches once the
+            // drag is confirmed as a real edit (see latchAutomationOverride).
+            if (hasAutomationTarget_ && isAutomated()) {
+                magda::AutomationManager::getInstance().setTargetTouchSuppressed(automationTarget_,
+                                                                                 true);
+            }
+            // Mark the user gesture even when no lane exists yet, so the
+            // recording engine can distinguish real touches from playback
+            // engine echo-backs.
+            if (hasAutomationTarget_) {
+                magda::AutomationManager::getInstance().setTargetUserTouched(automationTarget_,
+                                                                             true);
             }
         } else {
             isLeftButtonDrag_ = false;
@@ -290,6 +432,16 @@ class TextSlider : public juce::Component, public juce::Label::Listener {
         int dy = std::abs(e.y - dragStartY_);
         if (dx > 3 || dy > 3) {
             hasDragged_ = true;
+            // Drag confirmed — latch persistent override on first real motion.
+            // Skipped when write mode is on: the gesture is being recorded
+            // into the lane, not taking over from it.
+            if (!isShiftDrag_ && !overrideLatchedThisGesture_ && hasAutomationTarget_ &&
+                isAutomated() && !magda::AutomationManager::getInstance().isWriteModeEnabled()) {
+                magda::AutomationManager::getInstance().setTargetOverridden(automationTarget_,
+                                                                            true);
+                setAutomationVisualState(magda::AutomationVisualState::Overridden);
+                overrideLatchedThisGesture_ = true;
+            }
         }
 
         if (hasDragged_) {
@@ -304,15 +456,22 @@ class TextSlider : public juce::Component, public juce::Label::Listener {
                 // Normal drag: change the slider value with modifier-based sensitivity
                 // Vertical: component height = full range (fader tracks mouse 1:1)
                 // Horizontal: 200 pixels = full range
-                // Shift: 10x finer, Ctrl/Cmd: 100x finer
+                // Shift: 10x finer, Ctrl/Cmd: 100x finer (both pixel range AND
+                // snap interval, so fine-tune actually lands on finer values —
+                // the default interval is coarser than cent-level for most VST
+                // parameters, so without scaling it here Cmd-drag only slowed
+                // the mouse without changing the reachable value grid).
                 double pixelRange = (orientation_ == Orientation::Vertical)
                                         ? static_cast<double>(getHeight())
                                         : 200.0;
+                double effectiveInterval = interval_;
 
                 if (e.mods.isShiftDown()) {
                     pixelRange *= 10.0;  // Fine control
+                    effectiveInterval *= 0.1;
                 } else if (e.mods.isCommandDown() || e.mods.isCtrlDown()) {
                     pixelRange *= 100.0;  // Very fine control
+                    effectiveInterval *= 0.01;
                 }
 
                 double pixelDelta;
@@ -335,12 +494,20 @@ class TextSlider : public juce::Component, public juce::Label::Listener {
                     double sensitivity = (maxValue_ - minValue_) / pixelRange;
                     newValue = dragStartValue_ + pixelDelta * sensitivity;
                 }
-                setValue(newValue);
+                setValueWithInterval(newValue, effectiveInterval);
             }
         }
     }
 
     void mouseUp(const juce::MouseEvent& e) override {
+        // Release the transient flags; the lane stays in bypass (override)
+        // state until the user explicitly re-enables it from the header.
+        if (isLeftButtonDrag_ && hasAutomationTarget_) {
+            auto& mgr = magda::AutomationManager::getInstance();
+            mgr.setTargetUserTouched(automationTarget_, false);
+            mgr.setTargetTouchSuppressed(automationTarget_, false);
+        }
+
         // Handle Shift+drag end
         if (isShiftDrag_) {
             if (hasDragged_ && onShiftDragEnd) {
@@ -415,6 +582,7 @@ class TextSlider : public juce::Component, public juce::Label::Listener {
     int dragStartX_ = 0;
     int dragStartY_ = 0;
     bool hasDragged_ = false;
+    bool overrideLatchedThisGesture_ = false;
     bool isLeftButtonDrag_ = false;
     bool isShiftDrag_ = false;
     float shiftDragStartValue_ = 0.5f;
@@ -425,7 +593,9 @@ class TextSlider : public juce::Component, public juce::Label::Listener {
     std::function<juce::String(double)>
         valueFormatter_;  // Custom value formatting (normalized → string)
     std::function<double(const juce::String&)>
-        valueParser_;  // Custom value parsing (string → normalized)
+        valueParser_;                     // Custom value parsing (string → normalized)
+    magda::ParameterInfo paramInfoCopy_;  // Populated by setParameterInfo
+    bool hasParamInfo_ = false;
 
     void updateLabel() {
         // Show empty text instead of value when disabled/empty
@@ -472,6 +642,30 @@ class TextSlider : public juce::Component, public juce::Label::Listener {
 
     float meterPeakL_ = 0.f;
     float meterPeakR_ = 0.f;
+
+    // Automation state
+    magda::AutomationTarget automationTarget_;
+    bool hasAutomationTarget_ = false;
+    magda::AutomationVisualState automationVisualState_ = magda::AutomationVisualState::None;
+    bool listeningToAutomation_ = false;
+
+    void refreshAutomationVisualState() {
+        auto newState =
+            hasAutomationTarget_
+                ? magda::AutomationManager::getInstance().getVisualState(automationTarget_)
+                : magda::AutomationVisualState::None;
+        if (automationVisualState_ == newState)
+            return;
+        automationVisualState_ = newState;
+        repaint();
+    }
+
+    void setAutomationVisualState(magda::AutomationVisualState state) {
+        if (automationVisualState_ == state)
+            return;
+        automationVisualState_ = state;
+        repaint();
+    }
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(TextSlider)
 };

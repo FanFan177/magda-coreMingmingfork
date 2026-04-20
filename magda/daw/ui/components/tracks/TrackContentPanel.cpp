@@ -296,11 +296,7 @@ void TrackContentPanel::paintOverChildren(juce::Graphics& g) {
     // Draw marquee selection rectangle on top of everything
     paintMarqueeRect(g);
 
-    // Draw tint overlay for plugin drag-and-drop
-    if (showPluginDropOverlay_) {
-        g.setColour(juce::Colours::white.withAlpha(0.08f));
-        g.fillRect(getLocalBounds());
-    }
+    // Plugin drop: no content-area feedback — the track header highlight is enough
 
     // Draw drop indicator for file drag-and-drop
     if (showDropIndicator_) {
@@ -308,18 +304,57 @@ void TrackContentPanel::paintOverChildren(juce::Graphics& g) {
 
         if (dropTargetTrackIndex_ >= 0 &&
             dropTargetTrackIndex_ < static_cast<int>(trackLanes.size())) {
-            // Dropping on an existing track — line spans that track
+            // Dropping on an existing track — line spans that track (append mode).
             int trackY = getTrackYPosition(dropTargetTrackIndex_);
             int trackHeight = getTrackHeight(dropTargetTrackIndex_);
 
             g.setColour(juce::Colours::yellow.withAlpha(0.8f));
             g.drawLine(static_cast<float>(dropX), static_cast<float>(trackY),
                        static_cast<float>(dropX), static_cast<float>(trackY + trackHeight), 2.0f);
-        } else {
-            // Dropping on empty area — show drop line spanning a phantom track region
-            int topY = getTotalTracksHeight();
-            int bottomY = topY + DEFAULT_TRACK_HEIGHT;
+        } else if (!draggedAudioFiles_.isEmpty()) {
+            // Dropping audio on empty area — ghost one clip preview per audio
+            // file, each on its own phantom track row below the existing tracks.
+            // The ghost starts at the drop insertion time (never before it) and
+            // its width matches the sample duration so the user can judge layout.
+            const int numGhosts = draggedAudioFiles_.size();
+            const int topY = getTotalTracksHeight();
+            const int ghostHeight = DEFAULT_TRACK_HEIGHT;
+            const int baseIndex = TrackManager::getInstance().getNumTracks();
 
+            for (int i = 0; i < numGhosts; ++i) {
+                const int y0 = topY + i * ghostHeight;
+                const int y1 = y0 + ghostHeight;
+
+                const auto tint = juce::Colour(Config::getDefaultColour(baseIndex + i));
+
+                // Ghost clip: starts at dropX, width derived from sample duration.
+                double duration = (i < static_cast<int>(draggedAudioDurations_.size()))
+                                      ? draggedAudioDurations_[i]
+                                      : 4.0;
+                int clipEndX = timeToPixel(dropInsertTime_ + duration);
+                int clipW = juce::jmax(4, clipEndX - dropX);
+
+                juce::Rectangle<int> clipRect(dropX, y0 + 2, clipW, ghostHeight - 4);
+                g.setColour(tint.withAlpha(0.25f));
+                g.fillRect(clipRect);
+                g.setColour(tint.withAlpha(0.9f));
+                g.drawRect(clipRect, 1);
+
+                auto name = juce::File(draggedAudioFiles_[i]).getFileNameWithoutExtension();
+                g.setColour(tint.brighter(0.3f));
+                g.setFont(juce::Font(juce::FontOptions(12.0f).withStyle("Bold")));
+                g.drawFittedText(name, clipRect.reduced(6, 4), juce::Justification::centredLeft, 1);
+
+                // Insertion marker (left edge of the clip).
+                g.setColour(tint.withAlpha(0.9f));
+                g.drawLine(static_cast<float>(dropX), static_cast<float>(y0),
+                           static_cast<float>(dropX), static_cast<float>(y1), 2.0f);
+            }
+        } else {
+            // Non-audio drop on empty area (e.g. MIDI-only) — simple insertion
+            // line only, no clip-shaped ghosts.
+            const int topY = getTotalTracksHeight();
+            const int bottomY = topY + DEFAULT_TRACK_HEIGHT;
             g.setColour(juce::Colours::yellow.withAlpha(0.8f));
             g.drawLine(static_cast<float>(dropX), static_cast<float>(topY),
                        static_cast<float>(dropX), static_cast<float>(bottomY), 2.0f);
@@ -328,12 +363,23 @@ void TrackContentPanel::paintOverChildren(juce::Graphics& g) {
 }
 
 void TrackContentPanel::resized() {
-    // Update size based on zoom (ppb) and timeline length
+    // Size the panel to match its content exactly. Using jmax(contentHeight,
+    // getHeight()) here would be monotonic — when lanes shrink or hide the
+    // panel would stay inflated, producing phantom scrollbar space in the
+    // outer viewport and stale pixels revealed by scrolling into the empty
+    // area. The outer viewport already handles "content smaller than
+    // viewport" by showing the component at its natural size with no
+    // scrollbar.
     double beats = timelineLength * tempoBPM / 60.0;
     int contentWidth = static_cast<int>(std::round(beats * currentZoom));
-    int contentHeight = getTotalTracksHeight();
+    int contentHeight = juce::jmax(getTotalTracksHeight(), minHeight_);
 
-    setSize(juce::jmax(contentWidth, getWidth()), juce::jmax(contentHeight, getHeight()));
+    setSize(contentWidth, contentHeight);
+
+    // Re-position lane viewports with the current (possibly updated) width.
+    // This is needed because lane viewports are sized to getWidth() which may
+    // change when the panel is first laid out or when the window is resized.
+    updateAutomationLanePositions();
 }
 
 void TrackContentPanel::selectTrack(int index) {
@@ -386,6 +432,7 @@ void TrackContentPanel::setTrackHeight(int trackIndex, int height) {
         trackLanes[trackIndex]->height = height;
 
         updateClipComponentPositions();
+        updateAutomationLanePositions();
         resized();
         repaintVisible();
 
@@ -408,6 +455,7 @@ void TrackContentPanel::setZoom(double zoom) {
         return;
     currentZoom = zoom;
     updateClipComponentPositions();
+    updateAutomationLanePositions();
     resized();
     repaintVisible();
 }
@@ -418,6 +466,7 @@ void TrackContentPanel::setVerticalZoom(double zoom) {
         return;
     verticalZoom = zoom;
     updateClipComponentPositions();
+    updateAutomationLanePositions();
     resized();
     repaintVisible();
 }
@@ -784,12 +833,14 @@ int TrackContentPanel::getTrackIndexAtY(int y) const {
     int currentY = 0;
     for (size_t i = 0; i < trackLanes.size(); ++i) {
         int trackHeight = static_cast<int>(trackLanes[i]->height * verticalZoom);
+        // Only match within the track's own lane area, not automation lanes below it
         if (y >= currentY && y < currentY + trackHeight) {
             return static_cast<int>(i);
         }
-        currentY += trackHeight;
+        // Advance past both the track and its automation lanes
+        currentY += getTrackTotalHeight(static_cast<int>(i));
     }
-    return -1;  // Not in any track
+    return -1;  // Not in any track (or in an automation lane)
 }
 
 bool TrackContentPanel::isOnExistingSelection(int x, int y) const {
@@ -2183,6 +2234,8 @@ void TrackContentPanel::syncAutomationLaneVisibility() {
     visibleAutomationLanes_.clear();
 
     auto& manager = AutomationManager::getInstance();
+    if (!manager.isGlobalLaneVisibilityEnabled())
+        return;  // Global override: treat all lanes as hidden
 
     for (auto trackId : visibleTrackIds_) {
         auto laneIds = manager.getLanesForTrack(trackId);
@@ -2282,7 +2335,6 @@ int TrackContentPanel::getVisibleAutomationLanesHeight(TrackId trackId) const {
         for (auto laneId : it->second) {
             const auto* lane = manager.getLane(laneId);
             if (lane && lane->visible) {
-                // Apply vertical zoom to automation lane height (header + content + resize handle)
                 int laneHeight = lane->expanded ? (AutomationLaneComponent::HEADER_HEIGHT +
                                                    static_cast<int>(lane->height * verticalZoom) +
                                                    AutomationLaneComponent::RESIZE_HANDLE_HEIGHT)
@@ -2296,106 +2348,87 @@ int TrackContentPanel::getVisibleAutomationLanesHeight(TrackId trackId) const {
 }
 
 void TrackContentPanel::rebuildAutomationLaneComponents() {
+    // Remove old lane components
+    for (auto& entry : automationLaneComponents_)
+        if (entry.component)
+            removeChildComponent(entry.component.get());
     automationLaneComponents_.clear();
 
     auto& manager = AutomationManager::getInstance();
 
-    // Create components for visible automation lanes
     for (size_t i = 0; i < visibleTrackIds_.size(); ++i) {
         TrackId trackId = visibleTrackIds_[i];
 
         auto it = visibleAutomationLanes_.find(trackId);
-        if (it == visibleAutomationLanes_.end()) {
+        if (it == visibleAutomationLanes_.end())
             continue;
-        }
 
         for (auto laneId : it->second) {
             const auto* lane = manager.getLane(laneId);
-            if (!lane || !lane->visible) {
+            if (!lane || !lane->visible)
                 continue;
-            }
 
             AutomationLaneEntry entry;
             entry.trackId = trackId;
             entry.laneId = laneId;
             entry.component = std::make_unique<AutomationLaneComponent>(laneId);
-            // Convert ppb to pps for automation (time-based rendering)
             entry.component->setPixelsPerSecond(currentZoom * tempoBPM / 60.0);
-            entry.component->snapTimeToGrid = snapTimeToGrid;
+            entry.component->setPixelsPerBeat(currentZoom);
+            entry.component->setTempoBPM(tempoBPM);
+            entry.component->snapTimeToGrid = snapBeatsToGrid;
+            entry.component->getGridSpacingBeats = getGridSpacingBeats;
 
-            // Wire up height change callback for resizing
-            entry.component->onHeightChanged = [this](AutomationLaneId /*changedLaneId*/,
-                                                      int /*newHeight*/) {
-                // Update layout when automation lane is resized
+            entry.component->onHeightChanged = [this](AutomationLaneId, int) {
                 updateAutomationLanePositions();
                 updateClipComponentPositions();
                 resized();
                 repaintVisible();
             };
 
-            addAndMakeVisible(entry.component.get());
+            addAndMakeVisible(*entry.component);
             automationLaneComponents_.push_back(std::move(entry));
         }
     }
-
     updateAutomationLanePositions();
 }
 
 void TrackContentPanel::updateAutomationLanePositions() {
     auto& manager = AutomationManager::getInstance();
 
-    for (auto& entry : automationLaneComponents_) {
-        // Find track index for this lane's track
-        int trackIndex = -1;
-        for (size_t i = 0; i < visibleTrackIds_.size(); ++i) {
-            if (visibleTrackIds_[i] == entry.trackId) {
-                trackIndex = static_cast<int>(i);
-                break;
-            }
-        }
-
-        if (trackIndex < 0) {
-            continue;
-        }
-
-        // Calculate Y position: after track + any previous automation lanes for this track
+    // Position each lane component directly under its track row.
+    // Lanes stack inline; the outer content panel viewport handles scrolling.
+    for (size_t i = 0; i < visibleTrackIds_.size(); ++i) {
+        TrackId trackId = visibleTrackIds_[i];
+        int trackIndex = static_cast<int>(i);
         int y = getTrackYPosition(trackIndex) +
                 static_cast<int>(trackLanes[trackIndex]->height * verticalZoom);
 
-        // Add height of any previous automation lanes for this same track
-        auto it = visibleAutomationLanes_.find(entry.trackId);
-        if (it != visibleAutomationLanes_.end()) {
-            for (auto prevLaneId : it->second) {
-                if (prevLaneId == entry.laneId) {
-                    break;  // Found our lane, stop adding
-                }
-                const auto* prevLane = manager.getLane(prevLaneId);
-                if (prevLane && prevLane->visible) {
-                    // Apply vertical zoom to automation lane height (header + content + resize
-                    // handle)
-                    y += prevLane->expanded ? (AutomationLaneComponent::HEADER_HEIGHT +
-                                               static_cast<int>(prevLane->height * verticalZoom) +
-                                               AutomationLaneComponent::RESIZE_HANDLE_HEIGHT)
-                                            : AutomationLaneComponent::HEADER_HEIGHT;
+        auto laneIt = visibleAutomationLanes_.find(trackId);
+        if (laneIt == visibleAutomationLanes_.end())
+            continue;
+
+        for (auto laneId : laneIt->second) {
+            const auto* lane = manager.getLane(laneId);
+            if (!lane || !lane->visible)
+                continue;
+
+            int height = lane->expanded ? (AutomationLaneComponent::HEADER_HEIGHT +
+                                           static_cast<int>(lane->height * verticalZoom) +
+                                           AutomationLaneComponent::RESIZE_HANDLE_HEIGHT)
+                                        : AutomationLaneComponent::HEADER_HEIGHT;
+
+            for (auto& entry : automationLaneComponents_) {
+                if (entry.trackId == trackId && entry.laneId == laneId) {
+                    entry.component->setBounds(0, y, getWidth(), height);
+                    entry.component->setPixelsPerSecond(currentZoom * tempoBPM / 60.0);
+                    entry.component->setPixelsPerBeat(currentZoom);
+                    entry.component->setTempoBPM(tempoBPM);
+                    break;
                 }
             }
+
+            y += height;
         }
-
-        // Get lane info for height
-        const auto* lane = manager.getLane(entry.laneId);
-        if (!lane) {
-            continue;
-        }
-
-        // Apply vertical zoom to automation lane height (header + content + resize handle)
-        int height = lane->expanded ? (AutomationLaneComponent::HEADER_HEIGHT +
-                                       static_cast<int>(lane->height * verticalZoom) +
-                                       AutomationLaneComponent::RESIZE_HANDLE_HEIGHT)
-                                    : AutomationLaneComponent::HEADER_HEIGHT;
-
-        entry.component->setBounds(0, y, getWidth(), height);
-        // Convert ppb to pps for automation (time-based rendering)
-        entry.component->setPixelsPerSecond(currentZoom * tempoBPM / 60.0);
     }
 }
 
@@ -2415,13 +2448,47 @@ bool TrackContentPanel::isInterestedInFileDrag(const juce::StringArray& files) {
     return false;
 }
 
-void TrackContentPanel::fileDragEnter(const juce::StringArray& /*files*/, int x, int y) {
+void TrackContentPanel::fileDragEnter(const juce::StringArray& files, int x, int y) {
     dropInsertTime_ = juce::jmax(0.0, pixelToTime(x));
     if (snapTimeToGrid) {
         dropInsertTime_ = snapTimeToGrid(dropInsertTime_);
     }
     dropTargetTrackIndex_ = getTrackIndexAtY(y);
+
+    draggedAudioFiles_.clear();
+    draggedAudioDurations_.clear();
+    juce::AudioFormatManager formatMgr;
+    formatMgr.registerBasicFormats();
+    for (const auto& f : files) {
+        if (f.endsWithIgnoreCase(".wav") || f.endsWithIgnoreCase(".aiff") ||
+            f.endsWithIgnoreCase(".aif") || f.endsWithIgnoreCase(".mp3") ||
+            f.endsWithIgnoreCase(".ogg") || f.endsWithIgnoreCase(".flac")) {
+            draggedAudioFiles_.add(f);
+
+            double duration = 4.0;
+            juce::File audioFile(f);
+            if (auto reader = std::unique_ptr<juce::AudioFormatReader>(
+                    formatMgr.createReaderFor(audioFile))) {
+                if (reader->sampleRate > 0.0)
+                    duration = static_cast<double>(reader->lengthInSamples) / reader->sampleRate;
+            }
+            draggedAudioDurations_.push_back(duration);
+        }
+    }
+
     showDropIndicator_ = true;
+
+    // Fire ghost-header callback: one phantom header per audio file when the
+    // drop would spawn new tracks (i.e. empty area).
+    if (onGhostHeadersChanged) {
+        juce::StringArray labels;
+        if (dropTargetTrackIndex_ < 0) {
+            for (const auto& f : draggedAudioFiles_)
+                labels.add(juce::File(f).getFileNameWithoutExtension());
+        }
+        onGhostHeadersChanged(labels);
+    }
+
     repaintVisible();
 }
 
@@ -2430,17 +2497,37 @@ void TrackContentPanel::fileDragMove(const juce::StringArray& /*files*/, int x, 
     if (snapTimeToGrid) {
         dropInsertTime_ = snapTimeToGrid(dropInsertTime_);
     }
+    const int prevTarget = dropTargetTrackIndex_;
     dropTargetTrackIndex_ = getTrackIndexAtY(y);
+
+    // Update ghost headers when we cross the empty-area / existing-track boundary.
+    if (onGhostHeadersChanged && (prevTarget < 0) != (dropTargetTrackIndex_ < 0)) {
+        juce::StringArray labels;
+        if (dropTargetTrackIndex_ < 0) {
+            for (const auto& f : draggedAudioFiles_)
+                labels.add(juce::File(f).getFileNameWithoutExtension());
+        }
+        onGhostHeadersChanged(labels);
+    }
+
     repaintVisible();
 }
 
 void TrackContentPanel::fileDragExit(const juce::StringArray& /*files*/) {
     showDropIndicator_ = false;
+    draggedAudioFiles_.clear();
+    draggedAudioDurations_.clear();
+    if (onGhostHeadersChanged)
+        onGhostHeadersChanged({});
     repaintVisible();
 }
 
 void TrackContentPanel::filesDropped(const juce::StringArray& files, int x, int y) {
     showDropIndicator_ = false;
+    draggedAudioFiles_.clear();
+    draggedAudioDurations_.clear();
+    if (onGhostHeadersChanged)
+        onGhostHeadersChanged({});
     repaintVisible();
 
     // Determine drop position (clamp to timeline start, snap if enabled)
@@ -2492,43 +2579,74 @@ void TrackContentPanel::filesDropped(const juce::StringArray& files, int x, int 
 
     int importedCount = 0;
 
-    // Import audio files
+    // Import audio files.
+    // Drop target decides the mode:
+    //   * on existing track  → append clips sequentially to that track
+    //   * on empty area      → one new track per sample
     if (!audioFiles.isEmpty()) {
         juce::AudioFormatManager formatManager;
         formatManager.registerBasicFormats();
 
-        double currentTime = dropTime;
+        const bool expand = (targetTrackId == INVALID_TRACK_ID);
         CompoundOperationScope scope("Import Audio Files");
 
-        for (const auto& filePath : audioFiles) {
-            juce::File audioFile(filePath);
-            if (!audioFile.existsAsFile())
-                continue;
+        if (expand) {
+            TrackId insertAfter = INVALID_TRACK_ID;
 
-            if (targetTrackId == INVALID_TRACK_ID) {
+            for (const auto& filePath : audioFiles) {
+                juce::File audioFile(filePath);
+                if (!audioFile.existsAsFile())
+                    continue;
+
                 juce::String trackName = audioFile.getFileNameWithoutExtension();
                 auto createTrackCmd =
-                    std::make_unique<CreateTrackCommand>(TrackType::Audio, trackName);
+                    std::make_unique<CreateTrackCommand>(TrackType::Audio, trackName, insertAfter);
                 auto* createTrackPtr = createTrackCmd.get();
                 UndoManager::getInstance().executeCommand(std::move(createTrackCmd));
-                targetTrackId = createTrackPtr->getCreatedTrackId();
-                if (targetTrackId == INVALID_TRACK_ID)
-                    return;
-                TrackManager::getInstance().setSelectedTrack(targetTrackId);
+                TrackId clipTrackId = createTrackPtr->getCreatedTrackId();
+                if (clipTrackId == INVALID_TRACK_ID)
+                    continue;
+                insertAfter = clipTrackId;
+
+                double fileDuration = 4.0;
+                if (auto reader = std::unique_ptr<juce::AudioFormatReader>(
+                        formatManager.createReaderFor(audioFile))) {
+                    fileDuration =
+                        static_cast<double>(reader->lengthInSamples) / reader->sampleRate;
+                }
+
+                auto cmd = std::make_unique<CreateClipCommand>(
+                    ClipType::Audio, clipTrackId, dropTime, fileDuration, filePath.toStdString());
+                UndoManager::getInstance().executeCommand(std::move(cmd));
+                importedCount++;
             }
 
-            double fileDuration = 4.0;
-            if (auto reader = std::unique_ptr<juce::AudioFormatReader>(
-                    formatManager.createReaderFor(audioFile))) {
-                fileDuration = static_cast<double>(reader->lengthInSamples) / reader->sampleRate;
+            if (importedCount > 0 && insertAfter != INVALID_TRACK_ID)
+                TrackManager::getInstance().setSelectedTrack(insertAfter);
+        } else {
+            // Append to the hovered track: stack clips sequentially on the timeline.
+            double currentTime = dropTime;
+
+            for (const auto& filePath : audioFiles) {
+                juce::File audioFile(filePath);
+                if (!audioFile.existsAsFile())
+                    continue;
+
+                double fileDuration = 4.0;
+                if (auto reader = std::unique_ptr<juce::AudioFormatReader>(
+                        formatManager.createReaderFor(audioFile))) {
+                    fileDuration =
+                        static_cast<double>(reader->lengthInSamples) / reader->sampleRate;
+                }
+
+                auto cmd =
+                    std::make_unique<CreateClipCommand>(ClipType::Audio, targetTrackId, currentTime,
+                                                        fileDuration, filePath.toStdString());
+                UndoManager::getInstance().executeCommand(std::move(cmd));
+
+                currentTime += fileDuration + 0.5;
+                importedCount++;
             }
-
-            auto cmd = std::make_unique<CreateClipCommand>(
-                ClipType::Audio, targetTrackId, currentTime, fileDuration, filePath.toStdString());
-            UndoManager::getInstance().executeCommand(std::move(cmd));
-
-            currentTime += fileDuration + 0.5;
-            importedCount++;
         }
     }
 
@@ -2717,22 +2835,28 @@ bool TrackContentPanel::isInterestedInDragSource(const SourceDetails& details) {
     return false;
 }
 
-void TrackContentPanel::itemDragEnter(const SourceDetails& /*details*/) {
+void TrackContentPanel::itemDragEnter(const SourceDetails& details) {
     showPluginDropOverlay_ = true;
+    pluginDropTrackIndex_ = getTrackIndexAtY(details.localPosition.y);
     repaintVisible();
 }
 
-void TrackContentPanel::itemDragMove(const SourceDetails& /*details*/) {
-    // Overlay already shown
+void TrackContentPanel::itemDragMove(const SourceDetails& details) {
+    int prev = pluginDropTrackIndex_;
+    pluginDropTrackIndex_ = getTrackIndexAtY(details.localPosition.y);
+    if (pluginDropTrackIndex_ != prev)
+        repaintVisible();
 }
 
 void TrackContentPanel::itemDragExit(const SourceDetails& /*details*/) {
     showPluginDropOverlay_ = false;
+    pluginDropTrackIndex_ = -1;
     repaintVisible();
 }
 
 void TrackContentPanel::itemDropped(const SourceDetails& details) {
     showPluginDropOverlay_ = false;
+    pluginDropTrackIndex_ = -1;
     repaintVisible();
 
     if (auto* obj = details.description.getDynamicObject()) {

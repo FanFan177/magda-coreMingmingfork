@@ -66,6 +66,11 @@ class TrackManagerListener {
         juce::ignoreUnused(trackId);
     }
 
+    // Called when an audio-triggered mod fires (gate opens) — sourceTrackId is the sidechain source
+    virtual void audioSidechainTriggered(TrackId sourceTrackId) {
+        juce::ignoreUnused(sourceTrackId);
+    }
+
     // Called when a device parameter changes (gain, level, etc.)
     virtual void devicePropertyChanged(DeviceId deviceId) {
         juce::ignoreUnused(deviceId);
@@ -154,7 +159,12 @@ class TrackManager {
     TrackId createTrack(const juce::String& name = "", TrackType type = TrackType::Audio);
     TrackId createGroupTrack(const juce::String& name = "");
     void deleteTrack(TrackId trackId);
-    TrackId duplicateTrack(TrackId trackId);
+    /**
+     * Duplicate a track. When `includeDevices` is false, the new track is
+     * created empty (no plugins / racks / chain elements), giving a clean
+     * slate for workflows that want content-only duplication.
+     */
+    TrackId duplicateTrack(TrackId trackId, bool includeDevices = true);
     void restoreTrack(const TrackInfo& trackInfo);  // Used by undo system
     void moveTrack(TrackId trackId, int newIndex);
 
@@ -195,8 +205,8 @@ class TrackManager {
     // Track property setters (notify listeners)
     void setTrackName(TrackId trackId, const juce::String& name);
     void setTrackColour(TrackId trackId, juce::Colour colour);
-    void setTrackVolume(TrackId trackId, float volume);
-    void setTrackPan(TrackId trackId, float pan);
+    void setTrackVolume(TrackId trackId, float volume, bool fromAutomation = false);
+    void setTrackPan(TrackId trackId, float pan, bool fromAutomation = false);
     void setTrackMuted(TrackId trackId, bool muted);
     void setTrackSoloed(TrackId trackId, bool soloed);
     void setTrackRecordArmed(TrackId trackId, bool armed);
@@ -216,7 +226,8 @@ class TrackManager {
     // Send management (track → any track)
     void addSend(TrackId sourceTrackId, TrackId destTrackId);
     void removeSend(TrackId sourceTrackId, int busIndex);
-    void setSendLevel(TrackId sourceTrackId, int busIndex, float level);
+    void setSendLevel(TrackId sourceTrackId, int busIndex, float level,
+                      bool fromAutomation = false);
 
     // View settings
     void setTrackVisible(TrackId trackId, ViewMode mode, bool visible);
@@ -300,6 +311,9 @@ class TrackManager {
     // Device parameter setters (notify listeners for audio sync)
     void setDeviceGainDb(const ChainNodePath& devicePath, float gainDb);
     void setDeviceLevel(const ChainNodePath& devicePath, float level);  // 0-1 linear
+
+    // Find the ChainNodePath for a device by its ID (searches all tracks recursively)
+    ChainNodePath findDevicePath(DeviceId deviceId) const;
 
     // Update device parameters (called by AudioBridge when processor is created)
     void updateDeviceParameters(DeviceId deviceId, const std::vector<ParameterInfo>& params);
@@ -663,6 +677,7 @@ class TrackManager {
     void notifyMasterChannelChanged();
     void notifyTrackSelectionChanged(TrackId trackId);
     void notifyDeviceModifiersChanged(TrackId trackId);
+    void notifyAudioSidechainTriggered(TrackId sourceTrackId);
     void notifyDevicePropertyChanged(DeviceId deviceId);
     void notifyDeviceParameterChanged(DeviceId deviceId, int paramIndex, float newValue);
     void notifyMacroValueChanged(TrackId trackId, bool isRack, int id, int macroIndex, float value);

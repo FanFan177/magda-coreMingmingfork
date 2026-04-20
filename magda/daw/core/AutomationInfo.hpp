@@ -14,13 +14,26 @@
 namespace magda {
 
 /**
+ * @brief Visual state for a control bound to an automation target.
+ *
+ * Drives the "purple / grey / none" visualisation on faders and value labels.
+ * Computed from lane existence + lane->touchSuppressed so UI code doesn't
+ * re-implement the same if-chain at every paint site.
+ */
+enum class AutomationVisualState {
+    None,        // No lane exists — control paints normally
+    Active,      // Lane exists and is driving the parameter — purple
+    Overridden,  // Lane exists but the user has taken over — grey
+};
+
+/**
  * @brief Bezier handle for smooth curve control
  *
  * Handles are offsets relative to their parent point.
  * When linked=true, moving one handle mirrors the other.
  */
 struct BezierHandle {
-    double time = 0.0;   // Time offset from point (seconds)
+    double time = 0.0;   // Time offset from point (beats)
     double value = 0.0;  // Value offset from point (normalized)
     bool linked = true;  // Mirror handles when one is moved
 
@@ -34,7 +47,7 @@ struct BezierHandle {
  */
 struct AutomationPoint {
     AutomationPointId id = INVALID_AUTOMATION_POINT_ID;
-    double time = 0.0;   // Position in seconds
+    double time = 0.0;   // Position in beats
     double value = 0.5;  // Normalized value 0-1
 
     AutomationCurveType curveType = AutomationCurveType::Linear;
@@ -74,6 +87,12 @@ struct AutomationTarget {
     ModId modId = INVALID_MOD_ID;
     int modParamIndex = -1;
 
+    // For SendLevel — TE AuxSend bus number on the source track.
+    int sendBusIndex = -1;
+
+    // Display name for the parameter (populated at lane creation time)
+    juce::String paramName;
+
     bool isValid() const {
         if (trackId == INVALID_TRACK_ID)
             return false;
@@ -82,6 +101,8 @@ struct AutomationTarget {
             case AutomationTargetType::TrackVolume:
             case AutomationTargetType::TrackPan:
                 return true;  // Only needs valid trackId
+            case AutomationTargetType::SendLevel:
+                return sendBusIndex >= 0;
             case AutomationTargetType::DeviceParameter:
                 return devicePath.isValid() && paramIndex >= 0;
             case AutomationTargetType::Macro:
@@ -100,6 +121,8 @@ struct AutomationTarget {
             case AutomationTargetType::TrackVolume:
             case AutomationTargetType::TrackPan:
                 return true;  // Only type and trackId need to match
+            case AutomationTargetType::SendLevel:
+                return sendBusIndex == other.sendBusIndex;
             case AutomationTargetType::DeviceParameter:
                 return devicePath == other.devicePath && paramIndex == other.paramIndex;
             case AutomationTargetType::Macro:
@@ -123,11 +146,21 @@ struct AutomationTarget {
                 return "Track Volume";
             case AutomationTargetType::TrackPan:
                 return "Track Pan";
+            case AutomationTargetType::SendLevel:
+                if (paramName.isNotEmpty())
+                    return paramName;
+                return "Send " + juce::String(sendBusIndex + 1);
             case AutomationTargetType::DeviceParameter:
+                if (paramName.isNotEmpty())
+                    return paramName;
                 return "Param " + juce::String(paramIndex);
             case AutomationTargetType::Macro:
+                if (paramName.isNotEmpty())
+                    return paramName;
                 return "Macro " + juce::String(macroIndex + 1);
             case AutomationTargetType::ModParameter:
+                if (paramName.isNotEmpty())
+                    return paramName;
                 return "Mod " + juce::String(modId) + " Param " + juce::String(modParamIndex);
         }
         return "Unknown";
@@ -136,22 +169,12 @@ struct AutomationTarget {
     /**
      * @brief Get the ParameterInfo for this automation target
      *
-     * Provides consistent value conversion and display formatting.
+     * For track volume/pan returns preset info; for device parameters
+     * looks up the owning device's ParameterInfo (real range/unit/scale)
+     * via TrackManager so curve labels show real units. Defined in
+     * AutomationInfo.cpp to avoid pulling TrackManager into this header.
      */
-    ParameterInfo getParameterInfo() const {
-        switch (type) {
-            case AutomationTargetType::TrackVolume:
-                return ParameterPresets::faderVolume(-1, "Volume");
-            case AutomationTargetType::TrackPan:
-                return ParameterPresets::pan(-1, "Pan");
-            case AutomationTargetType::DeviceParameter:
-            case AutomationTargetType::Macro:
-            case AutomationTargetType::ModParameter:
-            default:
-                // Default to percentage for unknown parameters
-                return ParameterPresets::percent(-1, getDisplayName());
-        }
-    }
+    ParameterInfo getParameterInfo() const;
 };
 
 /**
@@ -166,11 +189,11 @@ struct AutomationClipInfo {
     juce::String name;
     juce::Colour colour;
 
-    double startTime = 0.0;  // Position on timeline (seconds)
-    double length = 4.0;     // Duration (seconds)
+    double startTime = 0.0;  // Position on timeline (beats)
+    double length = 4.0;     // Duration (beats)
 
     bool looping = false;
-    double loopLength = 4.0;  // Loop length in seconds
+    double loopLength = 4.0;  // Loop length in beats
 
     std::vector<AutomationPoint> points;
 
@@ -230,8 +253,15 @@ struct AutomationLaneInfo {
     juce::String name;  // Display name (auto-generated if empty)
     bool visible = true;
     bool expanded = true;
-    bool armed = false;  // Ready to record automation
-    int height = 60;     // Lane height in pixels
+    bool bypass = false;  // Ignore baked curve during playback
+    // Transient (not serialized): set while a user is actively touching a
+    // control bound to this target during playback, so AutomationPlaybackEngine
+    // leaves the parameter alone for the duration of the gesture instead of
+    // fighting it every block.
+    bool touchSuppressed = false;
+    bool snapTime = true;    // Snap drawn points to time grid
+    bool snapValue = false;  // Snap drawn values to parameter's natural ticks
+    int height = 60;         // Lane height in pixels
 
     // For Absolute type: points directly on lane
     std::vector<AutomationPoint> absolutePoints;

@@ -77,6 +77,14 @@ class DeviceProcessor {
     virtual ParameterInfo getParameterInfo(int index) const;
 
     /**
+     * @brief Format a parameter value using the plugin's own display text.
+     * @param index Parameter index
+     * @param normalizedValue 0..1 normalized value
+     * @return Plugin's display text, or empty if not available.
+     */
+    virtual juce::String formatParameterValue(int index, float normalizedValue) const;
+
+    /**
      * @brief Populate DeviceInfo.parameters with current parameter state
      */
     virtual void populateParameters(DeviceInfo& info) const;
@@ -144,6 +152,15 @@ class DeviceProcessor {
 
     // Apply gain to the appropriate plugin parameter
     virtual void applyGain();
+
+  private:
+    // Cached automatable-parameter array so formatParameterValue doesn't
+    // re-copy it on every DisplayTextProvider call. For Vital that array
+    // has ~777 entries and TE's accessor allocates a fresh juce::Array
+    // each call — the lane repaints + slot updates during playback called
+    // it thousands of times per second and the UI would beach-ball.
+    mutable juce::Array<te::AutomatableParameter*> cachedParams_;
+    mutable const te::Plugin* cachedParamsPlugin_ = nullptr;
 };
 
 // =============================================================================

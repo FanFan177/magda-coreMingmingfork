@@ -32,6 +32,7 @@ class TabbedPanel : public juce::Component, public PanelStateListener {
 
     void paint(juce::Graphics& g) override;
     void resized() override;
+    void mouseDoubleClick(const juce::MouseEvent& event) override;
 
     // PanelStateListener interface
     void panelStateChanged(PanelLocation location, const PanelState& state) override;
@@ -70,6 +71,10 @@ class TabbedPanel : public juce::Component, public PanelStateListener {
      */
     void setTimelineController(magda::TimelineController* controller);
 
+    PanelContent* getActiveContent() const {
+        return activeContent_;
+    }
+
   protected:
     /**
      * @brief Override to customize background painting
@@ -87,10 +92,11 @@ class TabbedPanel : public juce::Component, public PanelStateListener {
     virtual juce::Rectangle<int> getContentBounds();
 
     /**
-     * @brief Get the currently active content
+     * @brief Hook called just before content switches
+     * Override to manage header population/depopulation.
      */
-    PanelContent* getActiveContent() const {
-        return activeContent_;
+    virtual void onContentWillSwitch(PanelContent* outgoing, PanelContent* incoming) {
+        juce::ignoreUnused(outgoing, incoming);
     }
 
     /**

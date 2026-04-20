@@ -4,6 +4,28 @@
 # Generate version header from project version
 configure_file(version.hpp.in "${CMAKE_CURRENT_BINARY_DIR}/generated/version.hpp" @ONLY)
 
+# Safety net: detect git-lfs pointer files before juce_add_binary_data embeds
+# them. Without this, a clone without git-lfs would build successfully but
+# silently ship a ~130-byte pointer in place of the real font, and CJK text
+# would render as tofu at runtime.
+set(LFS_TRACKED_FILES
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../assets/fonts/NotoSansCJKsc-Regular.otf"
+)
+foreach(LFS_FILE ${LFS_TRACKED_FILES})
+    if(EXISTS "${LFS_FILE}")
+        file(READ "${LFS_FILE}" _lfs_head LIMIT 64)
+        if(_lfs_head MATCHES "^version https://git-lfs\\.github\\.com/spec/")
+            message(FATAL_ERROR
+                "\n"
+                "Git LFS file not fetched: ${LFS_FILE}\n"
+                "This file is tracked by git-lfs but was checked out as a pointer.\n"
+                "Install git-lfs and pull the real content:\n"
+                "    git lfs install\n"
+                "    git lfs pull\n")
+        endif()
+    endif()
+endforeach()
+
 # Create binary data for fonts and icons
 juce_add_binary_data(MagdaAssets
     SOURCES
@@ -14,6 +36,8 @@ juce_add_binary_data(MagdaAssets
     ../../assets/fonts/Inter-Bold.ttf
     "../../assets/fonts/Microgramma D Extended Bold.otf"
     ../../assets/fonts/JetBrainsMono-Regular.ttf
+    # CJK fallback — covers Simplified/Traditional Chinese, Japanese, Korean
+    ../../assets/fonts/NotoSansCJKsc-Regular.otf
     # General UI icons
     ../../assets/icons/general/enter.svg
     ../../assets/icons/general/track.svg
@@ -28,6 +52,7 @@ juce_add_binary_data(MagdaAssets
     ../../assets/icons/general/menu.svg
     ../../assets/icons/general/chord.svg
     ../../assets/icons/general/funnel.svg
+    ../../assets/icons/general/learn.svg
     ../../assets/icons/general/refresh.svg
     ../../assets/icons/general/send.svg
     ../../assets/icons/general/chevron_left.svg
@@ -78,6 +103,10 @@ juce_add_binary_data(MagdaAssets
     ../../assets/icons/transport/punchin_on.svg
     ../../assets/icons/transport/punchout.svg
     ../../assets/icons/transport/punchout_on.svg
+    ../../assets/icons/transport/automation_off.svg
+    ../../assets/icons/transport/automation_on.svg
+    ../../assets/icons/transport/midi_qwerty_off.svg
+    ../../assets/icons/transport/midi_qwerty_on.svg
     # Inspector icons
     ../../assets/icons/inspector/infinito.svg
     ../../assets/icons/inspector/position.svg
@@ -95,6 +124,10 @@ juce_add_binary_data(MagdaAssets
     # Resume/arrangement icons
     ../../assets/icons/resume/resume.svg
     ../../assets/icons/resume/resume_on.svg
+    # Automation icons
+    ../../assets/icons/automation/horizontal_snap.svg
+    ../../assets/icons/automation/vertical_snap.svg
+    ../../assets/icons/automation/automation.svg
     # Waveform icons
     ../../assets/icons/waveform/sine-wave.svg
     ../../assets/icons/waveform/bare_sine.svg
@@ -185,6 +218,7 @@ set(DAW_CORE_SOURCES
     command.cpp
     magda.cpp
     core/Config.cpp
+    core/UpdateChecker.cpp
     core/ViewModeController.cpp
     core/TrackManager.cpp
     core/TrackManagerModulation.cpp
@@ -193,6 +227,7 @@ set(DAW_CORE_SOURCES
     core/ClipManager.cpp
     core/MidiFileWriter.cpp
     core/SelectionManager.cpp
+    core/AutomationInfo.cpp
     core/AutomationManager.cpp
     core/LinkModeManager.cpp
     core/UndoManager.cpp
@@ -203,7 +238,10 @@ set(DAW_CORE_SOURCES
     core/TrackPropertyCommands.cpp
     core/AutomationCommands.cpp
     core/MidiNoteCommands.cpp
+    core/ParameterInfo.cpp
     core/ParameterUtils.cpp
+    core/StringTable.cpp
+    core/ParameterDetector.cpp
     engine/TracktionEngineWrapper.cpp
     engine/TracktionEngineWrapperInit.cpp
     engine/TracktionEngineWrapperDevices.cpp
@@ -224,6 +262,7 @@ set(DAW_CORE_SOURCES
     audio/DeviceMeteringManager.cpp
     audio/DeviceProcessor.cpp
     audio/MidiBridge.cpp
+    audio/QwertyMidiKeyboard.cpp
     audio/SessionClipScheduler.cpp
     audio/SessionClipAudioMonitor.cpp
     audio/SessionMonitorPlugin.cpp
@@ -240,8 +279,12 @@ set(DAW_CORE_SOURCES
     audio/PluginManager.cpp
     audio/InstrumentRackManager.cpp
     audio/RackSyncManager.cpp
+    audio/AutomationPlaybackEngine.cpp
+    audio/AutomationRecordingEngine.cpp
+    audio/AutomationCurveSimplifier.cpp
     audio/ClipSynchronizer.cpp
     audio/SidechainMonitorPlugin.cpp
+    audio/AudioSidechainMonitorPlugin.cpp
     audio/MidiReceivePlugin.cpp
     audio/MagdaSamplerPlugin.cpp
     audio/DrumGridPlugin.cpp
@@ -330,6 +373,7 @@ set(DAW_UI_SOURCES
     ui/panels/content/AIChatConsoleContent.cpp
     ui/panels/content/ScriptingConsoleContent.cpp
     ui/panels/content/DSLTokeniser.cpp
+    ui/panels/content/PanelContent.cpp
     ui/panels/content/TrackChainContent.cpp
     ui/panels/content/MidiEditorContent.cpp
     ui/panels/content/PianoRollContent.cpp
@@ -349,6 +393,7 @@ set(DAW_UI_SOURCES
     ui/components/common/RampCurveDisplay.cpp
     ui/components/common/TimeBendPopup.cpp
     ui/components/common/SvgButton.cpp
+    ui/components/common/QwertyKeyboardPopup.cpp
     ui/components/common/IconSelector.cpp
     ui/components/common/ZoomControls.cpp
     ui/components/common/LayoutDebugPanel.cpp
@@ -553,9 +598,11 @@ set(DAW_HEADERS
     audio/PluginManager.hpp
     audio/InstrumentRackManager.hpp
     audio/RackSyncManager.hpp
+    audio/AutomationPlaybackEngine.hpp
     audio/ClipSynchronizer.hpp
     audio/SidechainTriggerBus.hpp
     audio/SidechainMonitorPlugin.hpp
+    audio/AudioSidechainMonitorPlugin.hpp
     audio/MidiBroadcastBus.hpp
     audio/MidiReceivePlugin.hpp
     audio/MagdaSamplerPlugin.hpp
@@ -651,6 +698,7 @@ set(DAW_HEADERS
     core/ModInfo.hpp
     # Core - Parameter
     core/ParameterInfo.hpp
+    core/ParameterDetector.hpp
     core/ParameterUtils.hpp
     # Core - Automation
     core/AutomationTypes.hpp
@@ -696,6 +744,21 @@ juce_add_gui_app(magda_daw_app
         <string>MAGDA needs access to your Downloads folder to import audio files.</string>
         <key>NSRemovableVolumesUsageDescription</key>
         <string>MAGDA needs access to external drives to load and save projects and audio files.</string>
+        <key>CFBundleDocumentTypes</key>
+        <array>
+            <dict>
+                <key>CFBundleTypeName</key>
+                <string>MAGDA Project</string>
+                <key>CFBundleTypeRole</key>
+                <string>Editor</string>
+                <key>LSHandlerRank</key>
+                <string>Owner</string>
+                <key>CFBundleTypeExtensions</key>
+                <array>
+                    <string>mgd</string>
+                </array>
+            </dict>
+        </array>
     </dict></plist>"
 )
 
@@ -893,6 +956,7 @@ target_include_directories(magda_plugin_scanner
     PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/engine
+    ${CMAKE_CURRENT_BINARY_DIR}/generated
 )
 
 # Copy scanner executable alongside the main app
@@ -917,5 +981,23 @@ else()
             "$<TARGET_FILE:magda_plugin_scanner>"
             "$<TARGET_FILE_DIR:magda_daw_app>/magda_plugin_scanner"
         COMMENT "Copying plugin scanner alongside app executable"
+    )
+endif()
+
+# Copy lang/ (localization JSON) into the app so StringTable can load it at runtime.
+set(MAGDA_LANG_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../../lang")
+if(APPLE)
+    add_custom_command(TARGET magda_daw_app POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${MAGDA_LANG_SRC}"
+            "$<TARGET_BUNDLE_CONTENT_DIR:magda_daw_app>/Resources/lang"
+        COMMENT "Copying localization files to app bundle Resources"
+    )
+else()
+    add_custom_command(TARGET magda_daw_app POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${MAGDA_LANG_SRC}"
+            "$<TARGET_FILE_DIR:magda_daw_app>/lang"
+        COMMENT "Copying localization files alongside app executable"
     )
 endif()

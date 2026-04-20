@@ -18,6 +18,7 @@ set(TEST_SOURCES
     test_modulation.cpp
     test_group_tracks_and_macros.cpp
     test_parameter_utils.cpp
+    test_update_checker.cpp
     test_plugin_loading.cpp
     test_plugin_format.cpp
     test_plugin_window_manager.cpp
@@ -31,6 +32,7 @@ set(TEST_SOURCES
     test_session_clip_playback.cpp
     test_sidechain_triggers.cpp
     test_curve_snapshot.cpp
+    test_automation_curve_simplifier.cpp
     test_scan_report.cpp
     test_drum_grid_plugin.cpp
     test_velocity_lane_utils.cpp
@@ -44,6 +46,9 @@ set(TEST_SOURCES
     test_mono_note_processor.cpp
     test_sends_and_track_deletion.cpp
     test_master_track_serialization.cpp
+    test_automation_agent.cpp
+    test_automation_singleton.cpp
+    test_compact_executor_context.cpp
 )
 
 # Create test executable

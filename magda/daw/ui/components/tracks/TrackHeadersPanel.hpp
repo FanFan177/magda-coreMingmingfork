@@ -13,6 +13,7 @@
 #include "../common/SvgButton.hpp"
 #include "../mixer/InputTypeSelector.hpp"
 #include "../mixer/RoutingSelector.hpp"
+#include "audio/MidiBridge.hpp"
 #include "core/AutomationManager.hpp"
 #include "core/SelectionManager.hpp"
 #include "core/TrackManager.hpp"
@@ -29,7 +30,8 @@ class TrackHeadersPanel : public juce::Component,
                           public TrackManagerListener,
                           public SelectionManagerListener,
                           public ViewModeListener,
-                          public AutomationManagerListener {
+                          public AutomationManagerListener,
+                          public MidiBridge::Listener {
   public:
     static constexpr int TRACK_HEADER_WIDTH = 200;
     static constexpr int DEFAULT_TRACK_HEIGHT = 80;
@@ -59,6 +61,10 @@ class TrackHeadersPanel : public juce::Component,
     void automationLanesChanged() override;
     void automationLanePropertyChanged(AutomationLaneId laneId) override;
 
+    // MidiBridge::Listener
+    void midiDeviceListChanged() override;
+    void automationValueChanged(AutomationLaneId laneId, double normalizedValue) override;
+
     // DragAndDropTarget implementation (plugin drops)
     bool isInterestedInDragSource(const SourceDetails& details) override;
     void itemDragEnter(const SourceDetails& details) override;
@@ -76,6 +82,11 @@ class TrackHeadersPanel : public juce::Component,
     void setScrollTarget(juce::Viewport* viewport) {
         scrollTarget_ = viewport;
     }
+
+    // Ghost-header preview: paints one phantom track-header row per label below
+    // the last real (non-master) track. Called during drag-to-create flows from
+    // both file drops and device drops. Pass an empty StringArray to clear.
+    void setGhostHeaders(const juce::StringArray& labels);
 
     // Track management
     void selectTrack(int index);
@@ -109,6 +120,11 @@ class TrackHeadersPanel : public juce::Component,
     // Callbacks
     std::function<void(int, int)> onTrackHeightChanged;
     std::function<void(int)> onTrackSelected;
+    // Fires when anything that affects the total tracks height changes
+    // (lane added/removed/resized, lane visibility toggled). MainView uses
+    // this to keep the content panel + headers panel sized together so the
+    // two viewports stay in scroll sync.
+    std::function<void()> onLayoutChanged;
     std::function<void(int, const juce::String&)> onTrackNameChanged;
     std::function<void(int, bool)> onTrackMutedChanged;
     std::function<void(int, bool)> onTrackSoloChanged;
@@ -185,6 +201,20 @@ class TrackHeadersPanel : public juce::Component,
     std::vector<std::unique_ptr<TrackHeader>> trackHeaders;
     std::vector<TrackId> visibleTrackIds_;  // Track IDs in display order
     std::unordered_map<TrackId, std::vector<AutomationLaneId>> visibleAutomationLanes_;
+
+    // Per-lane header buttons (snap time / snap value / bypass / delete).
+    // All four are custom LaneHeaderButton subclasses defined in the .cpp, but
+    // the struct only needs to hold them as juce::Button base pointers. Real
+    // child components — rebuilt on automationLanesChanged and positioned in
+    // updateTrackHeaderLayout.
+    struct AutoLaneHeaderButtons {
+        AutomationLaneId laneId = INVALID_AUTOMATION_LANE_ID;
+        std::unique_ptr<juce::Button> snapTimeBtn;
+        std::unique_ptr<juce::Button> snapValueBtn;
+        std::unique_ptr<juce::Button> bypassBtn;
+        std::unique_ptr<juce::Button> deleteBtn;
+    };
+    std::vector<std::unique_ptr<AutoLaneHeaderButtons>> laneHeaderButtons_;
     std::unordered_set<int> selectedTrackIndices_;
     double verticalZoom = 1.0;  // Track height multiplier
     ViewMode currentViewMode_ = ViewMode::Arrange;
@@ -205,6 +235,17 @@ class TrackHeadersPanel : public juce::Component,
     int resizingTrackIndex = -1;
     int resizeStartY = 0;
     int resizeStartHeight = 0;
+
+    // Drag-to-resize an automation lane's height from the headers panel,
+    // mirroring the lane's own resize handle in TrackContentPanel.
+    bool isResizingLane_ = false;
+    AutomationLaneId resizingLaneId_ = INVALID_AUTOMATION_LANE_ID;
+    int laneResizeStartY_ = 0;
+    int laneResizeStartHeight_ = 0;
+
+    // Returns the lane whose bottom-edge resize handle sits under the
+    // given panel-local point, or INVALID_AUTOMATION_LANE_ID if none.
+    AutomationLaneId findLaneResizeHandleAt(juce::Point<int> pos) const;
     static constexpr int RESIZE_HANDLE_HEIGHT = 6;
 
     // Drag-to-reorder state
@@ -222,7 +263,11 @@ class TrackHeadersPanel : public juce::Component,
     int dropTargetIndex_ = -1;
 
     // Plugin drop state
+    bool pluginDragActive_ = false;
     int pluginDropTrackIndex_ = -1;  // -1 = empty area (new track), >= 0 = existing track
+
+    // Ghost-header preview (file/device drags that will spawn new tracks)
+    juce::StringArray ghostHeaderLabels_;
 
     // Routing device management
     void populateAudioInputOptions(RoutingSelector* selector, TrackId trackId = INVALID_TRACK_ID);
@@ -292,6 +337,12 @@ class TrackHeadersPanel : public juce::Component,
 
     // Automation lane header painting
     void paintAutomationLaneHeaders(juce::Graphics& g, int trackIndex);
+
+    // Automation lane header button management
+    void rebuildLaneHeaderButtons();
+    void positionLaneHeaderButtons();
+
+    AutoLaneHeaderButtons* findLaneHeaderButtons(AutomationLaneId laneId);
 
     // Indentation
     static constexpr int INDENT_WIDTH = 12;

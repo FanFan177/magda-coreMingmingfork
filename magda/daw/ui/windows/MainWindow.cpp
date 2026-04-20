@@ -22,12 +22,16 @@
 #include "../views/MixerView.hpp"
 #include "../views/SessionView.hpp"
 #include "audio/AudioBridge.hpp"
+#include "audio/MidiBridge.hpp"
+#include "audio/QwertyMidiKeyboard.hpp"
 #include "core/Config.hpp"
 #include "core/LinkModeManager.hpp"
 #include "core/ModulatorEngine.hpp"
+#include "core/StringTable.hpp"
 #include "core/TrackCommands.hpp"
 #include "core/TrackManager.hpp"
 #include "core/UndoManager.hpp"
+#include "engine/AudioEngine.hpp"
 #include "engine/PlaybackPositionTimer.hpp"
 #include "engine/TracktionEngineWrapper.hpp"
 #include "project/ProjectManager.hpp"
@@ -95,7 +99,7 @@ class MainWindow::MainComponent::LoadingOverlay : public juce::Component, privat
     }
 
   private:
-    juce::String message_ = "Initializing...";
+    juce::String message_ = tr("main_window.loading.initializing");
     float alpha_ = 1.0f;
     int spinnerFrame_ = 0;
 
@@ -158,7 +162,13 @@ class MainWindow::MainComponent::ResizeHandle : public juce::Component {
         }
     }
 
+    void mouseDoubleClick(const juce::MouseEvent&) override {
+        if (onDoubleClick)
+            onDoubleClick();
+    }
+
     std::function<void(int)> onResize;
+    std::function<void()> onDoubleClick;
 
   private:
     Direction direction;
@@ -179,6 +189,44 @@ MainWindow::MainWindow(AudioEngine* audioEngine)
     mainComponent = new MainComponent(externalAudioEngine_);
     juce::Logger::writeToLog("[MainWindow] MainComponent created");
     setContentOwned(mainComponent, true);  // Window takes ownership
+
+    // Register command manager key mappings on the DocumentWindow so that
+    // shortcuts (Cmd+T, Cmd+Z, etc.) work regardless of which child
+    // component has keyboard focus. Previously this was on MainComponent,
+    // which missed events when a child (e.g. track name label) consumed
+    // focus after track creation.
+    addKeyListener(mainComponent->getCommandManager().getKeyMappings());
+
+    // Wire QWERTY keyboard toggle to register/unregister on THIS window
+    if (mainComponent->getQwertyKeyboard()) {
+        // Hand the keyboard pointer to the transport panel so right-clicking
+        // its toggle can pop up the keyboard-layout hint.
+        mainComponent->transportPanel->setQwertyKeyboard(mainComponent->getQwertyKeyboard());
+        mainComponent->transportPanel->onQwertyKeyboardToggled = [this](bool enabled) {
+            if (!mainComponent)
+                return;
+            auto* kb = mainComponent->getQwertyKeyboard();
+            if (!kb)
+                return;
+            kb->setEnabled(enabled);
+            if (enabled)
+                addKeyListener(kb);
+            else
+                removeKeyListener(kb);
+
+            // Enable/disable the virtual MIDI device and notify the
+            // routing selectors to refresh their cached device lists.
+            if (auto* engine = mainComponent->getAudioEngine()) {
+                if (auto* bridge = engine->getAudioBridge()) {
+                    if (auto* vmd = bridge->getQwertyMidiDevice())
+                        vmd->setEnabled(enabled);
+                }
+                if (auto* mb = engine->getMidiBridge())
+                    mb->notifyMidiDeviceListChanged();
+            }
+            DBG("QWERTY keyboard " << (enabled ? "ON" : "OFF"));
+        };
+    }
 
     // Setup menu bar
     juce::Logger::writeToLog("[MainWindow] Setting up menu bar...");
@@ -212,6 +260,15 @@ MainWindow::MainWindow(AudioEngine* audioEngine)
 
 MainWindow::~MainWindow() {
     DBG("  [5a] MainWindow::~MainWindow start");
+
+    // Remove QWERTY keyboard listener from this window before content is destroyed
+    if (mainComponent) {
+        if (auto* kb = mainComponent->getQwertyKeyboard()) {
+            removeKeyListener(kb);
+            kb->setEnabled(false);
+        }
+    }
+
     ProjectManager::getInstance().removeListener(this);
 
 #if JUCE_DEBUG
@@ -232,6 +289,7 @@ MainWindow::~MainWindow() {
     setMenuBar(nullptr);
 #endif
 
+    removeKeyListener(mainComponent->getCommandManager().getKeyMappings());
     DBG("  [5c] MainWindow::~MainWindow - about to destroy content");
 }
 
@@ -340,14 +398,12 @@ MainWindow::MainComponent::MainComponent(AudioEngine* externalEngine) {
         int screenWidth = display->userArea.getWidth();
         if (screenWidth >= 2560) {  // Large display (1440p+)
             leftPanelWidth = rightPanelWidth = 400;
-            bottomPanelHeight = 380;
         } else if (screenWidth >= 1920) {  // Full HD
             leftPanelWidth = rightPanelWidth = 350;
-            bottomPanelHeight = 350;
         } else {
             leftPanelWidth = rightPanelWidth = layout.defaultLeftPanelWidth;
-            bottomPanelHeight = layout.defaultBottomPanelHeight;
         }
+        bottomPanelHeight = layout.defaultBottomPanelHeight;
     } else {
         leftPanelWidth = rightPanelWidth = layout.defaultLeftPanelWidth;
         bottomPanelHeight = layout.defaultBottomPanelHeight;
@@ -409,6 +465,27 @@ MainWindow::MainComponent::MainComponent(AudioEngine* externalEngine) {
         bottomPanelCollapsed = collapsed;
         if (footerBar)
             footerBar->setBottomPanelCollapsed(collapsed);
+        resized();
+    };
+    bottomPanel->onHeaderDoubleClick = [this]() {
+        auto& layout = LayoutConfig::getInstance();
+        // Ask the active content for its preferred height. Falls back to
+        // the layout default if the content returns 0 (no preference).
+        int optimalHeight = 0;
+        if (auto* content = bottomPanel->getActiveContent())
+            optimalHeight = content->getOptimalPanelHeight(getHeight());
+        if (optimalHeight <= 0)
+            optimalHeight = layout.defaultBottomPanelHeight;
+        int maxHeight = static_cast<int>(getHeight() * layout.maxBottomPanelRatio);
+        bottomPanelHeight =
+            juce::jlimit(layout.minBottomPanelHeight,
+                         juce::jmax(layout.minBottomPanelHeight, maxHeight), optimalHeight);
+        if (bottomPanelCollapsed) {
+            bottomPanelCollapsed = false;
+            bottomPanel->setCollapsed(false);
+            if (footerBar)
+                footerBar->setBottomPanelCollapsed(false);
+        }
         resized();
     };
     addAndMakeVisible(*bottomPanel);
@@ -513,7 +590,7 @@ MainWindow::MainComponent::MainComponent(AudioEngine* externalEngine) {
             if (audioClips.empty())
                 return;
 
-            UndoManager::getInstance().beginCompoundOperation("Render Clips");
+            UndoManager::getInstance().beginCompoundOperation(tr("main_window.undo.render_clips"));
             std::vector<ClipId> newClips;
             for (auto cid : audioClips) {
                 auto cmd = std::make_unique<RenderClipCommand>(cid, engine);
@@ -749,6 +826,14 @@ void MainWindow::MainComponent::setupAudioEngineCallbacks(AudioEngine* engine) {
             engine->deactivateAllSessionClips();
     };
 
+    // QWERTY MIDI keyboard — created here, wired to MainWindow via the
+    // onQwertyKeyboardToggled callback set in the MainWindow constructor
+    // (after setContentOwned) so the key listener registers on the
+    // DocumentWindow, not on MainComponent.
+    if (auto* bridge = engine->getAudioBridge()) {
+        qwertyKeyboard_ = std::make_unique<QwertyMidiKeyboard>(*bridge);
+    }
+
     transportPanel->onTempoChange = [this](double bpm) {
         mainView->getTimelineController().dispatch(SetTempoEvent{bpm});
     };
@@ -776,6 +861,11 @@ void MainWindow::MainComponent::setupAudioEngineCallbacks(AudioEngine* engine) {
     transportPanel->onGridQuantizeChange = [this](bool autoGrid, int numerator, int denominator) {
         mainView->getTimelineController().dispatch(
             SetGridQuantizeEvent{autoGrid, numerator, denominator});
+    };
+
+    transportPanel->onAutomationWriteToggle = [this](bool enabled) {
+        if (auto* bridge = getAudioEngine()->getAudioBridge())
+            bridge->setAutomationWriteEnabled(enabled);
     };
 
     // Navigation callbacks
@@ -828,7 +918,7 @@ void MainWindow::MainComponent::setupDeviceLoadingCallback() {
     if (teWrapper) {
         // Show notification and disable transport if devices are still loading
         if (teWrapper->isDevicesLoading()) {
-            loadingOverlay_->setMessage("Scanning audio & MIDI devices...");
+            loadingOverlay_->setMessage(tr("main_window.loading.scanning_devices"));
             loadingOverlay_->showWithFade();
             loadingOverlay_->toFront(false);
             transportPanel->setTransportEnabled(false);

@@ -119,7 +119,8 @@ LinkableTextSlider::LinkableTextSlider(TextSlider::Format format) : slider_(form
                                .onRackMacroLinked = onRackMacroLinked,
                                .onTrackMacroLinked = onTrackMacroLinked,
                                .onRackMacroUnlinked = onRackMacroUnlinked,
-                               .onTrackMacroUnlinked = onTrackMacroUnlinked});
+                               .onTrackMacroUnlinked = onTrackMacroUnlinked,
+                               .onShowAutomationLane = onShowAutomationLane});
         }
     };
     addAndMakeVisible(slider_);
@@ -160,6 +161,10 @@ void LinkableTextSlider::setValueParser(std::function<double(const juce::String&
     slider_.setValueParser(std::move(parser));
 }
 
+void LinkableTextSlider::setParameterInfo(const magda::ParameterInfo& info) {
+    slider_.setParameterInfo(info);
+}
+
 void LinkableTextSlider::setRightClickEditsText(bool shouldEdit) {
     slider_.setRightClickEditsText(shouldEdit);
 }
@@ -193,6 +198,19 @@ void LinkableTextSlider::setLinkContext(magda::DeviceId deviceId, int paramIndex
     deviceId_ = deviceId;
     paramIndex_ = paramIndex;
     devicePath_ = devicePath;
+
+    // Wire the underlying TextSlider's automation target so the purple
+    // "automated" tint paints when a lane exists for this param, and so
+    // drag gestures trigger the touch/override bookkeeping on the lane.
+    magda::AutomationTarget target;
+    target.type = magda::AutomationTargetType::DeviceParameter;
+    target.trackId = devicePath.trackId;
+    target.devicePath = devicePath;
+    target.paramIndex = paramIndex;
+    if (target.isValid())
+        slider_.setAutomationTarget(target);
+    else
+        slider_.clearAutomationTarget();
 }
 
 void LinkableTextSlider::setAvailableMods(const magda::ModArray* mods) {
@@ -354,7 +372,8 @@ void LinkableTextSlider::mouseDown(const juce::MouseEvent& e) {
                            .onRackMacroLinked = onRackMacroLinked,
                            .onTrackMacroLinked = onTrackMacroLinked,
                            .onRackMacroUnlinked = onRackMacroUnlinked,
-                           .onTrackMacroUnlinked = onTrackMacroUnlinked});
+                           .onTrackMacroUnlinked = onTrackMacroUnlinked,
+                           .onShowAutomationLane = onShowAutomationLane});
         return;
     }
 

@@ -49,7 +49,8 @@ ParamSlotComponent::ParamSlotComponent(int paramIndex) : paramIndex_(paramIndex)
                            .onRackMacroLinked = onRackMacroLinked,
                            .onTrackMacroLinked = onTrackMacroLinked,
                            .onRackMacroUnlinked = onRackMacroUnlinked,
-                           .onTrackMacroUnlinked = onTrackMacroUnlinked});
+                           .onTrackMacroUnlinked = onTrackMacroUnlinked,
+                           .onShowAutomationLane = onShowAutomationLane});
     };
     valueSlider_.setRightClickEditsText(false);
 
@@ -62,6 +63,14 @@ ParamSlotComponent::ParamSlotComponent(int paramIndex) : paramIndex_(paramIndex)
     amountLabel_.setVisible(false);
     amountLabel_.setAlwaysOnTop(true);
     addChildComponent(amountLabel_);
+
+    // Shift+drag: edit mod amount when a mod is selected. Consulted before the
+    // gesture commits so Shift+drag with no mod selected falls through to the
+    // slider's normal (fine-tune) drag path.
+    valueSlider_.canStartShiftDrag = [this]() {
+        return selectedModIndex_ >= 0 && availableMods_ &&
+               selectedModIndex_ < static_cast<int>(availableMods_->size());
+    };
 
     // Shift+drag: edit mod amount when a mod is selected
     valueSlider_.onShiftDragStart = [this](float /*startValue*/) {
@@ -344,7 +353,24 @@ void ParamSlotComponent::setParamName(const juce::String& name) {
 }
 
 void ParamSlotComponent::setParamValue(double value) {
-    valueSlider_.setValue(value, juce::dontSendNotification);
+    // Bypass the slider's configured step interval (0.01) — that interval is
+    // there to give drags a pleasant coarse feel, but automation echoes push
+    // arbitrary continuous values and snapping them visibly quantizes the
+    // lane readout against the curve. setValueWithInterval(..., 0.0, ...)
+    // writes the exact value and still triggers the label refresh.
+    valueSlider_.setValueWithInterval(value, 0.0, juce::dontSendNotification);
+}
+
+void ParamSlotComponent::refreshAutomationTarget() {
+    magda::AutomationTarget target;
+    target.type = magda::AutomationTargetType::DeviceParameter;
+    target.trackId = devicePath_.trackId;
+    target.devicePath = devicePath_;
+    target.paramIndex = paramIndex_;
+    if (target.isValid())
+        valueSlider_.setAutomationTarget(target);
+    else
+        valueSlider_.clearAutomationTarget();
 }
 
 bool ParamSlotComponent::isBeingDragged() const {
@@ -398,8 +424,18 @@ void ParamSlotComponent::setFonts(const juce::Font& labelFont, const juce::Font&
 // Painting
 // ============================================================================
 
-void ParamSlotComponent::paint(juce::Graphics& /*g*/) {
-    // Selection highlight is drawn in paintOverChildren()
+void ParamSlotComponent::paint(juce::Graphics& g) {
+    // Draw cell background for toggle/combo widgets (TextSlider draws its own)
+    if ((boolToggle_ && boolToggle_->isVisible()) ||
+        (discreteCombo_ && discreteCombo_->isVisible())) {
+        auto bounds = getLocalBounds();
+        int labelHeight = juce::jmin(12, getHeight() / 3);
+        auto valueBounds = bounds.withTrimmedTop(labelHeight);
+        g.setColour(DarkTheme::getColour(DarkTheme::SURFACE));
+        g.fillRect(valueBounds);
+        g.setColour(DarkTheme::getColour(DarkTheme::BORDER));
+        g.drawRect(valueBounds);
+    }
 }
 
 void ParamSlotComponent::paintOverChildren(juce::Graphics& g) {
@@ -450,9 +486,11 @@ void ParamSlotComponent::resized() {
     nameLabel_.setBounds(bounds.removeFromTop(labelHeight));
 
     if (discreteCombo_ && discreteCombo_->isVisible()) {
-        discreteCombo_->setBounds(bounds);
+        discreteCombo_->setBounds(bounds.reduced(2));
     } else if (boolToggle_ && boolToggle_->isVisible()) {
-        auto toggleBounds = bounds.withSizeKeepingCentre(bounds.getWidth(), 20);
+        // Centre checkbox in the cell — needs enough space for JUCE tick rendering
+        int size = juce::jmin(28, bounds.getHeight(), bounds.getWidth());
+        auto toggleBounds = bounds.withSizeKeepingCentre(size, size);
         boolToggle_->setBounds(toggleBounds);
     } else {
         valueSlider_.setBounds(bounds);
@@ -495,7 +533,8 @@ void ParamSlotComponent::mouseDown(const juce::MouseEvent& e) {
                            .onRackMacroLinked = onRackMacroLinked,
                            .onTrackMacroLinked = onTrackMacroLinked,
                            .onRackMacroUnlinked = onRackMacroUnlinked,
-                           .onTrackMacroUnlinked = onTrackMacroUnlinked});
+                           .onTrackMacroUnlinked = onTrackMacroUnlinked,
+                           .onShowAutomationLane = onShowAutomationLane});
         return;
     }
 

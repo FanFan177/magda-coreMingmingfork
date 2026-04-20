@@ -149,6 +149,11 @@ class TrackContentPanel : public juce::Component,
 
     // Callbacks
     std::function<void(int)> onTrackSelected;
+
+    // Fires during file-drag with the list of audio filenames that are about
+    // to spawn new tracks (empty = clear ghost). Wired by MainView to push
+    // ghost-header previews into TrackHeadersPanel.
+    std::function<void(const juce::StringArray&)> onGhostHeadersChanged;
     std::function<void(int, int)> onTrackHeightChanged;
     std::function<void(double, double, std::set<int>)>
         onTimeSelectionChanged;                             // startTime, endTime, trackIndices
@@ -159,7 +164,10 @@ class TrackContentPanel : public juce::Component,
     std::function<void(ClipId)> onBounceToNewTrackRequested;  // Bounce clip to new track
     std::function<double(double)>
         snapTimeToGrid;  // Callback to snap time to grid (provided by MainView)
-
+    std::function<double(double)>
+        snapBeatsToGrid;  // Callback to snap beats to grid (for automation, provided by MainView)
+    std::function<double()>
+        getGridSpacingBeats;  // Returns current grid spacing in beats (for line stamp tool)
     // Multi-clip drag methods (public for ClipComponent access)
     void startMultiClipDrag(ClipId anchorClipId, const juce::Point<int>& startPos);
     void updateMultiClipDrag(const juce::Point<int>& currentPos);
@@ -373,13 +381,23 @@ class TrackContentPanel : public juce::Component,
     // Plugin Drag-and-Drop State
     // ========================================================================
     bool showPluginDropOverlay_ = false;
+    int pluginDropTrackIndex_ = -1;  // -1 = empty area (new track)
+    int minHeight_ = 0;              // Floor set by MainView so DnD works below last track
 
+  public:
+    void setMinHeight(int h) {
+        minHeight_ = h;
+    }
+
+  private:
     // ========================================================================
     // File Drag-and-Drop State
     // ========================================================================
     bool showDropIndicator_ = false;
     double dropInsertTime_ = 0.0;
     int dropTargetTrackIndex_ = -1;
+    juce::StringArray draggedAudioFiles_;        // Audio files currently being dragged over
+    std::vector<double> draggedAudioDurations_;  // Parallel to draggedAudioFiles_
 
     // Group track extent cache — avoids walking all descendants every paint
     struct GroupExtent {

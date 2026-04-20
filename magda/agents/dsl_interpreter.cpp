@@ -1,6 +1,7 @@
 #include "dsl_interpreter.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
@@ -339,8 +340,15 @@ bool Interpreter::execute(const char* dslCode) {
 
     ctx_ = InterpreterContext();
 
-    // Inject selected clip from UI so note operations work without explicit selection
+    // Seed implicit context from the UI selection so a bare statement like
+    // `fx("reverb")` or `note(...)` targets the selected track/clip. Matches
+    // CompactExecutor's behaviour — the two paths must stay in sync or the
+    // same request succeeds in one and fails in the other.
     auto& sm = SelectionManager::getInstance();
+    auto selectedTrack = sm.getSelectedTrack();
+    if (selectedTrack != INVALID_TRACK_ID && selectedTrack != MASTER_TRACK_ID)
+        ctx_.currentTrackId = selectedTrack;
+
     auto selectedClip = sm.getSelectedClip();
     if (selectedClip != INVALID_CLIP_ID)
         ctx_.currentClipId = selectedClip;
@@ -1415,6 +1423,18 @@ double Interpreter::barsToTime(double bar) const {
 // State Snapshot
 // ============================================================================
 
+namespace {
+std::atomic<bool> g_contextEnabled{true};
+}
+
+void Interpreter::setContextEnabled(bool enabled) {
+    g_contextEnabled.store(enabled, std::memory_order_relaxed);
+}
+
+bool Interpreter::isContextEnabled() {
+    return g_contextEnabled.load(std::memory_order_relaxed);
+}
+
 juce::String Interpreter::buildStateSnapshot() {
     auto& tm = TrackManager::getInstance();
 
@@ -1434,7 +1454,12 @@ juce::String Interpreter::buildStateSnapshot() {
     root->setProperty("tracks", tracksArray);
     root->setProperty("track_count", tm.getNumTracks());
 
-    // Current selection context
+    // Selection context — only exposed to the LLM when the UI's context
+    // toggle is enabled. When disabled, the snapshot still lists the tracks
+    // but omits the selection so the LLM has no bias signal.
+    if (!g_contextEnabled.load(std::memory_order_relaxed))
+        return juce::JSON::toString(juce::var(root), true);
+
     auto& sm = SelectionManager::getInstance();
     auto selTrack = sm.getSelectedTrack();
     if (selTrack != INVALID_TRACK_ID) {

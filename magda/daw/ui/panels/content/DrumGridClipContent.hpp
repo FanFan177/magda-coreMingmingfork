@@ -48,6 +48,14 @@ class DrumGridClipContent : public MidiEditorContent, private juce::Timer {
     void onActivated() override;
     void onDeactivated() override;
 
+    bool wantsHeader() const override {
+        return true;
+    }
+
+    int getOptimalPanelHeight(int windowHeight) const override {
+        return windowHeight * 2 / 3;
+    }
+
     // ClipManagerListener overrides
     void clipsChanged() override;
     void clipSelectionChanged(magda::ClipId clipId) override;

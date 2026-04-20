@@ -15,8 +15,10 @@
 #include "../../themes/DarkTheme.hpp"
 #include "../../themes/FontManager.hpp"
 #include "../../themes/SmallButtonLookAndFeel.hpp"
+#include "core/AutomationManager.hpp"
 #include "core/ClipManager.hpp"
 #include "core/Config.hpp"
+#include "core/StringTable.hpp"
 #include "core/TrackPropertyCommands.hpp"
 #include "core/UndoManager.hpp"
 
@@ -306,7 +308,7 @@ TrackInspector::TrackInspector() {
     addAndMakeVisible(*panLabel_);
 
     // Routing section
-    routingSectionLabel_.setText("Routing", juce::dontSendNotification);
+    routingSectionLabel_.setText(tr("inspector.routing"), juce::dontSendNotification);
     routingSectionLabel_.setFont(FontManager::getInstance().getUIFont(11.0f));
     routingSectionLabel_.setColour(juce::Label::textColourId, DarkTheme::getSecondaryTextColour());
     addAndMakeVisible(routingSectionLabel_);
@@ -338,12 +340,13 @@ TrackInspector::TrackInspector() {
     addAndMakeVisible(*midiOutputSelector_);
 
     // Column header labels for routing selectors
-    audioColumnLabel_.setText("Audio", juce::dontSendNotification);
+    audioColumnLabel_.setText(tr("inspector.audio"), juce::dontSendNotification);
     audioColumnLabel_.setFont(FontManager::getInstance().getUIFont(9.0f));
     audioColumnLabel_.setColour(juce::Label::textColourId, DarkTheme::getSecondaryTextColour());
     audioColumnLabel_.setJustificationType(juce::Justification::centred);
     addAndMakeVisible(audioColumnLabel_);
 
+    // "MIDI" is a universal technical acronym — do not translate.
     midiColumnLabel_.setText("MIDI", juce::dontSendNotification);
     midiColumnLabel_.setFont(FontManager::getInstance().getUIFont(9.0f));
     midiColumnLabel_.setColour(juce::Label::textColourId, DarkTheme::getSecondaryTextColour());
@@ -372,13 +375,13 @@ TrackInspector::TrackInspector() {
     addAndMakeVisible(*outputIcon_);
 
     // Send/Receive section
-    sendReceiveSectionLabel_.setText("Sends / Receives", juce::dontSendNotification);
+    sendReceiveSectionLabel_.setText(tr("inspector.sends"), juce::dontSendNotification);
     sendReceiveSectionLabel_.setFont(FontManager::getInstance().getUIFont(11.0f));
     sendReceiveSectionLabel_.setColour(juce::Label::textColourId,
                                        DarkTheme::getSecondaryTextColour());
     addAndMakeVisible(sendReceiveSectionLabel_);
 
-    addSendButton_.setButtonText("+ Send");
+    addSendButton_.setButtonText(tr("inspector.add_send"));
     addSendButton_.setColour(juce::TextButton::buttonColourId,
                              DarkTheme::getColour(DarkTheme::SURFACE));
     addSendButton_.setColour(juce::TextButton::textColourOffId,
@@ -386,7 +389,7 @@ TrackInspector::TrackInspector() {
     addSendButton_.onClick = [this]() { showAddSendMenu(); };
     addAndMakeVisible(addSendButton_);
 
-    noSendsLabel_.setText("No sends", juce::dontSendNotification);
+    noSendsLabel_.setText(tr("inspector.no_sends"), juce::dontSendNotification);
     noSendsLabel_.setFont(FontManager::getInstance().getUIFont(10.0f));
     noSendsLabel_.setColour(juce::Label::textColourId, DarkTheme::getSecondaryTextColour());
     addAndMakeVisible(noSendsLabel_);
@@ -418,7 +421,15 @@ TrackInspector::TrackInspector() {
     addAndMakeVisible(latencyValue_);
 }
 
+void TrackInspector::midiDeviceListChanged() {
+    juce::MessageManager::callAsync([this]() { populateMidiInputOptions(); });
+}
+
 TrackInspector::~TrackInspector() {
+    if (audioEngine_) {
+        if (auto* mb = audioEngine_->getMidiBridge())
+            mb->removeMidiDeviceListListener(this);
+    }
     stopTimer();
     magda::TrackManager::getInstance().removeListener(this);
 }
@@ -692,6 +703,23 @@ void TrackInspector::setSelectedTrack(magda::TrackId trackId) {
     selectedTrackIds_.clear();
     selectedTrackId_ = trackId;
 
+    // Bind automation targets so the inspector gain/pan mirror the track
+    // header's purple/grey state automatically via the observer. Skip the
+    // master track (no automation lanes for master volume/pan).
+    if (trackId != magda::INVALID_TRACK_ID && trackId != magda::MASTER_TRACK_ID) {
+        magda::AutomationTarget volTarget;
+        volTarget.type = magda::AutomationTargetType::TrackVolume;
+        volTarget.trackId = trackId;
+        gainLabel_->setAutomationTarget(volTarget);
+        magda::AutomationTarget panTarget;
+        panTarget.type = magda::AutomationTargetType::TrackPan;
+        panTarget.trackId = trackId;
+        panLabel_->setAutomationTarget(panTarget);
+    } else {
+        gainLabel_->clearAutomationTarget();
+        panLabel_->clearAutomationTarget();
+    }
+
     // Restore single-track callbacks if switching from multi-track mode
     if (wasMulti) {
         muteButton_.onClick = [this]() {
@@ -799,6 +827,10 @@ void TrackInspector::setSelectedTracks(const std::unordered_set<magda::TrackId>&
     isMultiTrackMode_ = true;
     selectedTrackIds_ = trackIds;
     selectedTrackId_ = magda::INVALID_TRACK_ID;
+    // Multi-track selection has no single target to mirror, so clear any
+    // binding left from single-track mode.
+    gainLabel_->clearAutomationTarget();
+    panLabel_->clearAutomationTarget();
     updateFromMultiTrackSelection();
 }
 
@@ -877,7 +909,7 @@ void TrackInspector::updateFromSelectedTrack() {
     // Master track — show basic controls from MasterChannelState
     if (selectedTrackId_ == magda::MASTER_TRACK_ID) {
         const auto& master = magda::TrackManager::getInstance().getMasterChannel();
-        trackNameValue_.setText("Master", juce::dontSendNotification);
+        trackNameValue_.setText(tr("common.master"), juce::dontSendNotification);
         speakerButton_->setToggleState(master.muted, juce::dontSendNotification);
         soloButton_.setToggleState(false, juce::dontSendNotification);
         recordButton_.setToggleState(false, juce::dontSendNotification);
@@ -1281,6 +1313,41 @@ void TrackInspector::rebuildSendsUI() {
             magda::UndoManager::getInstance().executeCommand(
                 std::make_unique<magda::SetSendLevelCommand>(srcId, busIndex, gain));
         };
+
+        // Bind automation visual state + right-click menu so the send label
+        // tracks purple/grey like the volume fader and can add/show its lane.
+        magda::AutomationTarget sendTarget;
+        sendTarget.type = magda::AutomationTargetType::SendLevel;
+        sendTarget.trackId = srcId;
+        sendTarget.sendBusIndex = busIndex;
+        levelLabel->setAutomationTarget(sendTarget);
+
+        levelLabel->onRightClick = [srcId, busIndex]() {
+            auto& autoMgr = magda::AutomationManager::getInstance();
+            magda::AutomationTarget target;
+            target.type = magda::AutomationTargetType::SendLevel;
+            target.trackId = srcId;
+            target.sendBusIndex = busIndex;
+
+            auto laneId = autoMgr.getLaneForTarget(target);
+            const bool hasLane = laneId != magda::INVALID_AUTOMATION_LANE_ID;
+
+            juce::PopupMenu menu;
+            menu.addItem(1, hasLane ? "Show Automation Lane" : "Add Automation Lane");
+            if (hasLane)
+                menu.addItem(2, "Delete Automation Lane");
+            menu.showMenuAsync(juce::PopupMenu::Options(), [target](int result) {
+                auto& mgr = magda::AutomationManager::getInstance();
+                if (result == 1) {
+                    auto id = mgr.getOrCreateLane(target, magda::AutomationLaneType::Absolute);
+                    mgr.setLaneVisible(id, true);
+                } else if (result == 2) {
+                    auto id = mgr.getLaneForTarget(target);
+                    if (id != magda::INVALID_AUTOMATION_LANE_ID)
+                        mgr.deleteLane(id);
+                }
+            });
+        };
         addAndMakeVisible(*levelLabel);
         sendLevelLabels_.push_back(std::move(levelLabel));
 
@@ -1385,6 +1452,10 @@ void TrackInspector::showAddSendMenu() {
 void TrackInspector::populateRoutingSelectors() {
     if (!audioEngine_)
         return;
+
+    // Register for device list changes (QWERTY keyboard toggle, etc.)
+    if (auto* mb = audioEngine_->getMidiBridge())
+        mb->addMidiDeviceListListener(this);
 
     // Populate all routing selectors
     populateAudioInputOptions();

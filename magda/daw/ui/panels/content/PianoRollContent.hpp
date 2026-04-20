@@ -42,6 +42,14 @@ class PianoRollContent : public MidiEditorContent, public magda::SelectionManage
     void onActivated() override;
     void onDeactivated() override;
 
+    bool wantsHeader() const override {
+        return true;
+    }
+
+    int getOptimalPanelHeight(int windowHeight) const override {
+        return windowHeight * 2 / 3;
+    }
+
     // ClipManagerListener overrides
     void clipsChanged() override;
     void clipPropertyChanged(magda::ClipId clipId) override;

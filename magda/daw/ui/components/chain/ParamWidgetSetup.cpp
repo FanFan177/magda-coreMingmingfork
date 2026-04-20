@@ -1,10 +1,87 @@
 #include "ParamWidgetSetup.hpp"
 
+#include <cmath>
+#include <limits>
+
 #include "ui/themes/DarkTheme.hpp"
+#include "ui/themes/SmallComboBoxLookAndFeel.hpp"
 
 namespace magda::daw::ui {
 
 void configureSliderFormatting(TextSlider& slider, const magda::ParameterInfo& info) {
+    // Live plugin display text — exact values, no quantization.
+    //
+    // DisplayTextProvider::format is a thin wrapper around TE's
+    // valueToString, so the argument MUST be a plugin-native (TE raw)
+    // value. The generic slot slider operates in MAGDA-normalized 0..1
+    // space, so we project back to the TE range (info.teMinValue /
+    // teMaxValue, captured at makeInfoFromTeParam time and preserved
+    // across AI-Detect overrides). For external VSTs TE range is
+    // [0,1] and this is a no-op; for 4OSC the filterFreq range is
+    // [0,135] so 0.5 → 67.5 → "440 Hz".
+    if (info.displayText) {
+        auto provider = info.displayText;
+        const float teMin = info.teMinValue;
+        const float teSpan = info.teMaxValue - info.teMinValue;
+        slider.setValueFormatter([provider, teMin, teSpan](double normalized) {
+            const float teRaw = teMin + static_cast<float>(normalized) * teSpan;
+            return provider->format(teRaw);
+        });
+        // Reverse-lookup parser: strip unit suffix, parse number, find closest
+        // normalized value by querying the plugin at sample points.
+        slider.setValueParser([provider, teMin, teSpan](const juce::String& text) -> double {
+            auto stripped = text.trim().retainCharacters("0123456789.-+eE");
+            double target = stripped.getDoubleValue();
+            int bestIdx = 0;
+            double bestDist = std::numeric_limits<double>::max();
+            constexpr int kSteps = 128;
+            for (int i = 0; i <= kSteps; ++i) {
+                float norm = static_cast<float>(i) / kSteps;
+                float teRaw = teMin + norm * teSpan;
+                auto numPart = provider->format(teRaw).trim().retainCharacters("0123456789.-+eE");
+                if (numPart.isEmpty())
+                    continue;
+                double dist = std::abs(numPart.getDoubleValue() - target);
+                if (dist < bestDist) {
+                    bestDist = dist;
+                    bestIdx = i;
+                }
+            }
+            return static_cast<double>(bestIdx) / kSteps;
+        });
+        return;
+    }
+
+    // If we have a full value table from the plugin, use it directly
+    if (!info.valueTable.empty()) {
+        slider.setValueFormatter([vt = info.valueTable](double normalized) {
+            int idx = juce::jlimit(0, static_cast<int>(vt.size()) - 1,
+                                   static_cast<int>(std::round(normalized * (vt.size() - 1))));
+            return vt[static_cast<size_t>(idx)].trim();
+        });
+        // Reverse-lookup parser: strip any unit suffix, parse the number,
+        // then find the closest value table entry by numeric distance.
+        slider.setValueParser([vt = info.valueTable](const juce::String& text) -> double {
+            auto stripped = text.trim().retainCharacters("0123456789.-+eE");
+            double target = stripped.getDoubleValue();
+            int bestIdx = 0;
+            double bestDist = std::numeric_limits<double>::max();
+            for (int i = 0; i < static_cast<int>(vt.size()); ++i) {
+                auto numPart =
+                    vt[static_cast<size_t>(i)].trim().retainCharacters("0123456789.-+eE");
+                if (numPart.isEmpty())
+                    continue;
+                double dist = std::abs(numPart.getDoubleValue() - target);
+                if (dist < bestDist) {
+                    bestDist = dist;
+                    bestIdx = i;
+                }
+            }
+            return static_cast<double>(bestIdx) / juce::jmax(1, static_cast<int>(vt.size()) - 1);
+        });
+        return;
+    }
+
     if (info.scale == magda::ParameterScale::Logarithmic && info.unit == "Hz") {
         // Frequency — show as Hz / kHz
         slider.setValueFormatter([info](double normalized) {
@@ -77,14 +154,16 @@ void configureBoolToggle(juce::ToggleButton& toggle, const magda::ParameterInfo&
         }
     };
     toggle.setToggleState(info.currentValue >= 0.5, juce::dontSendNotification);
-    toggle.setButtonText(info.currentValue >= 0.5 ? "On" : "Off");
+    toggle.setButtonText("");
 }
 
 void configureDiscreteCombo(juce::ComboBox& combo, const magda::ParameterInfo& info,
                             std::function<void(double)> onValueChanged) {
-    combo.setColour(juce::ComboBox::backgroundColourId, DarkTheme::getColour(DarkTheme::SURFACE));
+    combo.setLookAndFeel(&SmallComboBoxLookAndFeel::getInstance());
+    combo.setColour(juce::ComboBox::backgroundColourId, juce::Colours::transparentBlack);
     combo.setColour(juce::ComboBox::textColourId, juce::Colours::white);
-    combo.setColour(juce::ComboBox::outlineColourId, DarkTheme::getColour(DarkTheme::BORDER));
+    combo.setColour(juce::ComboBox::outlineColourId, juce::Colours::transparentBlack);
+    combo.setJustificationType(juce::Justification::centred);
 
     int numChoices = static_cast<int>(info.choices.size());
     combo.onChange = [&combo, numChoices, cb = std::move(onValueChanged)]() {
