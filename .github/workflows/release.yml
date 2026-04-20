@@ -45,12 +45,15 @@ jobs:
         echo "Version: $VERSION"
 
     - name: Configure CMake (Universal Binary)
+      env:
+        VERSION: ${{ steps.version.outputs.version }}
       run: |
         cmake -B build -G Ninja \
           -DCMAKE_BUILD_TYPE=Release \
           -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
           -DCMAKE_OSX_DEPLOYMENT_TARGET="11.0" \
           -DMAGDA_BUILD_TESTS=OFF \
+          -DMAGDA_FULL_VERSION="$VERSION" \
           -DCMAKE_C_COMPILER_LAUNCHER=sccache \
           -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
 
@@ -302,11 +305,14 @@ jobs:
 
     - name: Configure CMake
       shell: powershell
+      env:
+        VERSION: ${{ steps.version.outputs.version }}
       run: |
         cmake -B build -G Ninja `
           -DCMAKE_BUILD_TYPE=Release `
           -DCMAKE_SYSTEM_PROCESSOR=x64 `
           -DMAGDA_BUILD_TESTS=OFF `
+          -DMAGDA_FULL_VERSION="$env:VERSION" `
           -DCMAKE_C_COMPILER_LAUNCHER=sccache `
           -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
 
@@ -352,23 +358,40 @@ jobs:
       env:
         VERSION: ${{ steps.version.outputs.version }}
       run: |
-        $stagingDir = "packaging\windows"
-        Copy-Item "${{ steps.locate.outputs.exe_path }}" "$stagingDir\MAGDA.exe"
+        # Stage installer inputs into an ephemeral directory outside the source
+        # tree so the checkout stays clean and every shipped artifact appears
+        # here explicitly. The .nsi uses ${__FILEDIR__} and finds files next to
+        # itself, so staging and makensis invocation agree without chdir.
+        $stage = Join-Path $env:RUNNER_TEMP "magda-installer-stage"
+        if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+        New-Item -ItemType Directory -Path $stage | Out-Null
 
-        # Copy plugin scanner executable alongside MAGDA.exe
+        Copy-Item "packaging\windows\magda-installer.nsi" "$stage\"
+        Copy-Item "${{ steps.locate.outputs.exe_path }}" "$stage\MAGDA.exe"
+
         $exeDir = Split-Path "${{ steps.locate.outputs.exe_path }}"
         $scanner = Join-Path $exeDir "magda_plugin_scanner.exe"
         if (Test-Path $scanner) {
-          Copy-Item $scanner "$stagingDir\magda_plugin_scanner.exe"
+          Copy-Item $scanner "$stage\magda_plugin_scanner.exe"
           Write-Output "Copied plugin scanner to staging"
         } else {
           Write-Warning "magda_plugin_scanner.exe not found at $scanner"
         }
 
-        & "${env:ProgramFiles(x86)}\NSIS\makensis.exe" /DVERSION=$env:VERSION "$stagingDir\magda-installer.nsi"
+        Copy-Item -Recurse "lang" "$stage\lang"
+        Write-Output "Staged lang/ for installer"
+
+        # Guard against a regression where lang/ stops being bundled - 0.5
+        # shipped with missing translations because staging silently dropped it.
+        if (-not (Test-Path "$stage\lang\en.json")) {
+          Write-Error "lang/en.json missing from installer staging"
+          exit 1
+        }
+
+        & "${env:ProgramFiles(x86)}\NSIS\makensis.exe" /DVERSION=$env:VERSION "$stage\magda-installer.nsi"
 
         $installerName = "MAGDA-$env:VERSION-Windows-x86_64-Setup.exe"
-        Move-Item "$stagingDir\MAGDA-$env:VERSION-Windows-Setup.exe" $installerName
+        Move-Item "$stage\MAGDA-$env:VERSION-Windows-Setup.exe" $installerName
 
         Write-Output "Installer created: $installerName"
         Get-ChildItem $installerName
@@ -397,7 +420,7 @@ jobs:
       shell: powershell
       run: |
         Remove-Item -Recurse -Force build -ErrorAction SilentlyContinue
-        Remove-Item -Force "packaging\windows\MAGDA.exe" -ErrorAction SilentlyContinue
+        Remove-Item -Recurse -Force (Join-Path $env:RUNNER_TEMP "magda-installer-stage") -ErrorAction SilentlyContinue
 
   build-linux:
     runs-on: ubuntu-latest
@@ -460,11 +483,14 @@ jobs:
         sccache --version
 
     - name: Configure CMake
+      env:
+        VERSION: ${{ steps.version.outputs.version }}
       run: |
         cmake -B build -G Ninja \
           -DCMAKE_BUILD_TYPE=Release \
           -DCMAKE_INSTALL_PREFIX=/usr \
           -DMAGDA_BUILD_TESTS=OFF \
+          -DMAGDA_FULL_VERSION="$VERSION" \
           -DCMAKE_C_COMPILER_LAUNCHER=sccache \
           -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
 
@@ -501,6 +527,14 @@ jobs:
         else
           echo "Warning: magda_plugin_scanner not found"
         fi
+
+        # Localization JSON - StringTable looks for lang/ next to the binary
+        cp -r lang "$APPDIR/usr/bin/lang"
+
+        # Guard against a regression where lang/ stops being bundled - 0.5
+        # shipped with missing translations because staging silently dropped it.
+        test -f "$APPDIR/usr/bin/lang/en.json" \
+          || { echo "lang/en.json missing from AppDir staging"; exit 1; }
 
         # Copy icon
         cp assets/app_icon.png "$APPDIR/usr/share/icons/hicolor/256x256/apps/magda.png"
