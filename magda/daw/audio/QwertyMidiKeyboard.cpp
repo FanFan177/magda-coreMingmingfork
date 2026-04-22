@@ -139,8 +139,14 @@ bool QwertyMidiKeyboard::keyPressed(const juce::KeyPress& key, juce::Component*)
     if (mods.isCommandDown() || mods.isCtrlDown() || mods.isAltDown())
         return false;
 
-    // Octave shift: Z down, X up
+    // Normalize ASCII letter keys to uppercase. JUCE returns the char-level
+    // code from getKeyCode(): uppercase on macOS but lowercase on Linux/X11
+    // for unshifted letters, which would otherwise miss our A-Z switch.
     int keyCode = key.getKeyCode();
+    if (keyCode >= 'a' && keyCode <= 'z')
+        keyCode = keyCode - 'a' + 'A';
+
+    // Octave shift: Z down, X up
     if (keyCode == 'Z') {
         setBaseOctave(baseOctave_ - 1);
         return true;
@@ -181,7 +187,13 @@ bool QwertyMidiKeyboard::keyStateChanged(bool /*isKeyDown*/, juce::Component*) {
         // Build reverse map inline — check each key that maps to this note
         for (int kc :
              {'A', 'S', 'D', 'F', 'G', 'H', 'J', 'W', 'E', 'T', 'Y', 'U', 'K', 'L', 'O', 'P'}) {
-            if (keyToNote(kc) == note && juce::KeyPress::isKeyCurrentlyDown(kc)) {
+            if (keyToNote(kc) != note)
+                continue;
+            // Linux/X11 reports letter keys as lowercase — check both so held
+            // notes release correctly across platforms.
+            int lower = kc - 'A' + 'a';
+            if (juce::KeyPress::isKeyCurrentlyDown(kc) ||
+                juce::KeyPress::isKeyCurrentlyDown(lower)) {
                 stillDown = true;
                 break;
             }
