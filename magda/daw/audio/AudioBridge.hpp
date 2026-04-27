@@ -75,6 +75,8 @@ class AudioBridge : public TrackManagerListener, public ClipManagerListener, pub
     void deviceParameterChanged(DeviceId deviceId, int paramIndex, float newValue) override;
     void macroValueChanged(TrackId trackId, bool isRack, int id, int macroIndex,
                            float value) override;
+    void modParameterChanged(TrackId trackId, const ChainNodePath& devicePath, ModId modId,
+                             int paramIndex, float value) override;
     void masterChannelChanged() override;
 
     // =========================================================================
@@ -493,6 +495,16 @@ class AudioBridge : public TrackManagerListener, public ClipManagerListener, pub
      * @brief Check if automation write mode is enabled
      */
     bool isAutomationWriteEnabled() const;
+
+    /**
+     * @brief Set the active automation mode (Off / Write / Touch / Latch).
+     *
+     * Off disarms recording. Write records any user-driven change while transport
+     * rolls. Touch records only while a control is held. Latch records while held
+     * and continues writing the held value after release until the transport stops.
+     */
+    void setAutomationMode(AutomationMode mode);
+    AutomationMode getAutomationMode() const;
 
     // =========================================================================
     // Mixer Controls

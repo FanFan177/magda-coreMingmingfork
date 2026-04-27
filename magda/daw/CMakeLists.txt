@@ -211,6 +211,10 @@ juce_add_binary_data(MagdaAssets
     ../../assets/icons/cloud_providers/openrouter.svg
     # App logo
     ../../assets/magda-lisa.svg
+    # Curated alias dictionaries
+    ../../assets/aliases/curated_index.json
+    ../../assets/aliases/curated_eq.json
+    ../../assets/aliases/curated_compressor.json
 )
 
 # DAW Core sources
@@ -218,6 +222,7 @@ set(DAW_CORE_SOURCES
     command.cpp
     magda.cpp
     core/Config.cpp
+    core/UIScale.cpp
     core/UpdateChecker.cpp
     core/ViewModeController.cpp
     core/TrackManager.cpp
@@ -242,6 +247,39 @@ set(DAW_CORE_SOURCES
     core/ParameterUtils.cpp
     core/StringTable.cpp
     core/ParameterDetector.cpp
+    # Parameter alias system (PR 1 -- data model and normalisation)
+    core/aliases/Target.cpp
+    core/aliases/ParamNameNormalize.cpp
+    core/aliases/ParamSigilParser.cpp
+    # Parameter alias system (PR 2 -- AliasRegistry and persistence)
+    core/aliases/AliasRegistry.cpp
+    # MIDI Learn reverse index helpers
+    core/aliases/AliasReverseIndex.cpp
+    # Parameter alias system (PR 3 -- ResolverRegistry, ChainContext, TargetResolver)
+    core/aliases/ChainContext.cpp
+    core/aliases/ResolverRegistry.cpp
+    core/aliases/TargetResolver.cpp
+    # Parameter alias system (PR 4 -- AutoAliasGenerator)
+    core/aliases/AutoAliasGenerator.cpp
+    # Parameter alias system (PR 5 -- CuratedAliasLoader)
+    core/aliases/CuratedAliasLoader.cpp
+    # Controller data model (issue #1050 -- Phase A)
+    core/controllers/Controller.cpp
+    core/controllers/Binding.cpp
+    core/controllers/BindingTransform.cpp
+    # Controller registries (issue #1050 -- Phase B)
+    core/controllers/ControllerRegistry.cpp
+    core/controllers/BindingRegistry.cpp
+    # Controller profiles (issue #1052 -- hardware profile layer)
+    core/controllers/ControllerProfile.cpp
+    core/controllers/ControllerProfileRegistry.cpp
+    # Controller router + param writer (issue #1050 -- Phase C)
+    audio/ControllerParamWriter.cpp
+    audio/ControllerRouter.cpp
+    # MIDI Learn coordinator (issue #924)
+    core/controllers/MidiLearnCoordinator.cpp
+    # Platform-neutral MIDI device identifier matcher (issue #1050)
+    audio/MidiDeviceMatch.cpp
     engine/TracktionEngineWrapper.cpp
     engine/TracktionEngineWrapperInit.cpp
     engine/TracktionEngineWrapperDevices.cpp
@@ -328,6 +366,7 @@ set(DAW_UI_SOURCES
     ui/windows/MainWindowExport.cpp
     ui/windows/MenuManager.cpp
     # Dialogs
+    ui/dialogs/ControllersDialog.cpp
     ui/dialogs/AISettingsDialog.cpp
     ui/dialogs/AudioSettingsDialog.cpp
     ui/dialogs/ChainTreeDialog.cpp
@@ -400,6 +439,7 @@ set(DAW_UI_SOURCES
     ui/components/common/MixerDebugPanel.cpp
     ui/components/common/GridOverlayComponent.cpp
     ui/components/common/LinkableTextSlider.cpp
+    ui/components/common/Toast.cpp
     ui/components/common/DraggableValueLabel.cpp
     ui/components/common/BarsBeatsTicksLabel.cpp
     # Components - Timeline
@@ -488,6 +528,7 @@ set(DAW_HEADERS
     profiling/PerformanceProfiler.hpp
     profiling/BenchmarkSuite.hpp
     core/Config.hpp
+    core/UIScale.hpp
     core/DeviceInfo.hpp
     core/ViewModeState.hpp
     core/ViewModeEvents.hpp
@@ -999,5 +1040,24 @@ else()
             "${MAGDA_LANG_SRC}"
             "$<TARGET_FILE_DIR:magda_daw_app>/lang"
         COMMENT "Copying localization files alongside app executable"
+    )
+endif()
+
+# Copy resources/controllers/ (hardware profile JSON) into the app so
+# ControllerProfileRegistry can load profiles at runtime.
+set(MAGDA_CONTROLLERS_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../../resources/controllers")
+if(APPLE)
+    add_custom_command(TARGET magda_daw_app POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${MAGDA_CONTROLLERS_SRC}"
+            "$<TARGET_BUNDLE_CONTENT_DIR:magda_daw_app>/Resources/controllers"
+        COMMENT "Copying controller profiles to app bundle Resources"
+    )
+else()
+    add_custom_command(TARGET magda_daw_app POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${MAGDA_CONTROLLERS_SRC}"
+            "$<TARGET_FILE_DIR:magda_daw_app>/controllers"
+        COMMENT "Copying controller profiles alongside app executable"
     )
 endif()

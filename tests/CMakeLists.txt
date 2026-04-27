@@ -39,6 +39,7 @@ set(TEST_SOURCES
     test_drum_grid_plugin.cpp
     test_velocity_lane_utils.cpp
     test_grid_constants.cpp
+    test_ui_scale.cpp
     test_multi_out_tracks.cpp
     test_freeze_track.cpp
     test_dsl_add_chord.cpp
@@ -49,8 +50,35 @@ set(TEST_SOURCES
     test_sends_and_track_deletion.cpp
     test_master_track_serialization.cpp
     test_automation_agent.cpp
+    test_automation_modes.cpp
     test_automation_singleton.cpp
     test_compact_executor_context.cpp
+    # Parameter alias system tests (PR 1)
+    test_param_name_normalize.cpp
+    test_alias_parser.cpp
+    # Parameter alias system tests (PR 2)
+    test_alias_registry.cpp
+    # Parameter alias system tests (PR 3)
+    test_alias_resolver.cpp
+    # Parameter alias system tests (PR 4 -- AutoAliasGenerator)
+    test_alias_auto_gen.cpp
+    # Parameter alias system tests (PR 5 -- CuratedAliasLoader)
+    test_curated_alias_loader.cpp
+    # Parameter alias system tests (PR 7 -- Automation alias targets)
+    test_automation_alias_targets.cpp
+    # Controller data model tests (issue #1050 -- Phase A)
+    test_binding_transform.cpp
+    # Controller registry tests (issue #1050 -- Phase B)
+    test_controller_registry.cpp
+    test_binding_registry.cpp
+    # Controller router tests (issue #1050 -- Phase C)
+    test_controller_router.cpp
+    # MIDI device identifier matcher tests (issue #1050)
+    test_midi_device_match.cpp
+    # MIDI Learn session tests (issue #924)
+    test_midi_learn.cpp
+    # Controller profile tests (issue #1052)
+    test_controller_profile.cpp
 )
 
 # Create test executable
@@ -97,6 +125,7 @@ target_sources(magda_juce_tests PRIVATE
     # test_export_no_assertion_juce.cpp  # Disabled - see issue #611 (generator device export)
     test_midi_recording_juce.cpp
     test_clip_sync_integration_juce.cpp
+    test_automation_modes_juce.cpp
 )
 
 # Link required libraries for JUCE tests

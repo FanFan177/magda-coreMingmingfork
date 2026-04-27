@@ -35,6 +35,9 @@ AutomationPlaybackEngine::AutomationPlaybackEngine(AudioBridge& bridge, te::Edit
         auto* lane = AutomationManager::getInstance().getLane(laneId);
         if (!lane)
             return;
+        DBG("[AutoPb] touchSuppressionListener lane=" << laneId
+                                                       << " suppressed=" << (int)suppressed
+                                                       << " bypass=" << (int)lane->bypass);
         if (suppressed) {
             clearLane(*lane);
             if (auto* param = resolveParameter(lane->target))
@@ -52,13 +55,25 @@ AutomationPlaybackEngine::~AutomationPlaybackEngine() {
 
     // Detach from every TE parameter we were listening on — otherwise the
     // parameter keeps a dangling pointer and will crash on the next value
-    // change notification.
+    // change notification. Done first so the curve clears below don't
+    // trigger callbacks back at us.
     for (auto& [param, info] : listenedParams_) {
         juce::ignoreUnused(info);
         if (param != nullptr)
             param->removeListener(this);
     }
     listenedParams_.clear();
+
+    // Clear all baked curves while the Edit is still alive. If we don't,
+    // MacroParameters and Modifier AutomatableParameters get destroyed with
+    // a populated curve → their AutomationCurveSource holds a live
+    // ScopedActiveParameter → its destructor decrements
+    // automatableEditElement.numActiveParameters which can have already
+    // been zeroed during teardown (TE's per-edit-element bookkeeping
+    // interleaves with macro/mod parameter destruction order). Plugin
+    // params don't hit this because their AutomatableEditElement (the
+    // plugin) lives at least as long as the parameter's TE objects.
+    clearAllLanes();
 }
 
 void AutomationPlaybackEngine::process() {
@@ -124,6 +139,26 @@ void AutomationPlaybackEngine::process() {
 
 void AutomationPlaybackEngine::automationLanesChanged() {
     needsRebake_ = true;
+
+    // Immediate cleanup of any baked targets whose lane was just deleted (or
+    // emptied of points). Without this the deleted lane's last-baked value
+    // keeps driving TE's parameter until the next bakeAllLanes() — which only
+    // runs on transport start. The fader UI shows the user's manual value but
+    // TE plays the stale automated one.
+    auto& autoMgr = AutomationManager::getInstance();
+    std::vector<AutomationTarget> live;
+    live.reserve(bakedTargets_.size());
+    for (const auto& lane : autoMgr.getLanes()) {
+        if (lane.hasData())
+            live.push_back(lane.target);
+    }
+    for (const auto& old : bakedTargets_) {
+        bool stillActive = std::any_of(live.begin(), live.end(),
+                                       [&](const AutomationTarget& t) { return t == old; });
+        if (!stillActive)
+            clearStaleTarget(old);
+    }
+    bakedTargets_ = std::move(live);
 }
 
 void AutomationPlaybackEngine::automationPointsChanged(AutomationLaneId laneId) {
@@ -185,12 +220,8 @@ void AutomationPlaybackEngine::bakeAllLanes() {
     for (const auto& old : bakedTargets_) {
         bool stillActive = std::any_of(newTargets.begin(), newTargets.end(),
                                        [&](const AutomationTarget& t) { return t == old; });
-        if (stillActive)
-            continue;
-        if (auto* param = resolveParameter(old)) {
-            param->getCurve().clear(nullptr);
-            param->updateStream();
-        }
+        if (!stillActive)
+            clearStaleTarget(old);
     }
     bakedTargets_ = std::move(newTargets);
 
@@ -213,6 +244,30 @@ void AutomationPlaybackEngine::clearAllLanes() {
     }
 
     autoMgr.setPlaybackActive(false);
+}
+
+void AutomationPlaybackEngine::clearStaleTarget(const AutomationTarget& target) {
+    auto* param = resolveParameter(target);
+    if (!param)
+        return;
+
+    param->getCurve().clear(nullptr);
+
+    // Restore the user's manual value where MAGDA tracks one separately. For
+    // device parameters / macros / sends there's no separate manual store, so
+    // we just clear the curve and leave the parameter at whatever TE last had.
+    const auto* track = TrackManager::getInstance().getTrack(target.trackId);
+    if (track) {
+        if (target.type == AutomationTargetType::TrackVolume) {
+            float manualDb = juce::Decibels::gainToDecibels(track->manualVolume);
+            param->setParameter(te::decibelsToVolumeFaderPosition(manualDb),
+                                juce::sendNotificationSync);
+        } else if (target.type == AutomationTargetType::TrackPan) {
+            param->setParameter(track->manualPan, juce::sendNotificationSync);
+        }
+    }
+
+    param->updateStream();
 }
 
 void AutomationPlaybackEngine::bakeLane(const AutomationLaneInfo& lane) {
@@ -461,6 +516,62 @@ void AutomationPlaybackEngine::automationPointDragPreview(AutomationLaneId laneI
     // The stored lane points are untouched; on mouseUp the real commit runs
     // through automationPointsChanged → bakeLane as usual.
     AutomationManager::getInstance().notifyValueChanged(laneId, previewValue);
+
+    // For Macro / ModParameter targets the slider reads from MAGDA state
+    // (MacroInfo.value / ModInfo.rate), not the TE parameter — so without
+    // a state writeback the slider stays stuck during a drag while
+    // stopped. Mirror the writeback that currentValueChanged does on the
+    // playback side. Wrapped in AutomationWriteScope so the corresponding
+    // resync paths (deviceModifiersChanged / macroValueChanged) skip
+    // pushing back into TE while the user is editing the curve.
+    auto* lane = AutomationManager::getInstance().getLane(laneId);
+    if (!lane)
+        return;
+    const auto& target = lane->target;
+    if (target.type == AutomationTargetType::Macro) {
+        auto& trackMgr = TrackManager::getInstance();
+        AutomationManager::AutomationWriteScope writeScope;
+        const float value = static_cast<float>(previewValue);
+        if (target.devicePath.isValid()) {
+            switch (target.devicePath.getType()) {
+                case ChainNodeType::Rack:
+                    trackMgr.setRackMacroValue(target.devicePath, target.macroIndex, value);
+                    break;
+                case ChainNodeType::TopLevelDevice:
+                case ChainNodeType::Device:
+                    trackMgr.setDeviceMacroValue(target.devicePath, target.macroIndex, value);
+                    break;
+                default:
+                    trackMgr.setTrackMacroValue(target.trackId, target.macroIndex, value);
+                    break;
+            }
+        } else {
+            trackMgr.setTrackMacroValue(target.trackId, target.macroIndex, value);
+        }
+    } else if (target.type == AutomationTargetType::ModParameter && target.modParamIndex == 0) {
+        writeModRateFromCurve(target, previewValue);
+
+        // The MAGDA-side writeback above is wrapped in AutomationWriteScope
+        // to prevent the deviceModifiersChanged → resync path from fighting
+        // the baked curve. As a side-effect TE's LFO never sees the new rate
+        // until mouse-up, so the user hears no change while dragging. Push
+        // the dragged value directly to the active TE param (rateParam in Hz
+        // mode, rateTypeParam in sync mode — findModifierParameterForAutomation
+        // picks the right one) so audio tracks the drag in real time.
+        if (auto* teParam = bridge_.getPluginManager().findModifierParameterForAutomation(
+                target.trackId, target.devicePath, target.modId, 0)) {
+            ParameterInfo info = target.getParameterInfo();
+            float real = ParameterUtils::normalizedToReal(static_cast<float>(previewValue), info);
+            // Sync mode lane stores 0-based display index; the TE rateType
+            // param expects a 1-based ordinal, so shift by +1 there. In Hz
+            // mode the lane stores the Hz value directly.
+            float teValue = info.scale == ParameterScale::Discrete
+                                ? static_cast<float>(
+                                      juce::jlimit(1, 23, static_cast<int>(std::round(real)) + 1))
+                                : real;
+            teParam->setParameterFromHost(teValue, juce::dontSendNotification);
+        }
+    }
 }
 
 te::AutomatableParameter* AutomationPlaybackEngine::resolveParameter(
@@ -511,9 +622,12 @@ te::AutomatableParameter* AutomationPlaybackEngine::resolveParameter(
         }
 
         case AutomationTargetType::Macro:
+            return bridge_.getPluginManager().findMacroParameterForAutomation(
+                target.trackId, target.devicePath, target.macroIndex);
+
         case AutomationTargetType::ModParameter:
-            // TODO: resolve macro/mod parameters to TE AutomatableParameters
-            return nullptr;
+            return bridge_.getPluginManager().findModifierParameterForAutomation(
+                target.trackId, target.devicePath, target.modId, target.modParamIndex);
     }
 
     return nullptr;
@@ -641,7 +755,114 @@ void AutomationPlaybackEngine::currentValueChanged(te::AutomatableParameter& par
             trackMgr.setSendLevel(target.trackId, target.sendBusIndex, gain,
                                   /*fromAutomation=*/true);
         }
+    } else if (target.type == AutomationTargetType::Macro) {
+        // Mirror the curve value back into MacroInfo.value so the knob UI
+        // (which reads from TrackManager) follows the curve. AudioBridge
+        // gates the re-push to TE on AutomationWriteScope so we don't fight
+        // the curve TE just evaluated.
+        auto& trackMgr = TrackManager::getInstance();
+        AutomationManager::AutomationWriteScope writeScope;
+        const float value = static_cast<float>(normalized);
+        if (target.devicePath.isValid()) {
+            switch (target.devicePath.getType()) {
+                case ChainNodeType::Rack:
+                    trackMgr.setRackMacroValue(target.devicePath, target.macroIndex, value);
+                    break;
+                case ChainNodeType::TopLevelDevice:
+                case ChainNodeType::Device:
+                    trackMgr.setDeviceMacroValue(target.devicePath, target.macroIndex, value);
+                    break;
+                default:
+                    trackMgr.setTrackMacroValue(target.trackId, target.macroIndex, value);
+                    break;
+            }
+        } else {
+            trackMgr.setTrackMacroValue(target.trackId, target.macroIndex, value);
+        }
+    } else if (target.type == AutomationTargetType::ModParameter && target.modParamIndex == 0) {
+        // Mirror the curve value back into MAGDA's mod state. The lane is
+        // mode-aware — Hz value or sync division depending on tempoSync.
+        // AudioBridge::deviceModifiersChanged checks AutomationWriteScope and
+        // skips its resync to avoid fighting the live TE curve.
+        writeModRateFromCurve(target, normalized);
     }
+}
+
+void AutomationPlaybackEngine::writeModRateFromCurve(const AutomationTarget& target,
+                                                     double normalized) {
+    ParameterInfo info = target.getParameterInfo();
+    auto& trackMgr = TrackManager::getInstance();
+    AutomationManager::AutomationWriteScope writeScope;
+
+    // tempoSync flag drives both the lane's ParameterInfo (built above) and
+    // the writeback target. Resolving the mod again here keeps the two in
+    // lockstep without threading the flag through the call.
+    auto* track = trackMgr.getTrack(target.trackId);
+    const ModInfo* mod = nullptr;
+    if (track) {
+        if (target.devicePath.isValid()) {
+            auto resolved = trackMgr.resolvePath(target.devicePath);
+            if (resolved.valid && resolved.rack) {
+                for (const auto& m : resolved.rack->mods)
+                    if (m.id == target.modId) {
+                        mod = &m;
+                        break;
+                    }
+            } else if (resolved.valid && resolved.device) {
+                for (const auto& m : resolved.device->mods)
+                    if (m.id == target.modId) {
+                        mod = &m;
+                        break;
+                    }
+            }
+        }
+        if (!mod) {
+            for (const auto& m : track->mods)
+                if (m.id == target.modId) {
+                    mod = &m;
+                    break;
+                }
+        }
+    }
+    const bool sync = mod && mod->tempoSync;
+
+    if (sync) {
+        // Lane stores 0-based display index — shift +1 to recover TE ordinal.
+        float real = ParameterUtils::normalizedToReal(static_cast<float>(normalized), info);
+        int ordinal = juce::jlimit(1, 23, static_cast<int>(std::round(real)) + 1);
+        SyncDivision division = teRateOrdinalToSyncDivision(ordinal);
+        if (target.devicePath.isValid()) {
+            switch (target.devicePath.getType()) {
+                case ChainNodeType::Rack:
+                    trackMgr.setRackModSyncDivision(target.devicePath, target.modId, division);
+                    return;
+                case ChainNodeType::TopLevelDevice:
+                case ChainNodeType::Device:
+                    trackMgr.setDeviceModSyncDivision(target.devicePath, target.modId, division);
+                    return;
+                default:
+                    break;
+            }
+        }
+        trackMgr.setTrackModSyncDivision(target.trackId, target.modId, division);
+        return;
+    }
+
+    float real = ParameterUtils::normalizedToReal(static_cast<float>(normalized), info);
+    if (target.devicePath.isValid()) {
+        switch (target.devicePath.getType()) {
+            case ChainNodeType::Rack:
+                trackMgr.setRackModRate(target.devicePath, target.modId, real);
+                return;
+            case ChainNodeType::TopLevelDevice:
+            case ChainNodeType::Device:
+                trackMgr.setDeviceModRate(target.devicePath, target.modId, real);
+                return;
+            default:
+                break;
+        }
+    }
+    trackMgr.setTrackModRate(target.trackId, target.modId, real);
 }
 
 }  // namespace magda

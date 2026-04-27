@@ -37,12 +37,21 @@ class MacroPanelComponent : public PagedControlPanel {
     // Set macros from rack/chain data
     void setMacros(const magda::MacroArray& macros);
 
+    // Lightweight update — only refresh one knob's displayed value, leaving
+    // labels / link menus / bindings alone. Use for high-rate external writes
+    // (e.g. a hardware controller driving a macro via automap).
+    void updateMacroValueDisplay(int macroIndex, float value);
+
     // Set available devices for linking (devices in this rack/chain)
     void setAvailableDevices(const std::vector<std::pair<magda::DeviceId, juce::String>>& devices);
 
     // Set parameter names per device (for the link menu)
     void setDeviceParamNames(
         const std::map<magda::DeviceId, std::vector<juce::String>>& paramNames);
+
+    // Modifiers (LFOs etc.) on the macro's scope, exposed in the link menu
+    // under "Modulators" so a macro can drive an LFO's Rate.
+    void setAvailableModifiers(const std::vector<std::pair<magda::ModId, juce::String>>& mods);
 
     // Set which macro is selected (purple highlight)
     void setSelectedMacroIndex(int macroIndex);
@@ -69,6 +78,7 @@ class MacroPanelComponent : public PagedControlPanel {
   private:
     std::vector<std::unique_ptr<MacroKnobComponent>> knobs_;
     std::vector<std::pair<magda::DeviceId, juce::String>> availableDevices_;
+    std::vector<std::pair<magda::ModId, juce::String>> availableModifiers_;
     magda::ChainNodePath parentPath_;
 
     void ensureKnobCount(int count);

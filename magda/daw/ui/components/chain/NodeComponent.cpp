@@ -877,7 +877,14 @@ void NodeComponent::mouseUp(const juce::MouseEvent& e) {
                 bool wasAlreadySelected = selected_;
                 bool wasCollapsed = collapsed_;
 
+                // selectChainNode fans out to every SelectionManagerListener —
+                // some listener paths can trigger rebuildNodeComponents, which
+                // would delete *this* while we're still inside mouseUp. Guard
+                // with a SafePointer and bail if we got destroyed mid-dispatch.
+                juce::Component::SafePointer<NodeComponent> safeThis(this);
                 magda::SelectionManager::getInstance().selectChainNode(nodePath_);
+                if (safeThis == nullptr)
+                    return;
 
                 // If was already selected, toggle collapse — but only when collapsed
                 // (to expand) or when the click is on the header bar (to collapse)
@@ -1044,14 +1051,23 @@ void NodeComponent::initializeModsMacrosPanels() {
             return;
 
         const auto& sidechain = device ? device->sidechain : rack->sidechain;
+        const auto& mods = device ? device->mods : rack->mods;
+
+        // Pick sidechain type from the selected modulator's trigger mode.
+        // Advanced is only enabled in MIDI/Audio modes, so the fallback is fine.
+        const bool isAudioMode =
+            (selectedModIndex_ >= 0 && selectedModIndex_ < (int)mods.size() &&
+             mods[(size_t)selectedModIndex_].triggerMode == magda::LFOTriggerMode::Audio);
+        const auto sidechainType =
+            isAudioMode ? magda::SidechainConfig::Type::Audio : magda::SidechainConfig::Type::MIDI;
 
         juce::PopupMenu menu;
 
-        bool hasMidiSidechain = sidechain.type == magda::SidechainConfig::Type::MIDI &&
-                                sidechain.sourceTrackId != magda::INVALID_TRACK_ID;
+        bool hasSidechain =
+            sidechain.type == sidechainType && sidechain.sourceTrackId != magda::INVALID_TRACK_ID;
 
-        menu.addSectionHeader("MIDI Trigger Source");
-        menu.addItem(1, "Self", true, !hasMidiSidechain);
+        menu.addSectionHeader(isAudioMode ? "Audio Trigger Source" : "MIDI Trigger Source");
+        menu.addItem(1, "Self", true, !hasSidechain);
         menu.addSeparator();
 
         struct TrackEntry {
@@ -1063,7 +1079,7 @@ void NodeComponent::initializeModsMacrosPanels() {
         for (const auto& track : magda::TrackManager::getInstance().getTracks()) {
             if (track.id == nodePath_.trackId)
                 continue;
-            bool isCurrent = hasMidiSidechain && sidechain.sourceTrackId == track.id;
+            bool isCurrent = hasSidechain && sidechain.sourceTrackId == track.id;
             menu.addItem(itemId, track.name, true, isCurrent);
             trackEntries->push_back({track.id, track.name});
             itemId++;
@@ -1074,7 +1090,8 @@ void NodeComponent::initializeModsMacrosPanels() {
         auto deviceId = device ? device->id : magda::INVALID_DEVICE_ID;
         auto rackPath = nodePath_;
         menu.showMenuAsync(juce::PopupMenu::Options(), [safeThis, isDeviceTarget, deviceId,
-                                                        rackPath, trackEntries](int result) {
+                                                        rackPath, trackEntries,
+                                                        sidechainType](int result) {
             if (!safeThis || result == 0)
                 return;
             if (result == 1) {
@@ -1087,12 +1104,10 @@ void NodeComponent::initializeModsMacrosPanels() {
                 if (index >= 0 && index < (int)trackEntries->size()) {
                     if (isDeviceTarget) {
                         magda::TrackManager::getInstance().setSidechainSource(
-                            deviceId, (*trackEntries)[index].id,
-                            magda::SidechainConfig::Type::MIDI);
+                            deviceId, (*trackEntries)[index].id, sidechainType);
                     } else {
                         magda::TrackManager::getInstance().setRackSidechainSource(
-                            rackPath, (*trackEntries)[index].id,
-                            magda::SidechainConfig::Type::MIDI);
+                            rackPath, (*trackEntries)[index].id, sidechainType);
                     }
                 }
             }
@@ -1205,6 +1220,22 @@ void NodeComponent::initializeModsMacrosPanels() {
             }
             return "P" + juce::String(paramIndex);
         });
+    macroEditorPanel_->setModNameResolver(
+        [this](magda::ModId modId, int modParamIndex) -> juce::String {
+            // Same scope as the macro — pull the mod list from this node and
+            // format "<modName> Rate" / "<modName> Depth" for the link row.
+            const auto* mods = getModsData();
+            if (!mods)
+                return {};
+            for (const auto& m : *mods) {
+                if (m.id == modId) {
+                    juce::String paramLabel =
+                        modParamIndex == 0 ? "Rate" : "P" + juce::String(modParamIndex);
+                    return m.name + " " + paramLabel;
+                }
+            }
+            return {};
+        });
     addChildComponent(*macroEditorPanel_);
 }
 
@@ -1219,6 +1250,23 @@ void NodeComponent::updateModsPanel() {
 
     auto devices = getAvailableDevices();
     modsPanel_->setAvailableDevices(devices);
+
+    // Same-scope modifiers — each knob's "Link to Modulator" submenu
+    // can target another mod's rate. Skip the knob's own ModId is done
+    // inside the knob (it knows its own currentMod_.id).
+    std::vector<std::pair<magda::ModId, juce::String>> modList;
+    if (mods) {
+        modList.reserve(mods->size());
+        for (const auto& m : *mods)
+            if (m.enabled)
+                modList.emplace_back(m.id, m.name);
+    }
+    modsPanel_->setAvailableModifiers(modList);
+}
+
+void NodeComponent::updateMacroValueDisplay(int macroIndex, float value) {
+    if (macroPanel_)
+        macroPanel_->updateMacroValueDisplay(macroIndex, value);
 }
 
 void NodeComponent::updateMacroPanel() {
@@ -1233,6 +1281,17 @@ void NodeComponent::updateMacroPanel() {
     auto devices = getAvailableDevices();
     macroPanel_->setAvailableDevices(devices);
     macroPanel_->setDeviceParamNames(getDeviceParamNames());
+
+    // Same-scope modifiers — let the macro link picker offer "Modulators →
+    // <mod> → Rate" entries that resolve to the LFO's rate / rateType param.
+    std::vector<std::pair<magda::ModId, juce::String>> mods;
+    if (const auto* modsData = getModsData()) {
+        mods.reserve(modsData->size());
+        for (const auto& m : *modsData)
+            if (m.enabled)
+                mods.emplace_back(m.id, m.name);
+    }
+    macroPanel_->setAvailableModifiers(mods);
 }
 
 // === Modulator Editor Panel ===
@@ -1285,6 +1344,7 @@ void NodeComponent::updateModulatorEditor() {
                 return &(*m)[modIdx];
             return nullptr;
         };
+        modulatorEditorPanel_->setOwnerPath(nodePath_.trackId, nodePath_);
         modulatorEditorPanel_->setModInfo((*mods)[selectedModIndex_], &(*mods)[selectedModIndex_],
                                           std::move(getter));
         modulatorEditorPanel_->setSelectedModIndex(selectedModIndex_);

@@ -1,7 +1,12 @@
 #include "MacroKnobComponent.hpp"
 
 #include "BinaryData.h"
+#include "core/AutomationInfo.hpp"
+#include "core/AutomationManager.hpp"
 #include "core/LinkModeManager.hpp"
+#include "core/SelectionManager.hpp"
+#include "core/controllers/BindingRegistry.hpp"
+#include "core/controllers/MidiLearnCoordinator.hpp"
 #include "ui/themes/DarkTheme.hpp"
 #include "ui/themes/FontManager.hpp"
 
@@ -47,10 +52,50 @@ MacroKnobComponent::MacroKnobComponent(int macroIndex) : macroIndex_(macroIndex)
 
     // Register for link mode notifications
     magda::LinkModeManager::getInstance().addListener(this);
+
+    // Register for binding registry and selection changes (automap dot)
+    magda::BindingRegistry::getInstance().addListener(this);
+    magda::ControllerRegistry::getInstance().addListener(this);
+    magda::SelectionManager::getInstance().addListener(this);
 }
 
 MacroKnobComponent::~MacroKnobComponent() {
     magda::LinkModeManager::getInstance().removeListener(this);
+    magda::BindingRegistry::getInstance().removeListener(this);
+    magda::ControllerRegistry::getInstance().removeListener(this);
+    magda::SelectionManager::getInstance().removeListener(this);
+}
+
+void MacroKnobComponent::updateAutomationTarget() {
+    // Build the AutomationTarget for this macro so TextSlider can listen to
+    // AutomationManager and paint the standard purple highlight when a lane
+    // exists. Mirrors the way plugin-param sliders register themselves.
+    if (parentPath_.trackId == magda::INVALID_TRACK_ID || macroIndex_ < 0) {
+        valueSlider_.clearAutomationTarget();
+        return;
+    }
+
+    magda::AutomationTarget target;
+    target.type = magda::AutomationTargetType::Macro;
+    target.trackId = parentPath_.trackId;
+    target.devicePath = parentPath_;
+    target.macroIndex = macroIndex_;
+    target.paramName = currentMacro_.name;
+    valueSlider_.setAutomationTarget(target);
+}
+
+void MacroKnobComponent::refreshAutomapState() {
+    auto& reg = magda::BindingRegistry::getInstance();
+    bool active = reg.hasActiveBindingForTarget(parentPath_, macroIndex_,
+                                                magda::StaticTarget::Owner::DeviceMacro);
+    bool shadowed = active && reg.isAutomapShadowedForMacro(parentPath_, macroIndex_);
+    bool learned = reg.hasActiveStaticBindingForMacro(parentPath_, macroIndex_);
+    if (active != hasAutomap_ || shadowed != automapShadowed_ || learned != hasLearnedBinding_) {
+        hasAutomap_ = active;
+        automapShadowed_ = shadowed;
+        hasLearnedBinding_ = learned;
+        repaint();
+    }
 }
 
 void MacroKnobComponent::setMacroInfo(const magda::MacroInfo& macro) {
@@ -58,6 +103,12 @@ void MacroKnobComponent::setMacroInfo(const magda::MacroInfo& macro) {
     nameLabel_.setText(macro.name, juce::dontSendNotification);
     valueSlider_.setValue(macro.value, juce::dontSendNotification);
     repaint();  // Update link indicator
+}
+
+void MacroKnobComponent::setValueOnly(float value) {
+    currentMacro_.value = value;
+    valueSlider_.setValue(value, juce::dontSendNotification);
+    repaint();  // paint() draws the arc from currentMacro_.value
 }
 
 void MacroKnobComponent::setAvailableTargets(
@@ -68,6 +119,11 @@ void MacroKnobComponent::setAvailableTargets(
 void MacroKnobComponent::setDeviceParamNames(
     const std::map<magda::DeviceId, std::vector<juce::String>>& paramNames) {
     deviceParamNames_ = paramNames;
+}
+
+void MacroKnobComponent::setAvailableModifiers(
+    const std::vector<std::pair<magda::ModId, juce::String>>& mods) {
+    availableModifiers_ = mods;
 }
 
 void MacroKnobComponent::setSelected(bool selected) {
@@ -149,6 +205,30 @@ void MacroKnobComponent::paint(juce::Graphics& g) {
 
     g.setColour(DarkTheme::getTextColour());
     g.drawLine(knobRect.getCentreX(), knobRect.getCentreY(), pointerX, pointerY, 1.5f);
+
+    // Binding indicator dot at top-right.
+    //   Orange — explicit MIDI Learn binding on this macro (user-mapped).
+    //   Green  — automap profile binding only (factory default).
+    //   Grey   — automap binding exists but is shadowed by a Learn override
+    //            on a plugin param sharing the same CC.
+    // The Learn'd colour wins over green so the user can tell at a glance
+    // which macros they've personally mapped vs profile defaults.
+    if (hasAutomap_ || hasLearnedBinding_) {
+        constexpr float dotSize = 6.0f;
+        constexpr float margin = 3.0f;
+        auto r = getLocalBounds().toFloat();
+        juce::Rectangle<float> dot(r.getRight() - margin - dotSize, r.getY() + margin, dotSize,
+                                   dotSize);
+        juce::Colour colour;
+        if (hasLearnedBinding_)
+            colour = juce::Colour(0xFFFF6B35).withAlpha(0.9f);  // matches plugin-param dot
+        else if (automapShadowed_)
+            colour = juce::Colour(DarkTheme::TEXT_DIM).withAlpha(0.55f);
+        else
+            colour = DarkTheme::getColour(DarkTheme::ACCENT_GREEN).withAlpha(0.9f);
+        g.setColour(colour);
+        g.fillEllipse(dot);
+    }
 }
 
 void MacroKnobComponent::resized() {
@@ -179,6 +259,7 @@ void MacroKnobComponent::mouseDown(const juce::MouseEvent& e) {
     if (!e.mods.isPopupMenu()) {
         dragStartPos_ = e.getPosition();
         isDragging_ = false;
+        knobValueDragged_ = false;
 
         // Check if click is in knob area
         if (getKnobBounds().contains(e.getPosition())) {
@@ -204,6 +285,7 @@ void MacroKnobComponent::mouseDrag(const juce::MouseEvent& e) {
         if (newValue != currentMacro_.value) {
             currentMacro_.value = newValue;
             valueSlider_.setValue(newValue, juce::dontSendNotification);
+            knobValueDragged_ = true;
             repaint();
             if (onValueChanged) {
                 onValueChanged(newValue);
@@ -239,14 +321,17 @@ void MacroKnobComponent::mouseUp(const juce::MouseEvent& e) {
     if (e.mods.isPopupMenu()) {
         // Right-click shows link menu
         showLinkMenu();
-    } else if (!isDragging_ && !isKnobDragging_) {
-        // Left-click (no drag) - select this macro
+    } else if (!isDragging_ && !knobValueDragged_) {
+        // Left-click (no link drag, no knob value change) — select this macro.
+        // Clicking on the knob without dragging counts as a select gesture; we
+        // only suppress selection when the user actually moved the knob.
         if (onClicked) {
             onClicked();
         }
     }
     isDragging_ = false;
     isKnobDragging_ = false;
+    knobValueDragged_ = false;
 }
 
 void MacroKnobComponent::macroLinkModeChanged(bool active, const magda::MacroSelection& selection) {
@@ -271,8 +356,34 @@ void MacroKnobComponent::paintLinkIndicator(juce::Graphics& g, juce::Rectangle<i
 void MacroKnobComponent::showLinkMenu() {
     juce::PopupMenu menu;
 
+    constexpr int kShowAutomationLaneId = 30000;
+    menu.addItem(kShowAutomationLaneId, "Show Automation Lane");
+    menu.addSeparator();
+
     menu.addSectionHeader("Link to Parameter...");
     menu.addSeparator();
+
+    // Modulators submenu — macro can drive an LFO's Rate. Only shown when
+    // the parent populated availableModifiers_; offset 40000 keeps the IDs
+    // out of the way of the device-param items below (start at 1) and the
+    // unlink/clear/show-lane items further down.
+    constexpr int kModRateBaseId = 40000;
+    if (!availableModifiers_.empty()) {
+        juce::PopupMenu modsMenu;
+        for (size_t mi = 0; mi < availableModifiers_.size(); ++mi) {
+            const auto& [modId, modName] = availableModifiers_[mi];
+            juce::PopupMenu perModMenu;
+            magda::MacroTarget t;
+            t.kind = magda::MacroTarget::Kind::ModParam;
+            t.modId = modId;
+            t.modParamIndex = 0;  // Rate
+            const bool isCurrentTarget = currentMacro_.getLink(t) != nullptr;
+            perModMenu.addItem(kModRateBaseId + static_cast<int>(mi), "Rate", true,
+                               isCurrentTarget);
+            modsMenu.addSubMenu(modName, perModMenu);
+        }
+        menu.addSubMenu("Modulators", modsMenu);
+    }
 
     // Add submenu for each available device
     int itemId = 1;
@@ -335,14 +446,92 @@ void MacroKnobComponent::showLinkMenu() {
         menu.addItem(clearAllId, "Clear All Links");
     }
 
+    // MIDI Learn / Clear — same pattern as plugin params (ParamLinkMenu).
+    // Operates on the macro target (parentPath, macroIndex, owner=DeviceMacro).
+    constexpr int kLearnId = 50000;
+    constexpr int kClearMidiId = 50001;
+    if (parentPath_.isValid()) {
+        auto& reg = magda::BindingRegistry::getInstance();
+        auto& learn = magda::MidiLearnCoordinator::getInstance();
+        const bool isLearning = learn.isLearningMacro(parentPath_, macroIndex_);
+        const int mappingCount = static_cast<int>(
+            reg.findForTarget(parentPath_, macroIndex_, magda::StaticTarget::Owner::DeviceMacro)
+                .size());
+
+        menu.addSeparator();
+        menu.addItem(kLearnId, isLearning ? "Cancel MIDI Learn" : "Learn MIDI");
+        menu.addItem(kClearMidiId,
+                     "Clear MIDI Mapping" +
+                         (mappingCount > 0 ? " (" + juce::String(mappingCount) + ")" : ""),
+                     mappingCount > 0);
+    }
+
     // Show menu and handle selection
     auto safeThis = juce::Component::SafePointer<MacroKnobComponent>(this);
-    auto targets = availableTargets_;     // Capture by value for async safety
-    auto paramNames = deviceParamNames_;  // Capture by value for async safety
+    auto targets = availableTargets_;      // Capture by value for async safety
+    auto paramNames = deviceParamNames_;   // Capture by value for async safety
+    auto modifiers = availableModifiers_;  // Capture by value for async safety
+    auto parentPath = parentPath_;
+    auto macroIndex = macroIndex_;
+    auto displayName = currentMacro_.name;
 
-    menu.showMenuAsync(juce::PopupMenu::Options(), [safeThis, targets, paramNames, unlinkBaseId,
-                                                    unlinkTargets, clearAllId](int result) {
+    menu.showMenuAsync(juce::PopupMenu::Options(), [safeThis, targets, paramNames, modifiers,
+                                                    unlinkBaseId, unlinkTargets, clearAllId,
+                                                    kModRateBaseId, parentPath, macroIndex,
+                                                    displayName](int result) {
         if (safeThis == nullptr || result == 0) {
+            return;
+        }
+
+        // MIDI Learn / Clear — keep this branch above the device/param walks so
+        // the high-numbered IDs don't get re-interpreted as device-param items.
+        constexpr int kLearnId = 50000;
+        constexpr int kClearMidiId = 50001;
+        if (result == kLearnId) {
+            auto& learn = magda::MidiLearnCoordinator::getInstance();
+            if (learn.isLearningMacro(parentPath, macroIndex)) {
+                learn.cancelLearn();
+            } else {
+                juce::String name = displayName.isNotEmpty()
+                                        ? displayName
+                                        : "Macro " + juce::String(macroIndex + 1);
+                learn.beginLearnMacro(parentPath, macroIndex, name);
+            }
+            return;
+        }
+        if (result == kClearMidiId) {
+            magda::MidiLearnCoordinator::getInstance().clearMacroMappings(parentPath, macroIndex);
+            return;
+        }
+
+        // Modulator-rate link selection. The parent's onTargetChanged routes
+        // through TrackManager::setXxxMacroTarget, which materialises the
+        // link (with an audible default amount for ModParam kind) and
+        // triggers a refresh — so we don't need to mutate currentMacro_.
+        int modSlot = result - kModRateBaseId;
+        if (modSlot >= 0 && modSlot < static_cast<int>(modifiers.size())) {
+            magda::MacroTarget t;
+            t.kind = magda::MacroTarget::Kind::ModParam;
+            t.modId = modifiers[static_cast<size_t>(modSlot)].first;
+            t.modParamIndex = 0;  // Rate
+            if (safeThis->onTargetChanged)
+                safeThis->onTargetChanged(t);
+            return;
+        }
+
+        // Show automation lane for this macro
+        constexpr int kShowAutomationLaneId = 30000;
+        if (result == kShowAutomationLaneId) {
+            magda::AutomationTarget target;
+            target.type = magda::AutomationTargetType::Macro;
+            target.trackId = safeThis->parentPath_.trackId;
+            target.devicePath = safeThis->parentPath_;
+            target.macroIndex = safeThis->macroIndex_;
+            if (safeThis->currentMacro_.name.isNotEmpty())
+                target.paramName = safeThis->currentMacro_.name;
+            auto& mgr = magda::AutomationManager::getInstance();
+            auto laneId = mgr.getOrCreateLane(target, magda::AutomationLaneType::Absolute);
+            mgr.setLaneVisible(laneId, true);
             return;
         }
 

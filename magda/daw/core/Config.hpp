@@ -1,5 +1,7 @@
 #pragma once
 
+#include <juce_core/juce_core.h>
+
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -176,6 +178,15 @@ class Config {
     }
     void setScrollbarOnLeft(bool onLeft) {
         scrollbarOnLeft = onLeft;
+    }
+
+    // UI scale factor for HiDPI displays.
+    // 0 = Auto (pick from primary display DPI at startup); >0 = explicit factor (e.g. 1.5).
+    double getUIScale() const {
+        return uiScale;
+    }
+    void setUIScale(double scale) {
+        uiScale = scale;
     }
 
     // Audio Device Configuration
@@ -594,6 +605,41 @@ class Config {
         autoSaveIntervalSeconds = std::max(10, seconds);
     }
 
+    // Parameter aliases (user-global layer, serialized to/from config.json)
+    juce::var getParamAliases() const {
+        return paramAliases_;
+    }
+    void setParamAliases(const juce::var& aliases) {
+        paramAliases_ = aliases;
+    }
+
+    // Controllers (serialized to/from config.json "controllers" key)
+    juce::var getControllers() const {
+        return controllers_;
+    }
+    void setControllers(const juce::var& c) {
+        controllers_ = c;
+    }
+
+    // Global bindings (serialized to/from config.json "globalBindings" key)
+    juce::var getGlobalBindings() const {
+        return globalBindings_;
+    }
+    void setGlobalBindings(const juce::var& b) {
+        globalBindings_ = b;
+    }
+
+    // MIDI Learn default scope ("project" or "global"; default is Project).
+    // Stored in config.json under "midiLearn" -> "defaultScope".
+    // Returns 0 for Global, 1 for Project (mirrors BindingScope enum order).
+    // Callers that need the typed enum: cast with static_cast<BindingScope>(raw).
+    int getMidiLearnDefaultScopeRaw() const {
+        return midiLearnDefaultScope_;
+    }
+    void setMidiLearnDefaultScopeRaw(int scope) {
+        midiLearnDefaultScope_ = scope;
+    }
+
     // Save/load to platform-appropriate location:
     //   macOS  ~/Library/Application Support/MAGDA/config.json
     //   Windows  %APPDATA%\MAGDA\config.json
@@ -662,6 +708,9 @@ class Config {
     // Layout settings
     bool scrollbarOnLeft = false;  // Scrollbar on right by default
 
+    // UI scale: 0 = Auto (pick from display DPI), otherwise an explicit factor (1.0, 1.25, …)
+    double uiScale = 0.0;
+
     // Recent projects (most recent first, max 10)
     std::vector<std::string> recentProjects;
 
@@ -718,6 +767,7 @@ class Config {
         {"router", {"llama_local", "", "", ""}},
         {"command", {"llama_local", "", "", ""}},
         {"music", {"llama_local", "", "", ""}},
+        {"controller", {"llama_local", "", "", ""}},
     };
     std::map<std::string, std::string> aiCredentials;  // provider → API key
     std::string localLlamaUrl = "http://127.0.0.1:8080/v1";
@@ -728,6 +778,19 @@ class Config {
     int localLlamaContextSize = 4096;
 
     std::vector<ConfigListener*> listeners_;
+
+    // MIDI Learn default scope: 0 = Global, 1 = Project
+    // Default is Project (1) to keep bindings per-song by default.
+    int midiLearnDefaultScope_ = 1;
+
+    // User-global parameter aliases (opaque JSON blob, managed by AliasRegistry)
+    juce::var paramAliases_;
+
+    // Controller devices (opaque JSON blob, managed by ControllerRegistry)
+    juce::var controllers_;
+
+    // Global bindings (opaque JSON blob, managed by BindingRegistry)
+    juce::var globalBindings_;
 };
 
 }  // namespace magda

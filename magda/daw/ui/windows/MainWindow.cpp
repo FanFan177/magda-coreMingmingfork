@@ -7,6 +7,7 @@
 #include "../debug/DebugDialog.hpp"
 #include "../debug/DebugSettings.hpp"
 #include "../dialogs/AudioSettingsDialog.hpp"
+#include "../dialogs/ControllersDialog.hpp"
 #include "../dialogs/ExportAudioDialog.hpp"
 #include "../dialogs/PreferencesDialog.hpp"
 #include "../dialogs/TrackManagerDialog.hpp"
@@ -498,6 +499,7 @@ MainWindow::MainComponent::MainComponent(AudioEngine* externalEngine) {
         footerBar->setBottomPanelCollapsed(bottomPanelCollapsed);
         resized();
     };
+    footerBar->onControllersClicked = [this]() { ControllersDialog::showDialog(this); };
     addAndMakeVisible(*footerBar);
 
     // Create views (now audioEngine is valid - use externalEngine which points to either external
@@ -670,6 +672,15 @@ MainWindow::MainComponent::MainComponent(AudioEngine* externalEngine) {
         }
     }
 #endif
+
+    // Create and register the global Toast notification overlay
+    toast_ = std::make_unique<daw::ui::Toast>();
+    addAndMakeVisible(*toast_);
+    toast_->toFront(false);
+    daw::ui::Toast::setGlobalHost(toast_.get());
+
+    // Listen for MIDI Learn events to show toast notifications
+    magda::MidiLearnCoordinator::getInstance().addListener(this);
 
     // Select master channel by default so the inspector isn't empty on startup
     SelectionManager::getInstance().selectTrack(MASTER_TRACK_ID);
@@ -867,6 +878,10 @@ void MainWindow::MainComponent::setupAudioEngineCallbacks(AudioEngine* engine) {
         if (auto* bridge = getAudioEngine()->getAudioBridge())
             bridge->setAutomationWriteEnabled(enabled);
     };
+    transportPanel->onAutomationModeChanged = [this](AutomationMode mode) {
+        if (auto* bridge = getAudioEngine()->getAudioBridge())
+            bridge->setAutomationMode(mode);
+    };
 
     // Navigation callbacks
     transportPanel->onGoHome = [this]() {
@@ -997,6 +1012,12 @@ MainWindow::MainComponent::~MainComponent() {
     DBG("    [5g.2] Removing TrackManager listener...");
     TrackManager::getInstance().removeListener(this);
 
+    magda::MidiLearnCoordinator::getInstance().removeListener(this);
+
+    // Clear Toast global host before destroying
+    daw::ui::Toast::setGlobalHost(nullptr);
+    toast_.reset();
+
     // Explicitly reset unique_ptrs in order to see which one crashes
     DBG("    [5h] Destroying loadingOverlay_...");
     loadingOverlay_.reset();
@@ -1071,6 +1092,14 @@ void MainWindow::MainComponent::resized() {
     // Loading overlay covers entire component
     if (loadingOverlay_) {
         loadingOverlay_->setBounds(getLocalBounds());
+    }
+
+    // Toast: top-right corner, sized dynamically by Toast::show()
+    if (toast_) {
+        const int toastPad = 12;
+        toast_->setBounds(getWidth() - toast_->getWidth() - toastPad, toastPad, toast_->getWidth(),
+                          toast_->getHeight());
+        toast_->toFront(false);
     }
 
     layoutTransportArea(bounds);
@@ -1265,6 +1294,40 @@ void MainWindow::setupMenuBar() {
     // On other platforms, show menu bar in window
     setMenuBar(MenuManager::getInstance().getMenuBarModel());
 #endif
+}
+
+// ============================================================================
+// MidiLearnCoordinatorListener
+// ============================================================================
+
+void MainWindow::MainComponent::midiLearnStateChanged(const magda::ChainNodePath& /*path*/,
+                                                      int /*paramIndex*/,
+                                                      magda::StaticTarget::Owner /*owner*/,
+                                                      bool learning) {
+    if (learning) {
+        daw::ui::Toast::showGlobal("MIDI Learn armed - move a controller...", 5000);
+    }
+}
+
+void MainWindow::MainComponent::midiLearnCompleted(const magda::ChainNodePath& /*path*/,
+                                                   int /*paramIndex*/,
+                                                   magda::StaticTarget::Owner /*owner*/,
+                                                   const magda::Binding& binding) {
+    juce::String msg = "MIDI mapped";
+    if (binding.source.msgType == magda::BindingMsgType::CC)
+        msg = "MIDI CC " + juce::String(binding.source.number) + " mapped";
+    else if (binding.source.msgType == magda::BindingMsgType::Note)
+        msg = "MIDI Note " + juce::String(binding.source.number) + " mapped";
+    daw::ui::Toast::showGlobal(msg, 2500);
+}
+
+void MainWindow::MainComponent::midiLearnCleared(const magda::ChainNodePath& /*path*/,
+                                                 int /*paramIndex*/,
+                                                 magda::StaticTarget::Owner /*owner*/,
+                                                 int numRemoved) {
+    juce::String msg = numRemoved == 1 ? "MIDI mapping cleared"
+                                       : juce::String(numRemoved) + " MIDI mappings cleared";
+    daw::ui::Toast::showGlobal(msg, 2000);
 }
 
 }  // namespace magda

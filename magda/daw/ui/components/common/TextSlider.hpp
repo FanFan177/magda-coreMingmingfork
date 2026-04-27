@@ -105,9 +105,14 @@ class TextSlider : public juce::Component,
         paramInfoCopy_ = info;
         hasParamInfo_ = true;
 
-        valueFormatter_ = [this](double real) {
-            return magda::ParameterUtils::formatValue(static_cast<float>(real), paramInfoCopy_);
-        };
+        // A custom UI may have called setValueFormatter to override per-param
+        // formatting (e.g. 4OSC pan wants "0" at centre, not the plugin's
+        // native "0R"). Don't clobber an explicit formatter.
+        if (!hasExplicitFormatter_) {
+            valueFormatter_ = [this](double real) {
+                return magda::ParameterUtils::formatValue(static_cast<float>(real), paramInfoCopy_);
+            };
+        }
         valueParser_ = [this](const juce::String& text) {
             auto parsed = magda::ParameterUtils::parseValue(text, paramInfoCopy_);
             return parsed.has_value() ? static_cast<double>(*parsed) : value_;  // keep on failure
@@ -175,9 +180,12 @@ class TextSlider : public juce::Component,
         updateLabel();
     }
 
-    // Custom value formatter - takes normalized value (0-1), returns display string
+    // Custom value formatter - takes the slider's real value, returns display string.
+    // This override sticks: setParameterInfo will not replace it with the generic
+    // ParameterUtils formatter, so plugin-UI-specific formatting wins.
     void setValueFormatter(std::function<juce::String(double)> formatter) {
         valueFormatter_ = std::move(formatter);
+        hasExplicitFormatter_ = static_cast<bool>(valueFormatter_);
         updateLabel();
     }
 
@@ -416,6 +424,18 @@ class TextSlider : public juce::Component,
             if (hasAutomationTarget_) {
                 magda::AutomationManager::getInstance().setTargetUserTouched(automationTarget_,
                                                                              true);
+                // Capture the pre-drag value as a Touch-mode bounce-back
+                // baseline. dragStartValue_ is the slider's value before any
+                // motion, in the slider's display units; convert to the
+                // normalized 0..1 form the lane stores via the target's
+                // ParameterInfo. Track volume / pan have their own engine-
+                // internal baseline path and don't strictly need this, but
+                // it's harmless — the engine prefers its own when both exist.
+                magda::ParameterInfo info = automationTarget_.getParameterInfo();
+                double normalized = static_cast<double>(magda::ParameterUtils::realToNormalized(
+                    static_cast<float>(dragStartValue_), info));
+                magda::AutomationManager::getInstance().setTouchBaseline(automationTarget_,
+                                                                         normalized);
             }
         } else {
             isLeftButtonDrag_ = false;
@@ -506,6 +526,10 @@ class TextSlider : public juce::Component,
             auto& mgr = magda::AutomationManager::getInstance();
             mgr.setTargetUserTouched(automationTarget_, false);
             mgr.setTargetTouchSuppressed(automationTarget_, false);
+            // Recording engine consumes the baseline on the release
+            // transition; clear it here so a stale value doesn't leak into
+            // the next gesture if the engine wasn't recording.
+            mgr.clearTouchBaseline(automationTarget_);
         }
 
         // Handle Shift+drag end
@@ -596,6 +620,8 @@ class TextSlider : public juce::Component,
         valueParser_;                     // Custom value parsing (string → normalized)
     magda::ParameterInfo paramInfoCopy_;  // Populated by setParameterInfo
     bool hasParamInfo_ = false;
+    bool hasExplicitFormatter_ =
+        false;  // setValueFormatter override; sticky across setParameterInfo
 
     void updateLabel() {
         // Show empty text instead of value when disabled/empty

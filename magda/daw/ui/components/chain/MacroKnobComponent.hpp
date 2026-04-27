@@ -8,6 +8,8 @@
 #include "core/LinkModeManager.hpp"
 #include "core/MacroInfo.hpp"
 #include "core/SelectionManager.hpp"
+#include "core/controllers/BindingRegistry.hpp"
+#include "core/controllers/ControllerRegistry.hpp"
 #include "ui/components/common/SvgButton.hpp"
 #include "ui/components/common/TextSlider.hpp"
 
@@ -28,13 +30,22 @@ namespace magda::daw::ui {
  * Clicking the main area opens the macro editor side panel.
  * Clicking the link button enters link mode for this macro.
  */
-class MacroKnobComponent : public juce::Component, public magda::LinkModeManagerListener {
+class MacroKnobComponent : public juce::Component,
+                           public magda::LinkModeManagerListener,
+                           public magda::BindingRegistryListener,
+                           public magda::ControllerRegistryListener,
+                           public magda::SelectionManagerListener {
   public:
     explicit MacroKnobComponent(int macroIndex);
     ~MacroKnobComponent() override;
 
     // Set macro info from data model
     void setMacroInfo(const magda::MacroInfo& macro);
+
+    // Lightweight value-only update — avoids the full setMacroInfo teardown so
+    // high-rate controller writes don't congest the message thread rebuilding
+    // name labels, link menus, etc. Use when only the knob position changed.
+    void setValueOnly(float value);
 
     // Set available devices for linking (name and deviceId pairs)
     void setAvailableTargets(const std::vector<std::pair<magda::DeviceId, juce::String>>& devices);
@@ -43,9 +54,16 @@ class MacroKnobComponent : public juce::Component, public magda::LinkModeManager
     void setDeviceParamNames(
         const std::map<magda::DeviceId, std::vector<juce::String>>& paramNames);
 
+    // Set the modifiers (LFOs etc.) the macro can target via the "Modulators"
+    // submenu in the link picker. Same scope as the macro itself — the parent
+    // that owns this knob populates this from its track/rack/device mods list.
+    void setAvailableModifiers(const std::vector<std::pair<magda::ModId, juce::String>>& mods);
+
     // Set parent path for drag-and-drop identification
     void setParentPath(const magda::ChainNodePath& path) {
         parentPath_ = path;
+        refreshAutomapState();     // compute initial dot visibility now that path is known
+        updateAutomationTarget();  // wire valueSlider_ to AutomationManager for the highlight
     }
     const magda::ChainNodePath& getParentPath() const {
         return parentPath_;
@@ -82,26 +100,61 @@ class MacroKnobComponent : public juce::Component, public magda::LinkModeManager
     // LinkModeManagerListener implementation
     void macroLinkModeChanged(bool active, const magda::MacroSelection& selection) override;
 
+    // BindingRegistryListener
+    void bindingRegistryChanged(magda::BindingScope) override {
+        refreshAutomapState();
+    }
+
+    // ControllerRegistryListener — a controller's enabled state flip changes
+    // which bindings count as active, so the indicator must refresh.
+    void controllerRegistryChanged() override {
+        refreshAutomapState();
+    }
+
+    // SelectionManagerListener (only care about chain-node focus changes)
+    void selectionTypeChanged(magda::SelectionType) override {}
+    void chainNodeSelectionChanged(const magda::ChainNodePath&) override {
+        refreshAutomapState();
+    }
+    void chainNodeReselected(const magda::ChainNodePath&) override {
+        refreshAutomapState();
+    }
+
+    void refreshAutomapState();
+    void updateAutomationTarget();
+
     void showLinkMenu();
     void paintLinkIndicator(juce::Graphics& g, juce::Rectangle<int> area);
     void onNameLabelEdited();
     void onLinkButtonClicked();
 
     int macroIndex_;
+    bool hasAutomap_ = false;
+    bool automapShadowed_ = false;    // automap binding exists but a Learn
+                                      // override on the same CC is in effect —
+                                      // dot paints grey instead of green.
+    bool hasLearnedBinding_ = false;  // user-mapped (StaticTarget DeviceMacro)
+                                      // binding for this macro — paints orange
+                                      // instead of green to flag "your mapping,
+                                      // not a profile default".
     juce::Label nameLabel_;
     TextSlider valueSlider_{TextSlider::Format::Decimal};
     std::unique_ptr<magda::SvgButton> linkButton_;
     magda::MacroInfo currentMacro_;
     std::vector<std::pair<magda::DeviceId, juce::String>> availableTargets_;
     std::map<magda::DeviceId, std::vector<juce::String>> deviceParamNames_;
+    std::vector<std::pair<magda::ModId, juce::String>> availableModifiers_;
     bool selected_ = false;
     magda::ChainNodePath parentPath_;  // For drag-and-drop identification
 
     // Drag state
     juce::Point<int> dragStartPos_;
     bool isDragging_ = false;
-    bool isKnobDragging_ = false;  // True when dragging the knob to change value
-    float dragStartValue_ = 0.0f;  // Value when knob drag started
+    bool isKnobDragging_ = false;    // True while a click on the knob is in progress
+    bool knobValueDragged_ = false;  // True once a drag has actually changed the value;
+                                     // distinguishes a pure click-on-knob (selects) from
+                                     // a value drag (suppresses selection).
+    float dragStartValue_ = 0.0f;    // Value when knob drag started
     static constexpr int DRAG_THRESHOLD = 5;
 
     // Helper to get knob bounds for hit testing

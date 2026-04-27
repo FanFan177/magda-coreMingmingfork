@@ -6,8 +6,11 @@
 #include <memory>
 
 #include "core/DeviceInfo.hpp"
+#include "core/LinkModeManager.hpp"
 #include "core/ModInfo.hpp"
 #include "core/ModulatorEngine.hpp"
+#include "core/controllers/BindingRegistry.hpp"
+#include "core/controllers/MidiLearnCoordinator.hpp"
 #include "ui/components/chain/LFOCurveEditor.hpp"
 #include "ui/components/chain/LFOCurveEditorWindow.hpp"
 #include "ui/components/common/SvgButton.hpp"
@@ -28,13 +31,22 @@ class WaveformDisplay : public juce::Component, private juce::Timer {
         stopTimer();
     }
 
-    void setModInfo(const magda::ModInfo* mod) {
+    // Pass both a snapshot pointer (used as a fallback) and a getter that
+    // refetches the live ModInfo* on each paint. The raw pointer dangles
+    // when the underlying mod vector reallocates (mods added/removed,
+    // chain rebuild) — the getter gives us a stable lookup.
+    void setModInfo(const magda::ModInfo* mod,
+                    std::function<const magda::ModInfo*()> getter = nullptr) {
         mod_ = mod;
+        modGetter_ = std::move(getter);
         repaint();
     }
 
     void paint(juce::Graphics& g) override {
-        if (!mod_) {
+        // Always refetch through the getter when one is set — the raw mod_
+        // pointer may dangle after a vector reallocation.
+        const magda::ModInfo* mod = modGetter_ ? modGetter_() : mod_;
+        if (!mod) {
             return;
         }
 
@@ -44,8 +56,8 @@ class WaveformDisplay : public juce::Component, private juce::Timer {
         const float centerY = height * 0.5f;
 
         // Draw phase offset indicator line (vertical dashed line at offset position)
-        if (mod_->phaseOffset > 0.001f) {
-            float offsetX = bounds.getX() + mod_->phaseOffset * width;
+        if (mod->phaseOffset > 0.001f) {
+            float offsetX = bounds.getX() + mod->phaseOffset * width;
             g.setColour(juce::Colours::orange.withAlpha(0.3f));
             // Draw dashed line
             const float dashLength = 3.0f;
@@ -62,8 +74,8 @@ class WaveformDisplay : public juce::Component, private juce::Timer {
         for (int i = 0; i < numPoints; ++i) {
             float displayPhase = static_cast<float>(i) / static_cast<float>(numPoints - 1);
             // Apply phase offset to show how waveform is shifted
-            float effectivePhase = std::fmod(displayPhase + mod_->phaseOffset, 1.0f);
-            float value = magda::ModulatorEngine::generateWaveformForMod(*mod_, effectivePhase);
+            float effectivePhase = std::fmod(displayPhase + mod->phaseOffset, 1.0f);
+            float value = magda::ModulatorEngine::generateWaveformForMod(*mod, effectivePhase);
 
             // Invert value so high values are at top
             float y = centerY + (0.5f - value) * (height - 8.0f);
@@ -81,8 +93,8 @@ class WaveformDisplay : public juce::Component, private juce::Timer {
         g.strokePath(waveformPath, juce::PathStrokeType(1.5f));
 
         // Draw current phase indicator (dot) - use actual phase position
-        float displayX = bounds.getX() + mod_->phase * width;
-        float currentValue = mod_->value;
+        float displayX = bounds.getX() + mod->phase * width;
+        float currentValue = mod->value;
         float currentY = centerY + (0.5f - currentValue) * (height - 8.0f);
 
         g.setColour(juce::Colours::orange);
@@ -97,8 +109,8 @@ class WaveformDisplay : public juce::Component, private juce::Timer {
         // Use trigger counter to detect triggers across frame boundaries.
         // The triggered bool is only true for one 60fps tick — the 30fps paint
         // misses ~50% of them. The counter never misses.
-        if (mod_->triggerCount != lastSeenTriggerCount_) {
-            lastSeenTriggerCount_ = mod_->triggerCount;
+        if (mod->triggerCount != lastSeenTriggerCount_) {
+            lastSeenTriggerCount_ = mod->triggerCount;
             triggerHoldFrames_ = 4;  // Show for ~130ms at 30fps
         }
 
@@ -119,6 +131,7 @@ class WaveformDisplay : public juce::Component, private juce::Timer {
     }
 
     const magda::ModInfo* mod_ = nullptr;
+    std::function<const magda::ModInfo*()> modGetter_;
     mutable uint32_t lastSeenTriggerCount_ = 0;
     mutable int triggerHoldFrames_ = 0;
 };
@@ -181,7 +194,11 @@ class ModMatrixContent : public juce::Component {
  * |   Param Name     |
  * +------------------+
  */
-class ModulatorEditorPanel : public juce::Component, private juce::Timer {
+class ModulatorEditorPanel : public juce::Component,
+                             public magda::LinkModeManagerListener,
+                             public magda::BindingRegistryListener,
+                             public magda::MidiLearnCoordinatorListener,
+                             private juce::Timer {
   public:
     ModulatorEditorPanel();
     ~ModulatorEditorPanel() override;
@@ -190,6 +207,11 @@ class ModulatorEditorPanel : public juce::Component, private juce::Timer {
     // pointer on demand (avoids dangling pointers when the mod vector reallocates).
     void setModInfo(const magda::ModInfo& mod, const magda::ModInfo* liveMod = nullptr,
                     std::function<const magda::ModInfo*()> liveModGetter = nullptr);
+
+    // Identify the mod's owning scope so the rate slider can register an
+    // AutomationTarget with AutomationManager — drives the standard purple
+    // highlight + touch-suppression that plugin-param sliders already use.
+    void setOwnerPath(magda::TrackId trackId, const magda::ChainNodePath& devicePath);
 
     // Set a resolver for getting parameter names from device/param IDs
     void setParamNameResolver(std::function<juce::String(magda::DeviceId, int)> resolver) {
@@ -218,9 +240,27 @@ class ModulatorEditorPanel : public juce::Component, private juce::Timer {
     std::function<void(int modIndex, magda::ModTarget target, float amount)> onModLinkAmountChanged;
 
     void paint(juce::Graphics& g) override;
+    void paintOverChildren(juce::Graphics& g) override;
     void resized() override;
     void mouseDown(const juce::MouseEvent& e) override;
+    void mouseDrag(const juce::MouseEvent& e) override;
     void mouseUp(const juce::MouseEvent& e) override;
+
+    // LinkModeManagerListener — drives the link-mode click-to-link flow on
+    // the rate slider, mirroring how ParamSlotComponent participates in
+    // macro / mod link mode for device parameters.
+    void macroLinkModeChanged(bool active, const magda::MacroSelection& sel) override;
+    void modLinkModeChanged(bool active, const magda::ModSelection& sel) override;
+
+    // BindingRegistry / MIDI Learn — repaint the rate-slider dot indicator
+    // when a Learn'd binding is added, removed, or mid-learn.
+    void bindingRegistryChanged(magda::BindingScope scope) override;
+    void midiLearnStateChanged(const magda::ChainNodePath& path, int paramIndex,
+                               magda::StaticTarget::Owner owner, bool learning) override;
+    void midiLearnCompleted(const magda::ChainNodePath& path, int paramIndex,
+                            magda::StaticTarget::Owner owner, const magda::Binding&) override;
+    void midiLearnCleared(const magda::ChainNodePath& path, int paramIndex,
+                          magda::StaticTarget::Owner owner, int numRemoved) override;
 
     // Preferred width for this panel
     static constexpr int PREFERRED_WIDTH = 150;
@@ -228,6 +268,32 @@ class ModulatorEditorPanel : public juce::Component, private juce::Timer {
   private:
     int selectedModIndex_ = -1;
     magda::ModInfo currentMod_;
+    magda::TrackId ownerTrackId_ = magda::INVALID_TRACK_ID;
+    magda::ChainNodePath ownerDevicePath_;
+    void updateRateAutomationTarget();
+    void showRateSliderContextMenu();
+
+    // True when there's any binding keyed to (ownerDevicePath_, currentMod_.id,
+    // modParamIndex 0). Drives the small mapped-binding dot painted over the
+    // rate slider, plus the learn-mode pulse.
+    void refreshRateMidiBindingState();
+    bool hasRateMidiBinding_ = false;
+    bool isRateInMidiLearnMode_ = false;
+
+    // Apply / clear link-mode click handling on the rate sliders. When a
+    // link-mode source (macro or mod) is active, clicking the visible rate
+    // slider creates a ModParam-kind link from the source to this mod's rate.
+    void applyLinkModeToRateSliders();
+    // Push a new amount for the link from the active source to this mod's
+    // rate — creates the link on first call (with the given amount), updates
+    // it on subsequent calls. Mirrors ParamSlotComponent's link-mode-drag.
+    void writeLinkAmountFromActiveSource(float amount);
+    bool linkModeActiveAndInScope_ = false;
+    bool isLinkModeDrag_ = false;
+    float linkModeDragStartAmount_ = 0.0f;
+    float linkModeDragCurrentAmount_ = 0.0f;
+    int linkModeDragStartY_ = 0;
+    juce::Label linkModeAmountLabel_;
     const magda::ModInfo* liveModPtr_ = nullptr;  // Pointer to live mod for waveform animation
     std::function<const magda::ModInfo*()> liveModGetter_;  // Safe getter for timer callback
 
@@ -242,7 +308,7 @@ class ModulatorEditorPanel : public juce::Component, private juce::Timer {
     juce::ComboBox curvePresetCombo_;                          // Preset selector for curve mode
     std::unique_ptr<magda::SvgButton> savePresetButton_;       // Save preset button
     juce::TextButton syncToggle_;
-    juce::ComboBox syncDivisionCombo_;
+    TextSlider syncDivisionSlider_{TextSlider::Format::Decimal};
     TextSlider rateSlider_{TextSlider::Format::Decimal};
     juce::ComboBox triggerModeCombo_;
     std::unique_ptr<magda::SvgButton> advancedButton_;

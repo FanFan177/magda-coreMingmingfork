@@ -86,6 +86,7 @@ void Config::save() {
 
     // UI / behaviour
     root->setProperty("scrollbarOnLeft", scrollbarOnLeft);
+    root->setProperty("uiScale", uiScale);
     root->setProperty("confirmTrackDelete", confirmTrackDelete);
     root->setProperty("showTooltips", showTooltips);
     root->setProperty("autoMonitorSelectedTrack", autoMonitorSelectedTrack);
@@ -191,6 +192,26 @@ void Config::save() {
         paletteArray.add(juce::var(entryObj.get()));
     }
     root->setProperty("trackColourPalette", paletteArray);
+
+    // Parameter aliases (user-global layer)
+    if (!paramAliases_.isVoid())
+        root->setProperty("paramAliases", paramAliases_);
+
+    // Controller devices
+    if (!controllers_.isVoid())
+        root->setProperty("controllers", controllers_);
+
+    // Global bindings
+    if (!globalBindings_.isVoid())
+        root->setProperty("globalBindings", globalBindings_);
+
+    // MIDI Learn settings
+    {
+        auto* mlObj = new juce::DynamicObject();
+        mlObj->setProperty("defaultScope", midiLearnDefaultScope_ == 0 ? juce::String("global")
+                                                                       : juce::String("project"));
+        root->setProperty("midiLearn", juce::var(mlObj));
+    }
 
     // Write to disk
     auto configFile = getConfigFile();
@@ -302,6 +323,7 @@ void Config::load() {
 
     language = getString("language", language);
     scrollbarOnLeft = getBool("scrollbarOnLeft", scrollbarOnLeft);
+    uiScale = getDouble("uiScale", uiScale);
     confirmTrackDelete = getBool("confirmTrackDelete", confirmTrackDelete);
     showTooltips = getBool("showTooltips", showTooltips);
     autoMonitorSelectedTrack = getBool("autoMonitorSelectedTrack", autoMonitorSelectedTrack);
@@ -333,7 +355,9 @@ void Config::load() {
             aiPreset = aiObj->getProperty("preset").toString().toStdString();
             auto agentsVar = aiObj->getProperty("agents");
             if (auto* agentsObj = agentsVar.getDynamicObject()) {
-                agentConfigs.clear();
+                bool jsonHadController = false;
+                bool jsonHadMusic = false;
+
                 for (const auto& prop : agentsObj->getProperties()) {
                     auto role = prop.name.toString().toStdString();
                     if (auto* agentObj = prop.value.getDynamicObject()) {
@@ -354,8 +378,18 @@ void Config::load() {
                         }
 
                         agentConfigs[role] = cfg;
+                        if (role == "controller")
+                            jsonHadController = true;
+                        if (role == "music")
+                            jsonHadMusic = true;
                     }
                 }
+
+                // Saved configs that predate the "controller" role need a live
+                // config. Clone music so the user's cloud setup carries over
+                // instead of leaving the class-default llama_local in place.
+                if (!jsonHadController && jsonHadMusic)
+                    agentConfigs["controller"] = agentConfigs["music"];
             }
 
             // Local llama settings
@@ -428,6 +462,9 @@ void Config::load() {
         AgentLLMConfig commandCfg = musicCfg;
         agentConfigs["command"] = commandCfg;
 
+        AgentLLMConfig controllerCfg = musicCfg;
+        agentConfigs["controller"] = controllerCfg;
+
         AgentLLMConfig routerCfg;
         if (isLegacyOpenAI && musicCfg.baseUrl.empty()) {
             routerCfg.provider = "openai_chat";
@@ -472,6 +509,27 @@ void Config::load() {
                     trackColourPalette.push_back(entry);
                 }
             }
+        }
+    }
+
+    // Parameter aliases (user-global layer)
+    if (obj->hasProperty("paramAliases"))
+        paramAliases_ = obj->getProperty("paramAliases");
+
+    // Controller devices
+    if (obj->hasProperty("controllers"))
+        controllers_ = obj->getProperty("controllers");
+
+    // Global bindings
+    if (obj->hasProperty("globalBindings"))
+        globalBindings_ = obj->getProperty("globalBindings");
+
+    // MIDI Learn settings
+    if (obj->hasProperty("midiLearn")) {
+        auto mlVar = obj->getProperty("midiLearn");
+        if (auto* mlObj = mlVar.getDynamicObject()) {
+            auto scopeStr = mlObj->getProperty("defaultScope").toString();
+            midiLearnDefaultScope_ = (scopeStr == "global") ? 0 : 1;
         }
     }
 

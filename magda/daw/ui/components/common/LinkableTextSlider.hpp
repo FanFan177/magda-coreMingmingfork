@@ -7,6 +7,8 @@
 #include "core/MacroInfo.hpp"
 #include "core/ModInfo.hpp"
 #include "core/ParameterInfo.hpp"
+#include "core/controllers/ControllerRegistry.hpp"
+#include "core/controllers/MidiLearnCoordinator.hpp"
 #include "ui/components/chain/ParamModulationPainter.hpp"
 
 namespace magda::daw::ui {
@@ -19,6 +21,9 @@ namespace magda::daw::ui {
  */
 class LinkableTextSlider : public juce::Component,
                            public magda::LinkModeManagerListener,
+                           public magda::MidiLearnCoordinatorListener,
+                           public magda::BindingRegistryListener,
+                           public magda::ControllerRegistryListener,
                            public juce::Timer {
   public:
     LinkableTextSlider(TextSlider::Format format = TextSlider::Format::Decimal);
@@ -57,6 +62,13 @@ class LinkableTextSlider : public juce::Component,
     void setSelectedModIndex(int modIndex);
     void setSelectedMacroIndex(int macroIndex);
 
+    // Switch this slider into "modifier rate" mode — used by the LFO / mod
+    // rate slider. MIDI Learn becomes a ModParam binding instead of a
+    // PluginParam binding, and the mapped-dot indicator queries
+    // BindingRegistry::hasActiveBindingForModParam.
+    void setModRateContext(const magda::ChainNodePath& path, magda::ModId modId, int modParamIndex);
+    void clearModRateContext();
+
     int getParamIndex() const {
         return paramIndex_;
     }
@@ -81,6 +93,10 @@ class LinkableTextSlider : public juce::Component,
         onMacroAmountChanged;
     std::function<void()> onShowAutomationLane;
 
+    // MIDI Learn callbacks (wired to MidiLearnCoordinator by this component)
+    std::function<void(magda::ChainNodePath, int paramIndex, juce::String paramName)> onMidiLearn;
+    std::function<void(magda::ChainNodePath, int paramIndex)> onMidiClear;
+
     // === Component overrides ===
     void resized() override;
     void paintOverChildren(juce::Graphics& g) override;
@@ -93,6 +109,24 @@ class LinkableTextSlider : public juce::Component,
     // === LinkModeManagerListener ===
     void modLinkModeChanged(bool active, const magda::ModSelection& selection) override;
     void macroLinkModeChanged(bool active, const magda::MacroSelection& selection) override;
+
+    // === MidiLearnCoordinatorListener ===
+    void midiLearnStateChanged(const magda::ChainNodePath& path, int paramIndex,
+                               magda::StaticTarget::Owner owner, bool learning) override;
+    void midiLearnCompleted(const magda::ChainNodePath& path, int paramIndex,
+                            magda::StaticTarget::Owner owner, const magda::Binding&) override;
+    void midiLearnCleared(const magda::ChainNodePath& path, int paramIndex,
+                          magda::StaticTarget::Owner owner, int numRemoved) override;
+
+    // === BindingRegistryListener ===
+    void bindingRegistryChanged(magda::BindingScope scope) override;
+
+    // === ControllerRegistryListener ===
+    void controllerRegistryChanged() override {
+        refreshMidiBindingState();
+    }
+
+    void refreshMidiBindingState();
 
     // === Timer ===
     void timerCallback() override;
@@ -117,6 +151,17 @@ class LinkableTextSlider : public juce::Component,
     bool isInLinkMode_ = false;
     magda::ModSelection activeMod_;
     magda::MacroSelection activeMacro_;
+
+    // MIDI Learn state
+    bool isInMidiLearnMode_ = false;
+    bool hasMidiBinding_ = false;  // Persistent badge for already-mapped params
+
+    // Mod-rate mode (set by setModRateContext). When true, midiLearn calls
+    // route through the ModParam variants and the binding query targets
+    // ModParam instead of PluginParam.
+    bool isModRate_ = false;
+    magda::ModId modId_ = magda::INVALID_MOD_ID;
+    int modParamIndex_ = 0;
 
     // Link mode drag state
     bool isLinkModeDrag_ = false;

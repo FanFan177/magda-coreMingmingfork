@@ -34,19 +34,140 @@ enum class LFOWaveform {
  * @brief Tempo sync divisions for LFO rate
  */
 enum class SyncDivision {
-    Whole = 1,            // 1 bar (4 beats)
-    Half = 2,             // 1/2 note
-    Quarter = 4,          // 1/4 note (1 beat)
-    Eighth = 8,           // 1/8 note
-    Sixteenth = 16,       // 1/16 note
-    ThirtySecond = 32,    // 1/32 note
-    DottedHalf = 3,       // 1/2 + 1/4
-    DottedQuarter = 6,    // 1/4 + 1/8
-    DottedEighth = 12,    // 1/8 + 1/16
-    TripletHalf = 33,     // 1/2 triplet
-    TripletQuarter = 66,  // 1/4 triplet
-    TripletEighth = 132   // 1/8 triplet
+    Whole = 1,                  // 1 bar (4 beats)
+    Half = 2,                   // 1/2 note
+    Quarter = 4,                // 1/4 note (1 beat)
+    Eighth = 8,                 // 1/8 note
+    Sixteenth = 16,             // 1/16 note
+    ThirtySecond = 32,          // 1/32 note
+    DottedHalf = 3,             // 1/2 + 1/4
+    DottedQuarter = 6,          // 1/4 + 1/8
+    DottedEighth = 12,          // 1/8 + 1/16
+    DottedSixteenth = 24,       // 1/16 + 1/32
+    DottedThirtySecond = 48,    // 1/32 + 1/64
+    TripletHalf = 33,           // 1/2 triplet
+    TripletQuarter = 66,        // 1/4 triplet
+    TripletEighth = 132,        // 1/8 triplet
+    TripletSixteenth = 264,     // 1/16 triplet
+    TripletThirtySecond = 528,  // 1/32 triplet
+    TwoBars = 200,              // 2 bars (8 beats)
+    FourBars = 400,             // 4 bars (16 beats)
+    EightBars = 800,            // 8 bars (32 beats)
+    SixteenBars = 1600          // 16 bars (64 beats)
 };
+
+/**
+ * @brief Map MAGDA SyncDivision to TE's ModifierCommon::RateType ordinal.
+ *
+ * Mirror of audio/ModifierHelpers.hpp::mapSyncDivision but kept in core/ so
+ * TrackManager and the automation lane code can convert without dragging
+ * in TE's namespace. Numbers must match TE's RateType enum declaration
+ * order (slow → fast: hertz=0, sixteenBars=1, ..., sixtyFourthT=23).
+ */
+inline int syncDivisionToTeRateOrdinal(SyncDivision div) {
+    switch (div) {
+        case SyncDivision::SixteenBars:
+            return 1;
+        case SyncDivision::EightBars:
+            return 2;
+        case SyncDivision::FourBars:
+            return 3;
+        case SyncDivision::TwoBars:
+            return 4;
+        case SyncDivision::Whole:
+            return 5;  // bar
+        case SyncDivision::DottedHalf:
+            return 6;
+        case SyncDivision::Half:
+            return 7;
+        case SyncDivision::TripletHalf:
+            return 8;
+        case SyncDivision::DottedQuarter:
+            return 9;
+        case SyncDivision::Quarter:
+            return 10;
+        case SyncDivision::TripletQuarter:
+            return 11;
+        case SyncDivision::DottedEighth:
+            return 12;
+        case SyncDivision::Eighth:
+            return 13;
+        case SyncDivision::TripletEighth:
+            return 14;
+        case SyncDivision::DottedSixteenth:
+            return 15;
+        case SyncDivision::Sixteenth:
+            return 16;
+        case SyncDivision::TripletSixteenth:
+            return 17;
+        case SyncDivision::DottedThirtySecond:
+            return 18;
+        case SyncDivision::ThirtySecond:
+            return 19;
+        case SyncDivision::TripletThirtySecond:
+            return 20;
+    }
+    return 10;  // quarter fallback
+}
+
+/**
+ * @brief Inverse: TE ordinal → MAGDA SyncDivision (closest match).
+ *
+ * MAGDA's slider doesn't expose every TE division (no 1/16 D/T, no 1/64s)
+ * so unsupported ordinals snap to the closest MAGDA-known division. Used
+ * by automation playback when TE writes a discrete rateType value back
+ * into MAGDA state.
+ */
+inline SyncDivision teRateOrdinalToSyncDivision(int ordinal) {
+    switch (ordinal) {
+        case 1:
+            return SyncDivision::SixteenBars;
+        case 2:
+            return SyncDivision::EightBars;
+        case 3:
+            return SyncDivision::FourBars;
+        case 4:
+            return SyncDivision::TwoBars;
+        case 5:
+            return SyncDivision::Whole;
+        case 6:
+            return SyncDivision::DottedHalf;
+        case 7:
+            return SyncDivision::Half;
+        case 8:
+            return SyncDivision::TripletHalf;
+        case 9:
+            return SyncDivision::DottedQuarter;
+        case 10:
+            return SyncDivision::Quarter;
+        case 11:
+            return SyncDivision::TripletQuarter;
+        case 12:
+            return SyncDivision::DottedEighth;
+        case 13:
+            return SyncDivision::Eighth;
+        case 14:
+            return SyncDivision::TripletEighth;
+        case 15:
+            return SyncDivision::DottedSixteenth;
+        case 16:
+            return SyncDivision::Sixteenth;
+        case 17:
+            return SyncDivision::TripletSixteenth;
+        case 18:
+            return SyncDivision::DottedThirtySecond;
+        case 19:
+            return SyncDivision::ThirtySecond;
+        case 20:
+            return SyncDivision::TripletThirtySecond;
+        case 21:
+        case 22:
+        case 23:
+            return SyncDivision::TripletThirtySecond;
+        default:
+            return SyncDivision::Quarter;
+    }
+}
 
 /**
  * @brief Curve presets for Custom waveform
@@ -82,18 +203,53 @@ enum class LFOTriggerMode {
 };
 
 /**
- * @brief Target for a mod link (which device parameter it modulates)
+ * @brief Target for a mod link.
+ *
+ * Two kinds:
+ *  - DeviceParam: modifier drives a device's automatable parameter (deviceId +
+ *    paramIndex). The original / only kind before mod-on-mod addressing.
+ *  - ModParam:    modifier drives ANOTHER modifier's parameter (modId +
+ *    modParamIndex, typically Rate at index 0). The owning scope is inferred
+ *    from the modifier's parent path at resolution time. A modifier never
+ *    targets itself — UI filters that out before creating the link.
+ *
+ * Default kind is DeviceParam so legacy serialized targets without an
+ * explicit kind round-trip unchanged.
  */
 struct ModTarget {
-    DeviceId deviceId = INVALID_DEVICE_ID;
-    int paramIndex = -1;  // Which parameter on the device
+    enum class Kind { DeviceParam, ModParam };
+
+    // Field order intentionally puts the legacy DeviceParam fields first so
+    // existing positional aggregate-init (ModTarget{deviceId, paramIndex})
+    // in tests and call sites keeps compiling without modification.
+    DeviceId deviceId = INVALID_DEVICE_ID;  // DeviceParam: target device
+    int paramIndex = -1;                    // DeviceParam: parameter on the device
+
+    ModId modId = INVALID_MOD_ID;  // ModParam: target modifier
+    int modParamIndex = -1;        // ModParam: 0 = Rate (only kind today)
+
+    Kind kind = Kind::DeviceParam;
 
     bool isValid() const {
-        return deviceId != INVALID_DEVICE_ID && paramIndex >= 0;
+        switch (kind) {
+            case Kind::DeviceParam:
+                return deviceId != INVALID_DEVICE_ID && paramIndex >= 0;
+            case Kind::ModParam:
+                return modId != INVALID_MOD_ID && modParamIndex >= 0;
+        }
+        return false;
     }
 
     bool operator==(const ModTarget& other) const {
-        return deviceId == other.deviceId && paramIndex == other.paramIndex;
+        if (kind != other.kind)
+            return false;
+        switch (kind) {
+            case Kind::DeviceParam:
+                return deviceId == other.deviceId && paramIndex == other.paramIndex;
+            case Kind::ModParam:
+                return modId == other.modId && modParamIndex == other.modParamIndex;
+        }
+        return false;
     }
 
     bool operator!=(const ModTarget& other) const {

@@ -18,6 +18,7 @@
 #include "../daw/core/UndoManager.hpp"
 #include "../daw/engine/AudioEngine.hpp"
 #include "../daw/engine/TracktionEngineWrapper.hpp"
+#include "../daw/project/ProjectManager.hpp"
 #include "music_helpers.hpp"
 
 namespace magda::dsl {
@@ -56,8 +57,7 @@ Token Tokenizer::readIdentifier() {
     int startCol = col_;
     const char* start = pos_;
 
-    while (*pos_ &&
-           (std::isalnum(static_cast<unsigned char>(*pos_)) || *pos_ == '_' || *pos_ == '#')) {
+    while (*pos_ && (std::isalnum(static_cast<unsigned char>(*pos_)) || *pos_ == '_')) {
         pos_++;
         col_++;
     }
@@ -234,7 +234,7 @@ Token Tokenizer::next() {
         (c == '-' && std::isdigit(static_cast<unsigned char>(*(pos_ + 1)))))
         return readNumber();
 
-    if (std::isalpha(static_cast<unsigned char>(c)) || c == '_' || c == '#')
+    if (std::isalpha(static_cast<unsigned char>(c)) || c == '_')
         return readIdentifier();
 
     // Unknown character - skip it
@@ -698,7 +698,27 @@ bool Interpreter::parseValue(Tokenizer& tok, std::string& outValue) {
             tok.next();  // consume '('
             return evaluateFunction(t.value, tok, outValue);
         }
+
         outValue = t.value;
+        return true;
+    }
+
+    // '@' produces its own AT token; handle it as a sigil prefix.
+    if (t.type == TokenType::AT) {
+        // Consume pluginKey.paramKey as "@pluginKey.paramKey"
+        Token pluginTok = tok.next();
+        if (pluginTok.type != TokenType::IDENTIFIER) {
+            ctx_.setError("Expected identifier after '@'");
+            return false;
+        }
+        std::string sigilStr = "@" + pluginTok.value;
+        if (tok.peek().is(TokenType::DOT)) {
+            tok.next();  // consume '.'
+            Token paramTok = tok.next();
+            if (paramTok.type == TokenType::IDENTIFIER)
+                sigilStr += "." + paramTok.value;
+        }
+        outValue = sigilStr;
         return true;
     }
 
@@ -805,11 +825,13 @@ bool Interpreter::executeNewClip(const Params& params) {
         return false;
     }
 
-    double startTime = barsToTime(bar);
-    double length = barsToTime(bar + lengthBars) - startTime;
+    // Beats-authoritative: bars → beats via project time signature, no
+    // seconds round-trip.
+    double startBeats = barsToBeats(bar - 1.0);
+    double lengthBeats = barsToBeats(lengthBars);
 
     auto& cm = ClipManager::getInstance();
-    auto clipId = cm.createMidiClip(ctx_.currentTrackId, startTime, length);
+    auto clipId = cm.createMidiClipBeats(ctx_.currentTrackId, startBeats, lengthBeats);
 
     if (clipId < 0) {
         ctx_.setError("Failed to create clip");
@@ -1417,6 +1439,15 @@ double Interpreter::barsToTime(double bar) const {
 
     constexpr double beatsPerBar = 4.0;
     return (bar - 1.0) * beatsPerBar * 60.0 / bpm;
+}
+
+double Interpreter::barsToBeats(double bars) const {
+    // Use project time signature; never assume 4/4 here — the seconds round
+    // trip is what got us into trouble under non-4/4 sigs.
+    int beatsPerBar = ProjectManager::getInstance().getCurrentProjectInfo().timeSignatureNumerator;
+    if (beatsPerBar <= 0)
+        beatsPerBar = 4;
+    return bars * static_cast<double>(beatsPerBar);
 }
 
 // ============================================================================

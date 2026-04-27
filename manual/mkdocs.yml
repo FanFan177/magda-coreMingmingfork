@@ -48,6 +48,7 @@ nav:
       - Preferences: interface/preferences.md
       - Audio Settings: interface/audio-settings.md
       - Plugin Settings: interface/plugin-settings.md
+      - Controllers: interface/controllers.md
   - Tracks: tracks.md
   - Clips: clips.md
   - FX Chain & Racks: fx-chain.md
@@ -74,10 +75,12 @@ nav:
       - Modulators: modulation/modulators.md
       - Macros: modulation/macros.md
       - Linking Parameters: modulation/linking.md
+  - Automation: automation.md
   - Time Bend: time-bend.md
   - Transport: transport.md
   - Reference:
       - DSL Reference: reference/dsl.md
+      - Controller Profile Format: reference/controller-profile-format.md
       - Keyboard Shortcuts: reference/keyboard-shortcuts.md
       - File Formats: reference/file-formats.md
       - Troubleshooting: reference/troubleshooting.md
