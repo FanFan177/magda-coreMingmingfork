@@ -18,6 +18,11 @@ namespace magda::daw::ui {
 NodeComponent::NodeComponent() {
     // Register as SelectionManager listener for centralized selection
     magda::SelectionManager::getInstance().addListener(this);
+    // Listen for binding/controller changes so the header dot reflects the
+    // live automap state. Both registries can change asynchronously
+    // (controller plug/unplug, profile reload, MIDI Learn).
+    magda::BindingRegistry::getInstance().addListener(this);
+    magda::ControllerRegistry::getInstance().addListener(this);
     // === HEADER ===
 
     // Bypass button (power icon)
@@ -102,6 +107,8 @@ NodeComponent::NodeComponent() {
 
 NodeComponent::~NodeComponent() {
     magda::SelectionManager::getInstance().removeListener(this);
+    magda::BindingRegistry::getInstance().removeListener(this);
+    magda::ControllerRegistry::getInstance().removeListener(this);
 }
 
 void NodeComponent::paint(juce::Graphics& g) {
@@ -272,6 +279,33 @@ void NodeComponent::paintOverChildren(juce::Graphics& g) {
     if (!bypassButton_->getToggleState() || frozen_) {  // Toggle OFF = bypassed
         g.setColour(juce::Colours::black.withAlpha(0.3f));
         g.fillRoundedRectangle(getLocalBounds().toFloat(), 4.0f);
+    }
+
+    // Controller-binding indicator dots, drawn next to the node name. Two
+    // dots side-by-side when both apply: automap (green) then pinned
+    // (orange). Anchor comes from getControllerIndicatorAnchor() so
+    // subclasses with a custom logo (Drum Grid's "MDG2000") can place the
+    // dot relative to their own visible text rather than the empty
+    // nameLabel_. A negative-x anchor suppresses dot painting.
+    if (hasAutomapBindings_ || hasPinnedBindings_) {
+        auto anchor = getControllerIndicatorAnchor();
+        if (anchor.x >= 0.0f) {
+            constexpr float dotSize = 6.0f;
+            constexpr float gapBetweenDots = 5.0f;
+
+            float x = anchor.x;
+            float y = anchor.y - dotSize * 0.5f;
+
+            if (hasAutomapBindings_) {
+                g.setColour(DarkTheme::getColour(DarkTheme::ACCENT_GREEN).withAlpha(0.95f));
+                g.fillEllipse(x, y, dotSize, dotSize);
+                x += dotSize + gapBetweenDots;
+            }
+            if (hasPinnedBindings_) {
+                g.setColour(juce::Colour(0xFFFF6B35).withAlpha(0.9f));
+                g.fillEllipse(x, y, dotSize, dotSize);
+            }
+        }
     }
 
     // Selection border (over everything including side panels)
@@ -795,6 +829,54 @@ void NodeComponent::setNodePath(const magda::ChainNodePath& path) {
     if (macroPanel_) {
         macroPanel_->setParentPath(path);
     }
+
+    // Path change → re-evaluate controller dots; the previous path's
+    // resolver match no longer applies.
+    refreshControllerIndicators();
+}
+
+juce::Point<float> NodeComponent::getControllerIndicatorAnchor() const {
+    // Default: position the dot just to the right of nameLabel_'s rendered
+    // text, vertically centred on the label. Subclasses with a custom
+    // logo (Drum Grid, etc.) override this. A negative x suppresses
+    // painting (used when there's no visible name to anchor to).
+    if (!nameLabel_.isVisible() || nameLabel_.getText().isEmpty())
+        return {-1.0f, 0.0f};
+
+    auto labelBounds = nameLabel_.getBounds();
+    // GlyphArrangement is JUCE's recommended path for measuring text
+    // since juce::Font::getStringWidthFloat is deprecated.
+    juce::GlyphArrangement glyphs;
+    glyphs.addLineOfText(nameLabel_.getFont(), nameLabel_.getText(), 0.0f, 0.0f);
+    const float textWidth = glyphs.getBoundingBox(0, -1, true).getWidth();
+
+    constexpr float gapAfterText = 12.0f;
+    return {static_cast<float>(labelBounds.getX()) + textWidth + gapAfterText,
+            static_cast<float>(labelBounds.getCentreY())};
+}
+
+void NodeComponent::refreshControllerIndicators() {
+    if (!nodePath_.isValid()) {
+        if (hasPinnedBindings_ || hasAutomapBindings_) {
+            hasPinnedBindings_ = false;
+            hasAutomapBindings_ = false;
+            repaint();
+        }
+        return;
+    }
+
+    auto& reg = magda::BindingRegistry::getInstance();
+    // pinned (orange): any user-mapped binding (Static or Alias) — covers
+    // Learn'd plugin params AND Learn'd macros / mod-rates on this node.
+    // automap (green): only resolver bindings — i.e. profile-level defaults
+    // currently resolving to this node (focus-dependent for focused.macro).
+    bool pinned = reg.hasUserMappingForDevice(nodePath_);
+    bool automap = reg.hasResolverBindingForDevice(nodePath_);
+    if (pinned != hasPinnedBindings_ || automap != hasAutomapBindings_) {
+        hasPinnedBindings_ = pinned;
+        hasAutomapBindings_ = automap;
+        repaint();
+    }
 }
 
 void NodeComponent::selectionTypeChanged(magda::SelectionType newType) {
@@ -809,6 +891,9 @@ void NodeComponent::chainNodeSelectionChanged(const magda::ChainNodePath& path) 
     // Update our selection state based on whether we match the selected path
     bool shouldBeSelected = nodePath_.isValid() && nodePath_ == path;
     setSelected(shouldBeSelected);
+    // The focused.macro resolver depends on the live focus — when focus
+    // shifts to/from this node (or any sibling), recheck the automap dot.
+    refreshControllerIndicators();
 }
 
 void NodeComponent::chainNodeReselected(const magda::ChainNodePath& /*path*/) {
@@ -1172,10 +1257,10 @@ void NodeComponent::initializeModsMacrosPanels() {
         auto* device = magda::TrackManager::getInstance().getDeviceInChainByPath(nodePath_);
         if (device) {
             magda::TrackManager::getInstance().setModLinkBipolar(nodePath_, modIndex, target,
-                                                                       bipolar);
+                                                                 bipolar);
         } else {
             magda::TrackManager::getInstance().setModLinkBipolar(nodePath_, modIndex, target,
-                                                                     bipolar);
+                                                                 bipolar);
         }
         updateModulatorEditor();
     };
@@ -1186,10 +1271,10 @@ void NodeComponent::initializeModsMacrosPanels() {
         auto* device = magda::TrackManager::getInstance().getDeviceInChainByPath(nodePath_);
         if (device) {
             magda::TrackManager::getInstance().setModLinkAmount(nodePath_, modIndex, target,
-                                                                      amount);
+                                                                amount);
         } else {
             magda::TrackManager::getInstance().setModLinkAmount(nodePath_, modIndex, target,
-                                                                    amount);
+                                                                amount);
         }
     };
 

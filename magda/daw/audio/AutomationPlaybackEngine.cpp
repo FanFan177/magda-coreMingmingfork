@@ -35,9 +35,8 @@ AutomationPlaybackEngine::AutomationPlaybackEngine(AudioBridge& bridge, te::Edit
         auto* lane = AutomationManager::getInstance().getLane(laneId);
         if (!lane)
             return;
-        DBG("[AutoPb] touchSuppressionListener lane=" << laneId
-                                                       << " suppressed=" << (int)suppressed
-                                                       << " bypass=" << (int)lane->bypass);
+        DBG("[AutoPb] touchSuppressionListener lane=" << laneId << " suppressed=" << (int)suppressed
+                                                      << " bypass=" << (int)lane->bypass);
         if (suppressed) {
             clearLane(*lane);
             if (auto* param = resolveParameter(lane->target))
@@ -56,10 +55,12 @@ AutomationPlaybackEngine::~AutomationPlaybackEngine() {
     // Detach from every TE parameter we were listening on — otherwise the
     // parameter keeps a dangling pointer and will crash on the next value
     // change notification. Done first so the curve clears below don't
-    // trigger callbacks back at us.
+    // trigger callbacks back at us. Re-resolve via the cached target before
+    // dereferencing the pointer: if a device was removed mid-session, our
+    // cached pointer dangles and removeListener would crash.
     for (auto& [param, info] : listenedParams_) {
-        juce::ignoreUnused(info);
-        if (param != nullptr)
+        auto* live = resolveParameter(info.target);
+        if (live != nullptr && live == param)
             param->removeListener(this);
     }
     listenedParams_.clear();
@@ -118,10 +119,22 @@ void AutomationPlaybackEngine::process() {
     if (!playing) {
         const double nowSec = edit_.getTransport().getPosition().inSeconds();
         if (std::abs(nowSec - lastStoppedPlayheadSeconds_) > 1e-6) {
-            for (auto& [param, info] : listenedParams_) {
-                juce::ignoreUnused(info);
-                if (param != nullptr)
-                    param->updateToFollowCurve(edit_.getTransport().getPosition());
+            // Re-resolve each param from its target before touching it: when
+            // a device is removed mid-session, the lane stays in
+            // bakedTargets_ until the next bake, but the cached pointer in
+            // listenedParams_ now dangles. Dropping the entry here keeps
+            // the next iteration safe; full cleanup happens in the next
+            // syncParameterListeners() pass.
+            for (auto it = listenedParams_.begin(); it != listenedParams_.end();) {
+                auto* live = resolveParameter(it->second.target);
+                if (live == nullptr || live != it->first) {
+                    // Stale entry. Do NOT call removeListener — the cached
+                    // pointer may already be freed.
+                    it = listenedParams_.erase(it);
+                    continue;
+                }
+                live->updateToFollowCurve(edit_.getTransport().getPosition());
+                ++it;
             }
             lastStoppedPlayheadSeconds_ = nowSec;
         }
@@ -542,11 +555,13 @@ void AutomationPlaybackEngine::automationPointDragPreview(AutomationLaneId laneI
                     trackMgr.setMacroValue(target.devicePath, target.macroIndex, value);
                     break;
                 default:
-                    trackMgr.setMacroValue(ChainNodePath::trackLevel(target.trackId), target.macroIndex, value);
+                    trackMgr.setMacroValue(ChainNodePath::trackLevel(target.trackId),
+                                           target.macroIndex, value);
                     break;
             }
         } else {
-            trackMgr.setMacroValue(ChainNodePath::trackLevel(target.trackId), target.macroIndex, value);
+            trackMgr.setMacroValue(ChainNodePath::trackLevel(target.trackId), target.macroIndex,
+                                   value);
         }
     } else if (target.type == AutomationTargetType::ModParameter && target.modParamIndex == 0) {
         writeModRateFromCurve(target, previewValue);
@@ -691,10 +706,17 @@ void AutomationPlaybackEngine::syncParameterListeners() {
         desired[param] = ListenedParamInfo{laneId, target};
     }
 
-    // Remove listeners for params no longer in the desired set.
+    // Remove listeners for params no longer in the desired set. Re-resolve
+    // each cached entry's target before calling removeListener — if the
+    // target no longer resolves to the same param (device removed, or
+    // re-bound to a fresh pointer), the cached pointer is dangling and
+    // calling removeListener on it would crash. TE's listener list lives
+    // inside the parameter, so when the parameter dies the registration
+    // dies with it; skipping removeListener here just avoids the UAF.
     for (auto it = listenedParams_.begin(); it != listenedParams_.end();) {
         if (desired.find(it->first) == desired.end()) {
-            if (it->first != nullptr)
+            auto* live = resolveParameter(it->second.target);
+            if (live != nullptr && live == it->first)
                 it->first->removeListener(this);
             it = listenedParams_.erase(it);
         } else {
@@ -773,11 +795,13 @@ void AutomationPlaybackEngine::currentValueChanged(te::AutomatableParameter& par
                     trackMgr.setMacroValue(target.devicePath, target.macroIndex, value);
                     break;
                 default:
-                    trackMgr.setMacroValue(ChainNodePath::trackLevel(target.trackId), target.macroIndex, value);
+                    trackMgr.setMacroValue(ChainNodePath::trackLevel(target.trackId),
+                                           target.macroIndex, value);
                     break;
             }
         } else {
-            trackMgr.setMacroValue(ChainNodePath::trackLevel(target.trackId), target.macroIndex, value);
+            trackMgr.setMacroValue(ChainNodePath::trackLevel(target.trackId), target.macroIndex,
+                                   value);
         }
     } else if (target.type == AutomationTargetType::ModParameter && target.modParamIndex == 0) {
         // Mirror the curve value back into MAGDA's mod state. The lane is
@@ -844,7 +868,8 @@ void AutomationPlaybackEngine::writeModRateFromCurve(const AutomationTarget& tar
                     break;
             }
         }
-        trackMgr.setModSyncDivision(ChainNodePath::trackLevel(target.trackId), target.modId, division);
+        trackMgr.setModSyncDivision(ChainNodePath::trackLevel(target.trackId), target.modId,
+                                    division);
         return;
     }
 
