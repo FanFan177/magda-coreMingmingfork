@@ -16,6 +16,7 @@ set(TEST_SOURCES
     test_nested_racks.cpp
     test_rack_audio.cpp
     test_modulation.cpp
+    test_chain_fingerprint.cpp
     test_group_tracks_and_macros.cpp
     test_parameter_utils.cpp
     test_update_checker.cpp
@@ -79,6 +80,8 @@ set(TEST_SOURCES
     test_midi_learn.cpp
     # Controller profile tests (issue #1052)
     test_controller_profile.cpp
+    # SelectionManager listener reentrancy
+    test_selection_manager_listeners.cpp
 )
 
 # Create test executable

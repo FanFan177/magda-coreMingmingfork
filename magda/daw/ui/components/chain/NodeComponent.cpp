@@ -6,6 +6,7 @@
 #include "MacroPanelComponent.hpp"
 #include "ModsPanelComponent.hpp"
 #include "ModulatorEditorPanel.hpp"
+#include "core/LinkModeManager.hpp"
 #include "core/SelectionManager.hpp"
 #include "core/TrackManager.hpp"
 #include "ui/themes/DarkTheme.hpp"
@@ -865,6 +866,19 @@ void NodeComponent::mouseUp(const juce::MouseEvent& e) {
         return;
     }
 
+    // While a macro/mod is in link mode, clicks bouncing up from a non-link-
+    // target child (a tab strip, the device meter, the empty space between
+    // params) shouldn't change selection or toggle the device's collapsed
+    // state — that interrupts the linking gesture and visibly collapses the
+    // device the user is trying to link into. Bail out of the selection /
+    // collapse path; the actual link target widget (ParamSlot,
+    // LinkableTextSlider) consumes its own click separately.
+    auto& linkMgr = magda::LinkModeManager::getInstance();
+    if (linkMgr.getMacroInLinkMode().isValid() || linkMgr.getModInLinkMode().isValid()) {
+        mouseDownForSelection_ = false;
+        return;
+    }
+
     // Complete selection on mouse up (click-and-release) - only if not dragging
     if (mouseDownForSelection_ && !e.mods.isPopupMenu()) {
         mouseDownForSelection_ = false;
@@ -1144,10 +1158,10 @@ void NodeComponent::initializeModsMacrosPanels() {
     modulatorEditorPanel_->onModLinkDeleted = [this](int modIndex, magda::ModTarget target) {
         auto* device = magda::TrackManager::getInstance().getDeviceInChainByPath(nodePath_);
         if (device) {
-            magda::TrackManager::getInstance().removeDeviceModLink(nodePath_, modIndex, target);
+            magda::TrackManager::getInstance().removeModLink(nodePath_, modIndex, target);
         } else {
             // Rack mod
-            magda::TrackManager::getInstance().removeRackModLink(nodePath_, modIndex, target);
+            magda::TrackManager::getInstance().removeModLink(nodePath_, modIndex, target);
         }
         updateModulatorEditor();
     };
@@ -1157,10 +1171,10 @@ void NodeComponent::initializeModsMacrosPanels() {
                                                             bool bipolar) {
         auto* device = magda::TrackManager::getInstance().getDeviceInChainByPath(nodePath_);
         if (device) {
-            magda::TrackManager::getInstance().setDeviceModLinkBipolar(nodePath_, modIndex, target,
+            magda::TrackManager::getInstance().setModLinkBipolar(nodePath_, modIndex, target,
                                                                        bipolar);
         } else {
-            magda::TrackManager::getInstance().setRackModLinkBipolar(nodePath_, modIndex, target,
+            magda::TrackManager::getInstance().setModLinkBipolar(nodePath_, modIndex, target,
                                                                      bipolar);
         }
         updateModulatorEditor();
@@ -1171,10 +1185,10 @@ void NodeComponent::initializeModsMacrosPanels() {
                                                            float amount) {
         auto* device = magda::TrackManager::getInstance().getDeviceInChainByPath(nodePath_);
         if (device) {
-            magda::TrackManager::getInstance().setDeviceModLinkAmount(nodePath_, modIndex, target,
+            magda::TrackManager::getInstance().setModLinkAmount(nodePath_, modIndex, target,
                                                                       amount);
         } else {
-            magda::TrackManager::getInstance().setRackModLinkAmount(nodePath_, modIndex, target,
+            magda::TrackManager::getInstance().setModLinkAmount(nodePath_, modIndex, target,
                                                                     amount);
         }
     };
@@ -1267,6 +1281,13 @@ void NodeComponent::updateModsPanel() {
 void NodeComponent::updateMacroValueDisplay(int macroIndex, float value) {
     if (macroPanel_)
         macroPanel_->updateMacroValueDisplay(macroIndex, value);
+}
+
+void NodeComponent::refreshPanels() {
+    if (paramPanelVisible_)
+        updateMacroPanel();
+    if (modPanelVisible_)
+        updateModsPanel();
 }
 
 void NodeComponent::updateMacroPanel() {
