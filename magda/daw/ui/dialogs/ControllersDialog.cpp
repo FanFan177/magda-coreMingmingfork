@@ -1,5 +1,6 @@
 #include "ControllersDialog.hpp"
 
+#include <algorithm>
 #include <map>
 
 #include "../themes/DarkTheme.hpp"
@@ -564,6 +565,10 @@ void ControllerProfilesPage::onRowRemoveRequested(int row) {
 class LuaScriptsPage : public juce::Component {
   public:
     LuaScriptsPage() {
+        addScriptButton_.setButtonText(tr("controllers.scripts.add"));
+        addScriptButton_.onClick = [this]() { onAddScriptClicked(); };
+        addAndMakeVisible(addScriptButton_);
+
         openScriptsFolderButton_.setButtonText(tr("controllers.scripts.open_folder"));
         openScriptsFolderButton_.onClick = [this]() { onOpenScriptsFolderClicked(); };
         addAndMakeVisible(openScriptsFolderButton_);
@@ -604,17 +609,19 @@ class LuaScriptsPage : public juce::Component {
         auto bounds = getLocalBounds().reduced(16);
         const int rowH = 28;
         const int btnGap = 6;
-        const int openW = 170;
-        const int importW = 140;
-        const int reloadW = 100;
+        const int rowGap = 4;
 
-        // Left-to-right: Open Folder | Import | Reload. Same shape as Profiles.
-        auto buttonRow = bounds.removeFromTop(rowH);
-        openScriptsFolderButton_.setBounds(buttonRow.removeFromLeft(openW));
-        buttonRow.removeFromLeft(btnGap);
-        importButton_.setBounds(buttonRow.removeFromLeft(importW));
-        buttonRow.removeFromLeft(btnGap);
-        reloadLuaButton_.setBounds(buttonRow.removeFromLeft(reloadW));
+        auto layoutRow = [&](juce::Button& left, juce::Button& right) {
+            auto row = bounds.removeFromTop(rowH);
+            const int half = (row.getWidth() - btnGap) / 2;
+            left.setBounds(row.removeFromLeft(half));
+            row.removeFromLeft(btnGap);
+            right.setBounds(row.removeFromLeft(half));
+        };
+
+        layoutRow(addScriptButton_, importButton_);
+        bounds.removeFromTop(rowGap);
+        layoutRow(openScriptsFolderButton_, reloadLuaButton_);
         bounds.removeFromTop(8);
 
         list_->setBounds(bounds);
@@ -727,11 +734,14 @@ class LuaScriptsPage : public juce::Component {
             return;
         const auto file = scripts_[static_cast<size_t>(row)];
         const bool isActive = file.getFileName() == scripting_app::activeLuaScriptName();
+        const bool isFactory = scripting_app::isFactoryLuaScript(file);
 
         juce::PopupMenu menu;
         menu.addItem(1, tr("controllers.scripts.reveal"));
         if (isActive)
             menu.addItem(2, tr("controllers.scripts.unload"));
+        if (isFactory)
+            menu.addItem(3, tr("controllers.scripts.disable"));
 
         juce::Component::SafePointer<LuaScriptsPage> self(this);
         menu.showMenuAsync(juce::PopupMenu::Options(), [self, file](int result) {
@@ -742,8 +752,54 @@ class LuaScriptsPage : public juce::Component {
                 scripting_app::unloadLuaScript();
                 if (auto* page = self.getComponent())
                     page->rebuildScripts();
+            } else if (result == 3) {
+                auto& cfg = magda::Config::getInstance();
+                auto enabled = cfg.getEnabledFactoryLuaScripts();
+                const auto name = file.getFileName().toStdString();
+                enabled.erase(std::remove(enabled.begin(), enabled.end(), name), enabled.end());
+                cfg.setEnabledFactoryLuaScripts(std::move(enabled));
+                cfg.save();
+                if (file.getFileName() == scripting_app::activeLuaScriptName())
+                    scripting_app::unloadLuaScript();
+                if (auto* page = self.getComponent())
+                    page->rebuildScripts();
             }
         });
+    }
+
+    void onAddScriptClicked() {
+        auto available = scripting_app::enumerateAvailableFactoryLuaScripts();
+        if (available.empty()) {
+            juce::AlertWindow::showMessageBox(juce::AlertWindow::InfoIcon,
+                                              tr("controllers.scripts.add"),
+                                              tr("controllers.scripts.add_no_options"));
+            return;
+        }
+        juce::PopupMenu menu;
+        for (size_t i = 0; i < available.size(); ++i)
+            menu.addItem(static_cast<int>(i + 1), available[i].getFileName());
+
+        juce::Component::SafePointer<LuaScriptsPage> self(this);
+        const auto availableCopy = available;
+        menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&addScriptButton_),
+                           [self, availableCopy](int result) {
+                               if (result <= 0)
+                                   return;
+                               const size_t idx = static_cast<size_t>(result - 1);
+                               if (idx >= availableCopy.size())
+                                   return;
+                               auto& cfg = magda::Config::getInstance();
+                               auto enabled = cfg.getEnabledFactoryLuaScripts();
+                               const auto name = availableCopy[idx].getFileName().toStdString();
+                               if (std::find(enabled.begin(), enabled.end(), name) ==
+                                   enabled.end()) {
+                                   enabled.push_back(name);
+                                   cfg.setEnabledFactoryLuaScripts(std::move(enabled));
+                                   cfg.save();
+                               }
+                               if (auto* page = self.getComponent())
+                                   page->rebuildScripts();
+                           });
     }
 
     void onReloadLuaClicked() {
@@ -812,6 +868,7 @@ class LuaScriptsPage : public juce::Component {
     juce::Array<juce::MidiDeviceInfo> liveInputs_;
     juce::Array<juce::MidiDeviceInfo> liveOutputs_;
 
+    juce::TextButton addScriptButton_;
     juce::TextButton openScriptsFolderButton_;
     juce::TextButton importButton_;
     juce::TextButton reloadLuaButton_;
@@ -908,7 +965,7 @@ ControllersDialog::ControllersDialog() {
     tabbedComponent_.addTab(tr("controllers.tab.scripts"), tabBg, scriptsPage_.get(), false);
     addAndMakeVisible(tabbedComponent_);
 
-    setSize(560, 480);
+    setSize(560, 512);
 }
 
 ControllersDialog::~ControllersDialog() {
