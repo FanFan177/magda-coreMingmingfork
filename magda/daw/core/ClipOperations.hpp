@@ -537,12 +537,34 @@ class ClipOperations {
                 clip.setLoopLengthFromTimeline(clip.length);
             }
 
-            // Issue #1157: when the file carries source interpretation beats,
-            // default placement length to that musical extent so a
-            // freshly-dropped loop becomes exactly its natural length on
-            // toggling BEAT. For files without interpretation data, fall back
-            // to the timeline length converted at project BPM.
-            if (clip.audio().interpretation.totalBeats > 0.0)
+            // Issue #1157: when a full, untrimmed source file carries source
+            // interpretation beats, default placement length to that musical
+            // extent so a freshly-dropped loop becomes exactly its natural
+            // length on toggling BEAT. If the user has already trimmed the
+            // clip, preserve the edited timeline span instead of expanding
+            // back to the full source loop.
+            //
+            // Prefer interpretation-derived duration (totalBeats × 60 /
+            // sourceBpm) — interpretation is the calibrated musical view of
+            // the file, while source.durationSeconds may have been written by
+            // ClipSynchronizer's setSourceMetadata from TE's auto-detected
+            // loopInfo (often a project-default fallback) before the user or
+            // a later detection pass refined the interpretation. Falling back
+            // to durationSeconds only when interpretation is incomplete.
+            double naturalSourceDuration = 0.0;
+            if (clip.audio().interpretation.bpm > 0.0 &&
+                clip.audio().interpretation.totalBeats > 0.0) {
+                naturalSourceDuration =
+                    clip.audio().interpretation.totalBeats * 60.0 / clip.audio().interpretation.bpm;
+            } else if (clip.audio().source.durationSeconds > 0.0) {
+                naturalSourceDuration = clip.audio().source.durationSeconds;
+            }
+            const auto sourceSpan = clip.timelineToSource(clip.length);
+            const bool coversFullSource = naturalSourceDuration > 0.0 &&
+                                          currentSourceOffset <= 0.001 &&
+                                          std::abs(sourceSpan - naturalSourceDuration) <= 0.001;
+
+            if (coversFullSource && clip.audio().interpretation.totalBeats > 0.0)
                 clip.setPlacementBeats(clip.placement.startBeat,
                                        clip.audio().interpretation.totalBeats);
             else
