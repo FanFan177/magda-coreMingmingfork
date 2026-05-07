@@ -75,6 +75,10 @@ class ClipSyncIntegrationTest final : public juce::UnitTest {
         testCreateAndSyncAudioClip();
         testSessionImportUsesCachedDetectorFallback();
         testSessionSyncPreservesDetectedSourceInterpretation();
+        testBatchPropertyChangeUpdatesArrangementClipsSynchronously();
+        testPropertyChangeCreatesMissingArrangementClipAndReallocatesOnce();
+        testPropertyChangeCreatesMissingReversedArrangementClipSynchronously();
+        testBatchSessionSlotCreationReallocatesOnce();
         testMoveClip();
         testResizeFromRight();
         testResizeFromLeft();
@@ -86,6 +90,7 @@ class ClipSyncIntegrationTest final : public juce::UnitTest {
         testLoopTimeBased();
         testLoopTimeBasedWarpEnabled();
         testSplitAudioClip();
+        testSplitDrivesLeftClipUpdateThroughListener();
         testBeatModeSplitRendersRightSide();
         testBeatModeSplitWrapsLoopPhaseAtBoundary();
         testBeatModeDuplicateRendersCopy();
@@ -296,6 +301,152 @@ class ClipSyncIntegrationTest final : public juce::UnitTest {
         }
 
         thumbs.clearCache();
+    }
+
+    void testBatchPropertyChangeUpdatesArrangementClipsSynchronously() {
+        beginTest("Batch property change updates arrangement TE clips synchronously");
+
+        Fixture f;
+        auto& cm = ClipManager::getInstance();
+
+        auto first =
+            cm.createAudioClip(f.trackId, 0.0, 2.0, f.audioPath(), ClipView::Arrangement, 60.0);
+        auto second =
+            cm.createAudioClip(f.trackId, 4.0, 2.0, f.audioPath(), ClipView::Arrangement, 60.0);
+        expect(first != INVALID_CLIP_ID && second != INVALID_CLIP_ID);
+
+        auto* firstClip = cm.getClip(first);
+        auto* secondClip = cm.getClip(second);
+        expect(firstClip != nullptr && secondClip != nullptr);
+        if (!firstClip || !secondClip)
+            return;
+
+        firstClip->volumeDB = -7.0f;
+        secondClip->pan = 0.35f;
+
+        int reallocationCount = 0;
+        f.edit->getTransport().ensureContextAllocated();
+        f.clipSync->onGraphReallocated = [&reallocationCount]() { ++reallocationCount; };
+
+        cm.forceNotifyMultipleClipPropertiesChanged({first, second, first});
+
+        auto* firstTeClip = f.getTeAudioClip(first);
+        auto* secondTeClip = f.getTeAudioClip(second);
+        expect(firstTeClip != nullptr && secondTeClip != nullptr);
+        if (!firstTeClip || !secondTeClip)
+            return;
+
+        expectWithinAbsoluteError(static_cast<double>(firstTeClip->getGainDB()), -7.0, 0.01);
+        expectWithinAbsoluteError(static_cast<double>(secondTeClip->getPan()), 0.35, 0.01);
+        expectEquals(reallocationCount, 0,
+                     "Pure arrangement property batch should not reallocate the graph");
+    }
+
+    void testPropertyChangeCreatesMissingArrangementClipAndReallocatesOnce() {
+        beginTest("Property change creates missing arrangement TE clip and reallocates once");
+
+        Fixture f;
+        auto& cm = ClipManager::getInstance();
+
+        auto clipId =
+            cm.createAudioClip(f.trackId, 0.0, 2.0, f.audioPath(), ClipView::Arrangement, 60.0);
+        expect(clipId != INVALID_CLIP_ID);
+        f.clipSync->removeClipFromEngine(clipId);
+        expect(f.getTeAudioClip(clipId) == nullptr, "TE clip should be absent after removal");
+
+        auto* clip = cm.getClip(clipId);
+        expect(clip != nullptr);
+        if (!clip)
+            return;
+        clip->volumeDB = -9.0f;
+
+        int reallocationCount = 0;
+        f.edit->getTransport().ensureContextAllocated();
+        const bool canObserveReallocation = f.edit->getCurrentPlaybackContext() != nullptr;
+        f.clipSync->onGraphReallocated = [&reallocationCount]() { ++reallocationCount; };
+
+        cm.forceNotifyMultipleClipPropertiesChanged({clipId, clipId});
+
+        auto* teClip = f.getTeAudioClip(clipId);
+        expect(teClip != nullptr,
+               "Property sync should recreate the missing TE clip synchronously");
+        if (!teClip)
+            return;
+
+        expectWithinAbsoluteError(static_cast<double>(teClip->getGainDB()), -9.0, 0.01);
+        if (canObserveReallocation) {
+            expectEquals(
+                reallocationCount, 1,
+                "Creating an arrangement TE clip from a property batch should reallocate once");
+        }
+    }
+
+    void testPropertyChangeCreatesMissingReversedArrangementClipSynchronously() {
+        beginTest("Property change creates missing reversed arrangement TE clip synchronously");
+
+        Fixture f;
+        auto& cm = ClipManager::getInstance();
+
+        auto clipId =
+            cm.createAudioClip(f.trackId, 0.0, 2.0, f.audioPath(), ClipView::Arrangement, 60.0);
+        expect(clipId != INVALID_CLIP_ID);
+        f.clipSync->removeClipFromEngine(clipId);
+
+        auto* clip = cm.getClip(clipId);
+        expect(clip != nullptr);
+        if (!clip)
+            return;
+
+        clip->isReversed = true;
+        cm.forceNotifyMultipleClipPropertiesChanged({clipId, clipId});
+
+        auto* teClip = f.getTeAudioClip(clipId);
+        expect(teClip != nullptr,
+               "Reversed property sync should recreate the missing TE clip synchronously");
+        if (!teClip)
+            return;
+
+        expect(teClip->getIsReversed(), "Reversed state should sync before returning");
+        if (f.clipSync->getPendingReverseClipId() != INVALID_CLIP_ID)
+            expectEquals(f.clipSync->getPendingReverseClipId(), clipId,
+                         "Proxy-not-ready reversed clips should be tracked for timer reallocation");
+    }
+
+    void testBatchSessionSlotCreationReallocatesOnce() {
+        beginTest("Batch session slot creation reallocates graph once");
+
+        Fixture f;
+        auto& cm = ClipManager::getInstance();
+
+        auto first =
+            cm.createAudioClip(f.trackId, 0.0, 2.0, f.audioPath(), ClipView::Session, 60.0);
+        auto second =
+            cm.createAudioClip(f.trackId, 0.0, 2.0, f.audioPath(), ClipView::Session, 60.0);
+        expect(first != INVALID_CLIP_ID && second != INVALID_CLIP_ID);
+
+        auto* firstClip = cm.getClip(first);
+        auto* secondClip = cm.getClip(second);
+        expect(firstClip != nullptr && secondClip != nullptr);
+        if (!firstClip || !secondClip)
+            return;
+
+        firstClip->sceneIndex = 0;
+        secondClip->sceneIndex = 1;
+
+        int reallocationCount = 0;
+        f.edit->getTransport().ensureContextAllocated();
+        const bool canObserveReallocation = f.edit->getCurrentPlaybackContext() != nullptr;
+        f.clipSync->onGraphReallocated = [&reallocationCount]() { ++reallocationCount; };
+
+        cm.forceNotifyMultipleClipPropertiesChanged({first, second, first});
+
+        expect(f.clipSync->getSessionTeClip(first) != nullptr,
+               "First session slot should be synced before batch notification returns");
+        expect(f.clipSync->getSessionTeClip(second) != nullptr,
+               "Second session slot should be synced before batch notification returns");
+        if (canObserveReallocation)
+            expectEquals(reallocationCount, 1,
+                         "Batch-created session slots should share one graph reallocation");
     }
 
     void testMoveClip() {
@@ -803,6 +954,49 @@ class ClipSyncIntegrationTest final : public juce::UnitTest {
         expectWithinAbsoluteError(rightPos.getOffset().inSeconds(),
                                   rightClip->getTeOffset(rightClip->loopEnabled), 0.01);
         expect(rightClip->offset > 0.0, "Right clip offset should be > 0 after split");
+    }
+
+    void testSplitDrivesLeftClipUpdateThroughListener() {
+        beginTest("Split notifies property change for left clip (no manual resync needed)");
+
+        Fixture f;
+        auto& cm = ClipManager::getInstance();
+
+        // Audio: split must shrink the existing TE clip via the listener flow.
+        auto audioId =
+            cm.createAudioClip(f.trackId, 0.0, 4.0, f.audioPath(), ClipView::Arrangement, 60.0);
+        cm.splitClip(audioId, 2.0, 60.0);
+
+        auto* leftAudio = f.getTeAudioClip(audioId);
+        expect(leftAudio != nullptr, "Left audio TE clip should still exist after split");
+        if (leftAudio) {
+            const auto pos = leftAudio->getPosition();
+            expectWithinAbsoluteError(pos.getStart().inSeconds(), 0.0, 0.01);
+            expectWithinAbsoluteError(pos.getEnd().inSeconds(), 2.0, 0.01);
+        }
+
+        // MIDI: notes must be partitioned in the left TE clip too.
+        auto midiId = cm.createMidiClip(f.trackId, 0.0, 4.0, ClipView::Arrangement);
+        for (int beat = 0; beat < 4; ++beat) {
+            MidiNote n;
+            n.startBeat = static_cast<double>(beat) * 60.0 / 60.0;
+            n.lengthBeats = 0.25;
+            n.noteNumber = 60 + beat;
+            n.velocity = 100;
+            cm.addMidiNote(midiId, n);
+        }
+        cm.splitClip(midiId, 2.0, 60.0);
+
+        auto* leftMidi = f.getTeMidiClip(midiId);
+        expect(leftMidi != nullptr, "Left MIDI TE clip should still exist after split");
+        if (leftMidi) {
+            const auto pos = leftMidi->getPosition();
+            expectWithinAbsoluteError(pos.getEnd().inSeconds() - pos.getStart().inSeconds(), 2.0,
+                                      0.01);
+            const int teNoteCount = leftMidi->getSequence().getNumNotes();
+            expectEquals(teNoteCount, 2,
+                         "Left MIDI TE clip should hold only the notes before the split");
+        }
     }
 
     void testBeatModeSplitRendersRightSide() {
