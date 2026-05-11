@@ -590,7 +590,15 @@ void WaveformGridComponent::paintClipBoundaries(juce::Graphics& g) {
     auto loopColour = DarkTheme::getColour(DarkTheme::LOOP_MARKER);
 
     double baseTime = getDisplayStartTime();
-    double activeOffset = relativeMode_ ? 0.0 : displayInfo_.offsetPositionSeconds;
+    // offsetPositionSeconds is the timeline-time position of the clip's
+    // source offset within the drawable file extent. In non-REL mode the
+    // file is anchored at clipStart - offsetPositionSeconds so adding it
+    // back lands the clip boundary at clipStart. In REL mode the file is
+    // anchored at timeline=0, so the clip boundary needs to sit at
+    // timeline=offsetPositionSeconds — pinning it at 0 (the previous
+    // behaviour) made resize-from-left in the arrangement read out as
+    // resize-from-right in the editor because only clipLength_ moved.
+    double activeOffset = displayInfo_.offsetPositionSeconds;
 
     // Loop boundaries - only shown when loop is enabled
     if (isLooped && displayInfo_.loopLengthSeconds > 0.0) {
@@ -1119,6 +1127,20 @@ void WaveformGridComponent::mouseDown(const juce::MouseEvent& event) {
     const bool nearPhaseMarker = isNearPhaseMarker(x, *clip);
     const bool nearLeftEdge = isNearLeftEdge(x, *clip);
     const bool nearRightEdge = isNearRightEdge(x, *clip);
+
+    // Shift = force zoom-drag, even when over the phase marker. The phase
+    // marker only exists when loop is on, and its 20px hit zone otherwise
+    // swallows shift-drags that the user intended as zoom, making zoom feel
+    // broken specifically inside the loop region. Matches the warp-mode
+    // branch's shift+inside-waveform → zoom precedence above.
+    if (shiftHeld && isInsideWaveform(x, *clip)) {
+        dragMode_ = DragMode::Zoom;
+        zoomDragStartY_ = event.y;
+        zoomDragAnchorX_ = x;
+        if (onZoomDrag)
+            onZoomDrag(0, zoomDragAnchorX_);
+        return;
+    }
 
     if (nearPhaseMarker) {
         dragMode_ = DragMode::PhaseMarker;

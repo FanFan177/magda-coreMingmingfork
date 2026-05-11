@@ -688,6 +688,21 @@ void ClipManager::setClipColour(ClipId clipId, juce::Colour colour) {
 
 void ClipManager::setClipLoopEnabled(ClipId clipId, bool enabled, double projectBPM) {
     if (auto* clip = getClip(clipId)) {
+        // Invariant: autoTempo (beat mode) requires loopEnabled. TE's
+        // autoTempo beat range only operates over a loop region, and
+        // ClipOperations' resize / offset math for autoTempo clips assumes
+        // loopLengthBeats / loopStartBeats are live. Allowing loop-off while
+        // beat mode is on lands the clip in a state nothing models, so
+        // resize gestures fall through inconsistent branches and the user
+        // sees the clip resize to an unrelated length. Reject the disable
+        // here rather than corrupt state — the user must exit beat mode
+        // first to turn looping off. Emit a property-changed notification
+        // anyway so callers that flipped their local toggle optimistically
+        // re-read the (unchanged) model and revert.
+        if (!enabled && clip->autoTempo) {
+            notifyClipPropertyChanged(clipId);
+            return;
+        }
         clip->loopEnabled = enabled;
 
         // When enabling loop on MIDI clips, capture current length as loop region
@@ -720,14 +735,43 @@ void ClipManager::setClipLoopEnabled(ClipId clipId, bool enabled, double project
             clip->midiOffset = 0.0;
         }
 
-        // When disabling loop on audio clips, sync loopStart and clamp length to actual file
-        // content
+        // When disabling loop on audio clips, snap the clip's timeline length
+        // to the audible source content so the user doesn't end up with empty
+        // space after the audio. Two reasons the previous behaviour wasn't
+        // enough: clampLengthToSource only edited clip->length (the seconds
+        // cache) without touching placement.lengthBeats, so the next
+        // beats→seconds derive would resurrect the old length; and a clamp
+        // (cap-if-longer) leaves the clip oversized whenever the file is
+        // longer than the timeline span, which still reads as empty space
+        // after a short loop region. Set the length explicitly to "file
+        // content from offset on", routed through setPlacementBeats so the
+        // beat domain stays authoritative.
         if (!enabled && clip->isAudio() && clip->audio().source.filePath.isNotEmpty()) {
             clip->loopStart = clip->offset;
-            auto* thumbnail =
-                AudioThumbnailManager::getInstance().getThumbnail(clip->audio().source.filePath);
-            if (thumbnail) {
-                clip->clampLengthToSource(thumbnail->getTotalLength());
+
+            double fileDuration = 0.0;
+            if (auto* thumbnail = AudioThumbnailManager::getInstance().getThumbnail(
+                    clip->audio().source.filePath)) {
+                fileDuration = thumbnail->getTotalLength();
+            }
+            if (fileDuration <= 0.0)
+                fileDuration = clip->audio().source.durationSeconds;
+
+            const double speed = clip->speedRatio > 0.0 ? clip->speedRatio : 1.0;
+            if (fileDuration > 0.0) {
+                const double availableSource = juce::jmax(0.0, fileDuration - clip->offset);
+                const double newTimelineLength =
+                    juce::jmax(ClipInfo::MIN_CLIP_LENGTH, availableSource / speed);
+                const double bpm = juce::jmax(1.0, projectBPM);
+                clip->setPlacementBeats(clip->placement.startBeat, newTimelineLength * bpm / 60.0);
+                clip->deriveTimesFromBeats(bpm);
+
+                // The new timeline length can exceed the previous loop region,
+                // which on the arrangement view can push the clip into a
+                // neighbour. Match the policy other length-changing setters
+                // (resizeClip / trimClip) already enforce.
+                if (clip->view == ClipView::Arrangement)
+                    resolveOverlaps(clipId);
             }
         }
 
