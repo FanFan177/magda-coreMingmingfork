@@ -113,6 +113,21 @@ struct ParameterInfo {
     };
     std::shared_ptr<DisplayTextProvider> displayText;
 
+    // Gate condition. When gateSlotIndex >= 0 the UI disables (greys out)
+    // this parameter's cell whenever the referenced parameter's current
+    // value does not satisfy the condition.
+    // `[gate:N]`  → gateSlotIndex = N, gateNegated = false: enabled when
+    //                slot N's value >= 0.5.
+    // `[gate:!N]` → gateSlotIndex = N, gateNegated = true:  enabled when
+    //                slot N's value < 0.5.
+    // -1 = no gate (always enabled). UI-only; has no audio-thread effect.
+    int gateSlotIndex = -1;
+    bool gateNegated = false;
+
+    // UI-only visibility. Hidden parameters remain addressable for automation,
+    // aliases, and host writes, but parameter-grid layouts omit their cell.
+    bool hidden = false;
+
     // Modulation constraints
     bool modulatable = true;         // Can mods affect this parameter?
     bool bipolarModulation = false;  // Default unipolar; set true for params that need bipolar
@@ -142,6 +157,18 @@ struct ParameterInfo {
     bool isBipolar() const {
         return minValue < 0.0f && maxValue > 0.0f;
     }
+};
+
+struct ParameterNormalizedValue {
+    float value = 0.0f;
+
+    static ParameterNormalizedValue clamped(float v) {
+        return {juce::jlimit(0.0f, 1.0f, v)};
+    }
+};
+
+struct ParameterModelValue {
+    float value = 0.0f;
 };
 
 /**
