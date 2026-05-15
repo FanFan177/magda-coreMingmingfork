@@ -27,7 +27,6 @@
 #include "core/SelectionManager.hpp"
 #include "core/SessionLaunchService.hpp"
 #include "core/SessionViewState.hpp"
-#include "core/TempoUtils.hpp"
 #include "core/TrackCommands.hpp"
 #include "core/TrackPropertyCommands.hpp"
 #include "core/UndoManager.hpp"
@@ -2462,8 +2461,7 @@ void SessionView::wireClipSlotCallbacks(ClipSlotButton& slot, int trackIndex, in
         if (!ClipManager::getInstance().hasClipsInClipboard())
             return;
         TrackId tId = visibleTrackIds_[trackIndex];
-        auto cmd = std::make_unique<PasteClipCommand>(BeatPosition{0.0}, tId, ClipView::Session,
-                                                      sceneIndex);
+        auto cmd = std::make_unique<PasteClipCommand>(0.0, tId, ClipView::Session, sceneIndex);
         UndoManager::getInstance().executeCommand(std::move(cmd));
     };
     slot.onDuplicateClip = [this, trackIndex, sceneIndex]() {
@@ -2495,7 +2493,8 @@ ClipId SessionView::duplicateSessionClipToNextEmptyScene(ClipId clipId) {
     while (targetScene >= numScenes_)
         addScene();
 
-    auto cmd = DuplicateClipCommand::forSessionSlot(clipId, INVALID_TRACK_ID, targetScene);
+    auto cmd =
+        std::make_unique<DuplicateClipCommand>(clipId, -1.0, INVALID_TRACK_ID, 0.0, targetScene);
     auto* cmdPtr = cmd.get();
     UndoManager::getInstance().executeCommand(std::move(cmd));
     return cmdPtr->getDuplicatedClipId();
@@ -2719,8 +2718,8 @@ void SessionView::onCreateMidiClipClicked(int trackIndex, int sceneIndex) {
         return;
 
     // Create clip through command system for proper undo support
-    auto cmd = std::make_unique<CreateClipCommand>(ClipType::MIDI, trackId, BeatPosition{0.0},
-                                                   BeatDuration{4.0}, "", ClipView::Session);
+    auto cmd = std::make_unique<CreateClipCommand>(ClipType::MIDI, trackId, 0.0, 4.0, "",
+                                                   ClipView::Session);
 
     // Get raw pointer before moving to UndoManager
     auto* cmdPtr = cmd.get();
@@ -3373,11 +3372,10 @@ void SessionView::timerCallback() {
                 // audio thread hasn't ticked yet.
                 double atPos = audioEngine_->getAudioThreadTransportSeconds();
                 double pos = (atPos >= 0.0) ? atPos : transport.getPosition().inSeconds();
-                const double projectBpm = isValidBpm(bpm) ? bpm : DEFAULT_BPM;
-                double beatDuration = 60.0 / projectBpm;
+                double beatDuration = 60.0 / (bpm > 0.0 ? bpm : 120.0);
                 double beatPhase = std::fmod(pos, beatDuration) / beatDuration;
                 newBlinkOn = (beatPhase < 0.5);
-                posBeats = pos * projectBpm / 60.0;
+                posBeats = (bpm > 0.0) ? pos * bpm / 60.0 : 0.0;
             }
         }
 
@@ -3881,8 +3879,8 @@ void SessionView::itemDropped(const SourceDetails& details) {
         bool isAltHeld = juce::ModifierKeys::getCurrentModifiers().isAltDown();
         if (isAltHeld) {
             // Alt+drag = duplicate clip to target slot
-            auto cmd =
-                DuplicateClipCommand::forSessionSlot(clipId, targetTrackId, targetSceneIndex);
+            auto cmd = std::make_unique<DuplicateClipCommand>(clipId, -1.0, targetTrackId, 0.0,
+                                                              targetSceneIndex);
             UndoManager::getInstance().executeCommand(std::move(cmd));
         } else {
             // Regular drag = move clip to target slot

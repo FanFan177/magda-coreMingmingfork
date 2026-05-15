@@ -7,7 +7,6 @@
 
 #include "../core/AutomationManager.hpp"
 #include "../core/ClipManager.hpp"
-#include "../core/TempoUtils.hpp"
 #include "../core/TrackManager.hpp"
 #include "serialization/ProjectSerializer.hpp"
 #include "version.hpp"
@@ -116,18 +115,6 @@ bool ProjectManager::saveProjectAs(const juce::File& file) {
         actualFile = wrapperDir.getChildFile(file.getFileName());
     }
 
-    // Set up the target media directory before serializing so any clips that
-    // point at the unsaved project's temp media folder are rewritten to the
-    // durable project media folder in the saved .mgd.
-    auto oldMediaDir = mediaDirectory_;
-    juce::String mediaDirName = actualFile.getFileNameWithoutExtension() + "_Media";
-    auto targetMediaDir = actualFile.getParentDirectory().getChildFile(mediaDirName);
-    ensureMediaSubdirectories(targetMediaDir);
-
-    if (oldMediaDir != juce::File() && oldMediaDir != targetMediaDir && oldMediaDir.isDirectory()) {
-        migrateMediaFiles(oldMediaDir, targetMediaDir);
-    }
-
     // Prepare updated project info without mutating currentProject_ yet
     ProjectInfo newProject = currentProject_;
     newProject.filePath = actualFile.getFullPathName();
@@ -147,7 +134,18 @@ bool ProjectManager::saveProjectAs(const juce::File& file) {
     currentProject_ = std::move(newProject);
     currentFile_ = actualFile;
     isProjectOpen_ = true;
-    mediaDirectory_ = targetMediaDir;
+
+    // Set up permanent media directory beside the project file
+    auto oldMediaDir = mediaDirectory_;
+    juce::String mediaDirName = actualFile.getFileNameWithoutExtension() + "_Media";
+    mediaDirectory_ = actualFile.getParentDirectory().getChildFile(mediaDirName);
+    ensureMediaSubdirectories(mediaDirectory_);
+
+    // Migrate files from temp directory if needed
+    if (oldMediaDir != juce::File() && oldMediaDir != mediaDirectory_ &&
+        oldMediaDir.isDirectory()) {
+        migrateMediaFiles(oldMediaDir, mediaDirectory_);
+    }
 
     clearDirty();
     deleteAutosaveFile();
@@ -356,20 +354,17 @@ juce::String ProjectManager::getProjectName() const {
 }
 
 void ProjectManager::setTempo(double tempo) {
-    const double clampedTempo = clampBpm(tempo);
-    if (currentProject_.tempo != clampedTempo) {
-        currentProject_.tempo = clampedTempo;
+    if (currentProject_.tempo != tempo) {
+        currentProject_.tempo = tempo;
         markDirty();
     }
 }
 
 void ProjectManager::setTimeSignature(int numerator, int denominator) {
-    const int clampedNumerator = clampTimeSignatureValue(numerator);
-    const int clampedDenominator = clampTimeSignatureValue(denominator);
-    if (currentProject_.timeSignatureNumerator != clampedNumerator ||
-        currentProject_.timeSignatureDenominator != clampedDenominator) {
-        currentProject_.timeSignatureNumerator = clampedNumerator;
-        currentProject_.timeSignatureDenominator = clampedDenominator;
+    if (currentProject_.timeSignatureNumerator != numerator ||
+        currentProject_.timeSignatureDenominator != denominator) {
+        currentProject_.timeSignatureNumerator = numerator;
+        currentProject_.timeSignatureDenominator = denominator;
         markDirty();
     }
 }
@@ -465,23 +460,9 @@ juce::File ProjectManager::getBouncesDirectory() const {
 void ProjectManager::createTempMediaDirectory() {
     auto tempRoot =
         juce::File::getSpecialLocation(juce::File::tempDirectory).getChildFile(kTempRootDir);
-    tempRoot.createDirectory();
-
-    if (!tempRoot.isDirectory()) {
-        tempRoot = juce::File("/tmp").getChildFile(kTempRootDir);
-        tempRoot.createDirectory();
-    }
-
     juce::String timestamp = juce::Time::getCurrentTime().formatted("%Y%m%d_%H%M%S");
-    mediaDirectory_ = tempRoot.getNonexistentChildFile(kTempPrefix + timestamp, {});
+    mediaDirectory_ = tempRoot.getChildFile(kTempPrefix + timestamp);
     mediaDirectory_.createDirectory();
-
-    if (!mediaDirectory_.isDirectory()) {
-        auto fallbackRoot = juce::File("/tmp").getChildFile(kTempRootDir);
-        fallbackRoot.createDirectory();
-        mediaDirectory_ = fallbackRoot.getNonexistentChildFile(kTempPrefix + timestamp, {});
-        mediaDirectory_.createDirectory();
-    }
 }
 
 void ProjectManager::ensureMediaSubdirectories(const juce::File& mediaRoot) {
@@ -498,7 +479,6 @@ void ProjectManager::migrateMediaFiles(const juce::File& oldDir, const juce::Fil
 
     auto oldPath = oldDir.getFullPathName();
     auto newPath = newDir.getFullPathName();
-    std::vector<ClipId> updatedClipIds;
 
     // Move files from each subdirectory
     const char* subdirs[] = {kRecordingsDir, kRendersDir, kBouncesDir};
@@ -526,7 +506,6 @@ void ProjectManager::migrateMediaFiles(const juce::File& oldDir, const juce::Fil
                 if (clip) {
                     clip->audio().source.filePath =
                         clip->audio().source.filePath.replace(oldPath, newPath, false);
-                    updatedClipIds.push_back(clip->id);
                 }
             }
         }
@@ -534,9 +513,6 @@ void ProjectManager::migrateMediaFiles(const juce::File& oldDir, const juce::Fil
 
     updateClipPaths(clipManager.getArrangementClips());
     updateClipPaths(clipManager.getSessionClips());
-
-    if (!updatedClipIds.empty())
-        clipManager.forceNotifyMultipleClipPropertiesChanged(updatedClipIds);
 
     // Remove old temp directory if it's empty or under the temp root
     auto tempRoot =

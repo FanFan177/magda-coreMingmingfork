@@ -101,7 +101,7 @@ void AutomationPointComponent::mouseDown(const juce::MouseEvent& e) {
         // Start drag
         isDragging_ = true;
         dragStartPos_ = e.getEventRelativeTo(getParentComponent()).getPosition();
-        dragStartBeatPosition_ = point_.beatPosition;
+        dragStartTime_ = point_.time;
         dragStartValue_ = point_.value;
     }
 }
@@ -114,19 +114,19 @@ void AutomationPointComponent::mouseDrag(const juce::MouseEvent& e) {
     int deltaX = parentPos.x - dragStartPos_.x;
     int deltaY = parentPos.y - dragStartPos_.y;
 
-    // Convert pixel delta to beat/value using parent's coordinate system
-    double pixelsPerBeat = parentEditor_->getPixelsPerX();
+    // Convert pixel delta to time/value using parent's coordinate system
+    double pixelsPerSecond = parentEditor_->getPixelsPerSecond();
     double pixelsPerValue = parentEditor_->getPixelsPerValue();
 
-    double newBeatPosition = dragStartBeatPosition_ + deltaX / pixelsPerBeat;
+    double newTime = dragStartTime_ + deltaX / pixelsPerSecond;
     double newValue = dragStartValue_ - deltaY / pixelsPerValue;  // Y is inverted
 
     // Clamp values
-    newBeatPosition = juce::jmax(0.0, newBeatPosition);
+    newTime = juce::jmax(0.0, newTime);
     newValue = juce::jlimit(0.0, 1.0, newValue);
 
     if (onPointDragPreview) {
-        onPointDragPreview(pointId_, newBeatPosition, newValue);
+        onPointDragPreview(pointId_, newTime, newValue);
     }
 }
 
@@ -139,17 +139,17 @@ void AutomationPointComponent::mouseUp(const juce::MouseEvent& e) {
             int deltaX = parentPos.x - dragStartPos_.x;
             int deltaY = parentPos.y - dragStartPos_.y;
 
-            double pixelsPerBeat = parentEditor_->getPixelsPerX();
+            double pixelsPerSecond = parentEditor_->getPixelsPerSecond();
             double pixelsPerValue = parentEditor_->getPixelsPerValue();
 
-            double newBeatPosition = dragStartBeatPosition_ + deltaX / pixelsPerBeat;
+            double newTime = dragStartTime_ + deltaX / pixelsPerSecond;
             double newValue = dragStartValue_ - deltaY / pixelsPerValue;
 
-            newBeatPosition = juce::jmax(0.0, newBeatPosition);
+            newTime = juce::jmax(0.0, newTime);
             newValue = juce::jlimit(0.0, 1.0, newValue);
 
             if (onPointMoved) {
-                onPointMoved(pointId_, newBeatPosition, newValue);
+                onPointMoved(pointId_, newTime, newValue);
             }
         }
     }
@@ -227,14 +227,14 @@ void AutomationPointComponent::updateHandlePositions() {
     if (!parentEditor_ || !handlesVisible_)
         return;
 
-    double pixelsPerBeat = parentEditor_->getPixelsPerX();
+    double pixelsPerSecond = parentEditor_->getPixelsPerSecond();
     double pixelsPerValue = parentEditor_->getPixelsPerValue();
 
     auto pointCenter = getBounds().getCentre();
 
     // In handle position
     if (inHandle_) {
-        int handleX = pointCenter.x + static_cast<int>(point_.inHandle.beatOffset * pixelsPerBeat);
+        int handleX = pointCenter.x + static_cast<int>(point_.inHandle.time * pixelsPerSecond);
         int handleY = pointCenter.y - static_cast<int>(point_.inHandle.value * pixelsPerValue);
         inHandle_->setCentrePosition(handleX, handleY);
         inHandle_->updateFromHandle(point_.inHandle);
@@ -242,7 +242,7 @@ void AutomationPointComponent::updateHandlePositions() {
 
     // Out handle position
     if (outHandle_) {
-        int handleX = pointCenter.x + static_cast<int>(point_.outHandle.beatOffset * pixelsPerBeat);
+        int handleX = pointCenter.x + static_cast<int>(point_.outHandle.time * pixelsPerSecond);
         int handleY = pointCenter.y - static_cast<int>(point_.outHandle.value * pixelsPerValue);
         outHandle_->setCentrePosition(handleX, handleY);
         outHandle_->updateFromHandle(point_.outHandle);
@@ -258,14 +258,14 @@ void AutomationPointComponent::onHandleChanged(BezierHandleComponent::HandleType
         inH = handle;
         // If linked, mirror the out handle
         if (inH.linked && outH.linked) {
-            outH.beatOffset = -inH.beatOffset;
+            outH.time = -inH.time;
             outH.value = -inH.value;
         }
     } else {
         outH = handle;
         // If linked, mirror the in handle
         if (inH.linked && outH.linked) {
-            inH.beatOffset = -outH.beatOffset;
+            inH.time = -outH.time;
             inH.value = -outH.value;
         }
     }

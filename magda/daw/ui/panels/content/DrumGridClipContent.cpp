@@ -2023,7 +2023,8 @@ void DrumGridClipContent::updateVelocityLane() {
         if (auto* controller = magda::TimelineController::getCurrent()) {
             tempo = controller->getState().tempo.bpm;
         }
-        double clipLengthBeats = clip->getLengthInBeats(tempo);
+        double secondsPerBeat = 60.0 / tempo;
+        double clipLengthBeats = clip->length / secondsPerBeat;
         midiDrawer_->setClipLengthBeats(clipLengthBeats);
     }
 

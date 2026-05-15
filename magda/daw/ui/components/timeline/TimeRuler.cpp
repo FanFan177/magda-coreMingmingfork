@@ -7,7 +7,6 @@
 #include "FontManager.hpp"
 #include "LayoutConfig.hpp"
 #include "TimelineState.hpp"
-#include "core/TempoUtils.hpp"
 
 namespace magda {
 
@@ -69,12 +68,12 @@ void TimeRuler::setScrollOffset(int offsetPixels) {
 void TimeRuler::setTempo(double bpm) {
     // No repaint — callers (e.g. WaveformEditorContent) already repaint
     // after adjusting zoom/scroll in response to tempo changes.
-    tempo = clampBpm(bpm);
+    tempo = bpm;
 }
 
 void TimeRuler::setTimeSignature(int numerator, int denominator) {
-    timeSigNumerator = clampTimeSignatureValue(numerator);
-    timeSigDenominator = clampTimeSignatureValue(denominator);
+    timeSigNumerator = numerator;
+    timeSigDenominator = denominator;
     repaint();
 }
 

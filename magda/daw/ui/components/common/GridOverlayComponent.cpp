@@ -58,12 +58,9 @@ void GridOverlayComponent::setTempo(double bpm) {
 }
 
 void GridOverlayComponent::setTimeSignature(int numerator, int denominator) {
-    const int clampedNumerator = clampTimeSignatureValue(numerator);
-    const int clampedDenominator = clampTimeSignatureValue(denominator);
-    if (timeSignatureNumerator != clampedNumerator ||
-        timeSignatureDenominator != clampedDenominator) {
-        timeSignatureNumerator = clampedNumerator;
-        timeSignatureDenominator = clampedDenominator;
+    if (timeSignatureNumerator != numerator || timeSignatureDenominator != denominator) {
+        timeSignatureNumerator = numerator;
+        timeSignatureDenominator = denominator;
         repaint();
     }
 }

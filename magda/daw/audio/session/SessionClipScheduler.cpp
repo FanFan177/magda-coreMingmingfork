@@ -76,14 +76,9 @@ void SessionClipScheduler::clipPlaybackRequested(ClipId clipId, ClipPlaybackRequ
             return;
         }
 
-        // Session clips always loop. Route through ClipManager so Tracktion
-        // state is resynced before launch if an old project has loop disabled.
-        if (!clip->loopEnabled) {
-            cm.setClipLoopEnabled(clipId, true);
-            clip = cm.getClip(clipId);
-            if (!clip || clip->view != ClipView::Session)
-                return;
-        }
+        // Session clips always loop
+        if (!clip->loopEnabled)
+            cm.getClip(clipId)->loopEnabled = true;
 
         // Ensure the audio-thread monitor plugin is installed
         audioBridge_.ensureSessionMonitorPlugin();
@@ -287,45 +282,6 @@ void SessionClipScheduler::processStateEvents() {
         // discard — we read LaunchHandle state directly below
     }
 
-    // TE follow actions can start a different LaunchHandle from inside the
-    // audio graph. Adopt those handles back into Magda's track state so the UI
-    // and playhead monitor follow the clip that is actually sounding.
-    bool adoptedFollowActionClip = false;
-    for (const auto& clip : cm.getSessionClips()) {
-        auto* teClip = audioBridge_.getSessionTeClip(clip.id);
-        if (!teClip)
-            continue;
-
-        auto handle = teClip->getLaunchHandle();
-        if (!handle)
-            continue;
-
-        auto playState = handle->getPlayingStatus();
-        auto queuedState = handle->getQueuedStatus();
-        const bool isPlaying = playState == te::LaunchHandle::PlayState::playing;
-        const bool isQueued =
-            queuedState && *queuedState == te::LaunchHandle::QueueState::playQueued;
-        if (!isPlaying && !isQueued)
-            continue;
-
-        auto* track = tm.getTrack(clip.trackId);
-        if (!track || track->activeSessionClipId == clip.id)
-            continue;
-
-        track->activeSessionClipId = clip.id;
-        updateLaunchTimings(clip.id, &clip);
-        retainLaunchHandle(clip.id);
-        sendMonitorCommand(clip.id);
-        lastNotifiedState_[clip.id] =
-            isPlaying ? SessionClipPlayState::Playing : SessionClipPlayState::Queued;
-        playheadClipId_ = clip.id;
-        stopPendingTracks_.erase(clip.trackId);
-        cm.notifyClipPlaybackStateChanged(clip.id);
-        adoptedFollowActionClip = true;
-    }
-    if (adoptedFollowActionClip)
-        syncTrackPlaybackModes();
-
     bool transportPlaying = edit_.getTransport().isPlaying();
 
     // Transport just stopped — stop all LaunchHandles so clips reset to start.
@@ -448,18 +404,19 @@ void SessionClipScheduler::updateLaunchTimings(ClipId clipId, const ClipInfo* cl
         bpm = 120.0;
 
     if (clip->isAudio() && clip->autoTempo) {
-        data.clipLengthBeats = clip->getLengthInBeats(bpm);
+        data.clipLengthBeats = clip->lengthBeats;
         data.loopLengthBeats =
-            (clip->loopLengthBeats > 0.0) ? clip->loopLengthBeats : data.clipLengthBeats;
+            (clip->loopLengthBeats > 0.0) ? clip->loopLengthBeats : clip->lengthBeats;
     } else if (clip->isAudio()) {
-        double srcLength = clip->getSourceLoopLength() > 0.0
-                               ? clip->getSourceLoopLength()
-                               : clip->timelineToSource(clip->getTimelineLength(bpm));
+        double srcLength =
+            clip->loopLength > 0.0 ? clip->loopLength : clip->length * clip->speedRatio;
         double durationSeconds = srcLength / clip->speedRatio;
         data.clipLengthBeats = durationSeconds * bpm / 60.0;
         data.loopLengthBeats = data.clipLengthBeats;
     } else {
-        data.clipLengthBeats = clip->getLengthInBeats(bpm);
+        // MIDI: source length is in seconds
+        double srcLength = clip->getSourceLength();
+        data.clipLengthBeats = srcLength * bpm / 60.0;
         data.loopLengthBeats = data.clipLengthBeats;
     }
 }

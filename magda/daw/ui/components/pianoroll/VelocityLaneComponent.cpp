@@ -9,12 +9,6 @@
 
 namespace magda {
 
-namespace {
-double timelineStartBeats(const ClipInfo& clip, double bpm) {
-    return clip.getStartBeats(bpm);
-}
-}  // namespace
-
 VelocityLaneComponent::VelocityLaneComponent() {
     setName("VelocityLane");
     setOpaque(true);  // Ensure proper repainting during drag
@@ -239,7 +233,7 @@ void VelocityLaneComponent::updateCurveHandle() {
         double clipAbsStartBeats = 0.0;
         const auto* clipData = ClipManager::getInstance().getClip(clipId_);
         if (clipData) {
-            clipAbsStartBeats = timelineStartBeats(*clipData, tempo);
+            clipAbsStartBeats = clipData->startTime * (tempo / 60.0);
         }
         curveHandleX_ = beatToPixel(midBeat + clipAbsStartBeats);
     }
@@ -323,6 +317,8 @@ void VelocityLaneComponent::paint(juce::Graphics& g) {
     if (auto* controller = TimelineController::getCurrent()) {
         tempo = controller->getState().tempo.bpm;
     }
+    double beatsPerSecond = tempo / 60.0;
+
     int minBarWidth = 4;
 
     for (ClipId renderClipId : clipsToRender) {
@@ -334,7 +330,7 @@ void VelocityLaneComponent::paint(juce::Graphics& g) {
         // Compute per-clip offset for multi-clip relative mode
         double clipOffsetBeats = 0.0;
         if (relativeMode_ && clipIds_.size() > 1) {
-            clipOffsetBeats = timelineStartBeats(*clip, tempo) - clipStartBeats_;
+            clipOffsetBeats = clip->startTime * beatsPerSecond - clipStartBeats_;
         }
 
         juce::Colour noteColour = clip->colour;
@@ -355,7 +351,7 @@ void VelocityLaneComponent::paint(juce::Graphics& g) {
             if (relativeMode_) {
                 noteStart += clipOffsetBeats;
             } else {
-                double clipAbsStartBeats = timelineStartBeats(*clip, tempo);
+                double clipAbsStartBeats = clip->startTime * beatsPerSecond;
                 noteStart += clipAbsStartBeats;
             }
 
@@ -427,7 +423,7 @@ void VelocityLaneComponent::paint(juce::Graphics& g) {
                 if (auto* controller = TimelineController::getCurrent()) {
                     tempo = controller->getState().tempo.bpm;
                 }
-                clipAbsOffset = timelineStartBeats(*curveClip, tempo);
+                clipAbsOffset = curveClip->startTime * (tempo / 60.0);
             }
 
             // Draw curve line through selected notes

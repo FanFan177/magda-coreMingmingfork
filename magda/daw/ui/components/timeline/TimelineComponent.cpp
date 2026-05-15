@@ -7,7 +7,6 @@
 #include "../../themes/DarkTheme.hpp"
 #include "../../themes/FontManager.hpp"
 #include "Config.hpp"
-#include "core/TempoUtils.hpp"
 
 namespace magda {
 
@@ -215,12 +214,12 @@ void TimelineComponent::setTimeDisplayMode(TimeDisplayMode mode) {
 }
 
 void TimelineComponent::setTempo(double bpm) {
-    tempoBPM = clampBpm(bpm);
+    tempoBPM = juce::jlimit(20.0, 999.0, bpm);
 }
 
 void TimelineComponent::setTimeSignature(int numerator, int denominator) {
-    timeSignatureNumerator = clampTimeSignatureValue(numerator);
-    timeSignatureDenominator = clampTimeSignatureValue(denominator);
+    timeSignatureNumerator = juce::jlimit(1, 16, numerator);
+    timeSignatureDenominator = juce::jlimit(1, 16, denominator);
     repaint();
 }
 

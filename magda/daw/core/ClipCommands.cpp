@@ -62,27 +62,6 @@ juce::String expandBouncePattern(const juce::String& clipName, const juce::Strin
     return expandPattern(pattern, clipName, trackName);
 }
 
-double currentProjectBpm() {
-    double bpm = ProjectManager::getInstance().getCurrentProjectInfo().tempo;
-    return isValidBpm(bpm) ? bpm : DEFAULT_BPM;
-}
-
-double resolveTimelineBpm(double tempo) {
-    if (isValidBpm(tempo))
-        return tempo;
-    if (auto* controller = magda::TimelineController::getCurrent()) {
-        const double bpm = controller->getState().tempo.bpm;
-        if (isValidBpm(bpm))
-            return bpm;
-    }
-    return currentProjectBpm();
-}
-
-double beatsToTimelineSeconds(double beats, double tempo) {
-    const double bpm = resolveTimelineBpm(tempo);
-    return beats * 60.0 / bpm;
-}
-
 /**
  * Progress window for offline rendering that runs on a background thread
  * while pumping the message loop (via runThread()) so the UI stays responsive.
@@ -133,13 +112,12 @@ class RenderProgressWindow : public juce::ThreadWithProgressWindow {
 // SplitClipCommand
 // ============================================================================
 
-SplitClipCommand::SplitClipCommand(ClipId clipId, BeatPosition splitBeat, double tempo)
-    : clipId_(clipId), splitBeat_(splitBeat.value), tempo_(tempo) {}
+SplitClipCommand::SplitClipCommand(ClipId clipId, double splitTime, double tempo)
+    : clipId_(clipId), splitTime_(splitTime), tempo_(tempo) {}
 
 bool SplitClipCommand::canExecute() const {
     auto* clip = ClipManager::getInstance().getClip(clipId_);
-    const double bpm = resolveTimelineBpm(tempo_);
-    return clip && splitBeat_ > clip->getStartBeats(bpm) && splitBeat_ < clip->getEndBeats(bpm);
+    return clip && splitTime_ > clip->startTime && splitTime_ < clip->getEndTime();
 }
 
 ClipInfo SplitClipCommand::captureState() {
@@ -164,7 +142,7 @@ void SplitClipCommand::restoreState(const ClipInfo& state) {
 }
 
 void SplitClipCommand::performAction() {
-    rightClipId_ = ClipManager::getInstance().splitClipAtBeat(clipId_, splitBeat_, tempo_);
+    rightClipId_ = ClipManager::getInstance().splitClip(clipId_, splitTime_, tempo_);
 }
 
 bool SplitClipCommand::validateState() const {
@@ -196,8 +174,7 @@ bool SplitClipCommand::validateState() const {
         }
 
         // Validate clips are adjacent and continuous
-        const double bpm = resolveTimelineBpm(tempo_);
-        if (std::abs(leftClip->getTimelineEnd(bpm) - rightClip->getTimelineStart(bpm)) > 0.001) {
+        if (std::abs(leftClip->getEndTime() - rightClip->startTime) > 0.001) {
             return false;
         }
     }
@@ -209,8 +186,8 @@ bool SplitClipCommand::validateState() const {
 // MoveClipCommand
 // ============================================================================
 
-MoveClipCommand::MoveClipCommand(ClipId clipId, BeatPosition newStartBeat, double tempo)
-    : clipId_(clipId), newStartBeat_(newStartBeat.value), tempo_(tempo) {}
+MoveClipCommand::MoveClipCommand(ClipId clipId, double newStartTime)
+    : clipId_(clipId), newStartTime_(newStartTime) {}
 
 void MoveClipCommand::execute() {
     auto& clipManager = ClipManager::getInstance();
@@ -220,7 +197,7 @@ void MoveClipCommand::execute() {
         arrangementSnapshot_ = clipManager.getArrangementClips();
     }
 
-    clipManager.moveClipBeats(clipId_, newStartBeat_, tempo_);
+    clipManager.moveClip(clipId_, newStartTime_);
     executed_ = true;
 }
 
@@ -253,7 +230,7 @@ void MoveClipCommand::mergeWith(const UndoableCommand* other) {
     auto* otherMove = dynamic_cast<const MoveClipCommand*>(other);
     if (otherMove) {
         // Keep our original snapshot, just update the target position
-        newStartBeat_ = otherMove->newStartBeat_;
+        newStartTime_ = otherMove->newStartTime_;
     }
 }
 
@@ -351,9 +328,8 @@ void MoveClipToTrackCommand::undo() {
 // ResizeClipCommand
 // ============================================================================
 
-ResizeClipCommand::ResizeClipCommand(ClipId clipId, BeatDuration newLength, bool fromStart,
-                                     double tempo)
-    : clipId_(clipId), newLengthBeats_(newLength.value), fromStart_(fromStart), tempo_(tempo) {}
+ResizeClipCommand::ResizeClipCommand(ClipId clipId, double newLength, bool fromStart, double tempo)
+    : clipId_(clipId), newLength_(newLength), fromStart_(fromStart), tempo_(tempo) {}
 
 ClipInfo ResizeClipCommand::captureState() {
     auto* clip = ClipManager::getInstance().getClip(clipId_);
@@ -369,7 +345,7 @@ void ResizeClipCommand::restoreState(const ClipInfo& state) {
 }
 
 void ResizeClipCommand::performAction() {
-    ClipManager::getInstance().resizeClipBeats(clipId_, newLengthBeats_, fromStart_, tempo_);
+    ClipManager::getInstance().resizeClip(clipId_, newLength_, fromStart_, tempo_);
 }
 
 bool ResizeClipCommand::canMergeWith(const UndoableCommand* other) const {
@@ -382,7 +358,7 @@ void ResizeClipCommand::mergeWith(const UndoableCommand* other) {
     auto* otherResize = dynamic_cast<const ResizeClipCommand*>(other);
     if (otherResize) {
         // Update to their new length
-        newLengthBeats_ = otherResize->newLengthBeats_;
+        newLength_ = otherResize->newLength_;
     }
 }
 
@@ -415,19 +391,18 @@ bool DeleteClipCommand::validateState() const {
 // CreateClipCommand
 // ============================================================================
 
-CreateClipCommand::CreateClipCommand(ClipType type, TrackId trackId, BeatPosition startBeat,
-                                     BeatDuration lengthBeats, const juce::String& audioFilePath,
-                                     ClipView view, double tempo)
+CreateClipCommand::CreateClipCommand(ClipType type, TrackId trackId, double startTime,
+                                     double length, const juce::String& audioFilePath,
+                                     ClipView view)
     : type_(type),
       trackId_(trackId),
-      startBeat_(startBeat.value),
-      lengthBeats_(lengthBeats.value),
+      startTime_(startTime),
+      length_(length),
       audioFilePath_(audioFilePath),
-      view_(view),
-      tempo_(tempo) {}
+      view_(view) {}
 
 bool CreateClipCommand::canExecute() const {
-    return trackId_ != INVALID_TRACK_ID && lengthBeats_ > 0.0;
+    return trackId_ != INVALID_TRACK_ID && length_ > 0.0;
 }
 
 void CreateClipCommand::execute() {
@@ -441,10 +416,10 @@ void CreateClipCommand::execute() {
     }
 
     if (type_ == ClipType::Audio) {
-        createdClipId_ = clipManager.createAudioClipBeats(trackId_, startBeat_, lengthBeats_,
-                                                          audioFilePath_, view_, tempo_);
+        createdClipId_ =
+            clipManager.createAudioClip(trackId_, startTime_, length_, audioFilePath_, view_);
     } else {
-        createdClipId_ = clipManager.createMidiClipBeats(trackId_, startBeat_, lengthBeats_, view_);
+        createdClipId_ = clipManager.createMidiClip(trackId_, startTime_, length_, view_);
     }
 
     executed_ = true;
@@ -473,30 +448,14 @@ void CreateClipCommand::undo() {
 // DuplicateClipCommand
 // ============================================================================
 
-DuplicateClipCommand::DuplicateClipCommand(ClipId sourceClipId)
-    : sourceClipId_(sourceClipId),
-      targetTrackId_(INVALID_TRACK_ID),
-      tempo_(0.0),
-      targetSceneIndex_(-1) {}
-
-DuplicateClipCommand::DuplicateClipCommand(ClipId sourceClipId, BeatPosition startBeat,
+DuplicateClipCommand::DuplicateClipCommand(ClipId sourceClipId, double startTime,
                                            TrackId targetTrackId, double tempo,
                                            int targetSceneIndex)
     : sourceClipId_(sourceClipId),
-      hasExplicitStartBeat_(true),
-      startBeat_(startBeat.value),
+      startTime_(startTime),
       targetTrackId_(targetTrackId),
       tempo_(tempo),
       targetSceneIndex_(targetSceneIndex) {}
-
-std::unique_ptr<DuplicateClipCommand> DuplicateClipCommand::forSessionSlot(ClipId sourceClipId,
-                                                                           TrackId targetTrackId,
-                                                                           int targetSceneIndex) {
-    auto command = std::make_unique<DuplicateClipCommand>(sourceClipId);
-    command->targetTrackId_ = targetTrackId;
-    command->targetSceneIndex_ = targetSceneIndex;
-    return command;
-}
 
 bool DuplicateClipCommand::canExecute() const {
     return ClipManager::getInstance().getClip(sourceClipId_) != nullptr;
@@ -508,11 +467,11 @@ void DuplicateClipCommand::execute() {
 
     auto& clipManager = ClipManager::getInstance();
 
-    if (!hasExplicitStartBeat_) {
+    if (startTime_ < 0) {
         duplicatedClipId_ = clipManager.duplicateClip(sourceClipId_);
     } else {
         duplicatedClipId_ =
-            clipManager.duplicateClipAtBeats(sourceClipId_, startBeat_, targetTrackId_, tempo_);
+            clipManager.duplicateClipAt(sourceClipId_, startTime_, targetTrackId_, tempo_);
     }
     if (duplicatedClipId_ != INVALID_CLIP_ID) {
         if (targetTrackId_ != INVALID_TRACK_ID)
@@ -541,7 +500,6 @@ void DuplicateClipCommand::undo() {
 std::vector<std::unique_ptr<DuplicateClipCommand>> createArrangementBlockDuplicateCommands(
     const std::unordered_set<ClipId>& clipIds, double tempo) {
     auto& clipManager = ClipManager::getInstance();
-    const double bpm = resolveTimelineBpm(tempo);
 
     std::vector<ClipId> arrangementClipIds;
     arrangementClipIds.reserve(clipIds.size());
@@ -560,11 +518,8 @@ std::vector<std::unique_ptr<DuplicateClipCommand>> createArrangementBlockDuplica
                   const auto* clipB = clipManager.getClip(b);
                   if (!clipA || !clipB)
                       return a < b;
-                  const double bpm = currentProjectBpm();
-                  const double startA = clipA->getTimelineStart(bpm);
-                  const double startB = clipB->getTimelineStart(bpm);
-                  if (startA != startB)
-                      return startA < startB;
+                  if (clipA->startTime != clipB->startTime)
+                      return clipA->startTime < clipB->startTime;
                   if (clipA->trackId != clipB->trackId)
                       return clipA->trackId < clipB->trackId;
                   return a < b;
@@ -584,8 +539,8 @@ std::vector<std::unique_ptr<DuplicateClipCommand>> createArrangementBlockDuplica
         const auto* clip = clipManager.getClip(clipId);
         if (!clip)
             continue;
-        const double clipStart = clip->getTimelineStart(bpm);
-        const double clipEnd = clipStart + clip->getTimelineLength(bpm);
+        const double clipStart = clip->getTimelineStart(tempo);
+        const double clipEnd = clipStart + clip->getTimelineLength(tempo);
         selectionStart = std::min(selectionStart, clipStart);
         selectionEnd = std::max(selectionEnd, clipEnd);
     }
@@ -598,9 +553,9 @@ std::vector<std::unique_ptr<DuplicateClipCommand>> createArrangementBlockDuplica
         const auto* clip = clipManager.getClip(clipId);
         if (!clip)
             continue;
-        const double newStartBeat = clip->getStartBeats(bpm) + blockLength * bpm / 60.0;
-        commands.push_back(std::make_unique<DuplicateClipCommand>(
-            clipId, BeatPosition{newStartBeat}, INVALID_TRACK_ID, tempo));
+        const double newStart = clip->getTimelineStart(tempo) + blockLength;
+        commands.push_back(
+            std::make_unique<DuplicateClipCommand>(clipId, newStart, INVALID_TRACK_ID, tempo));
     }
 
     return commands;
@@ -610,13 +565,12 @@ std::vector<std::unique_ptr<DuplicateClipCommand>> createArrangementBlockDuplica
 // PasteClipCommand Implementation
 // ============================================================================
 
-PasteClipCommand::PasteClipCommand(BeatPosition pasteBeat, TrackId targetTrackId,
-                                   ClipView targetView, int targetSceneIndex, double tempo)
-    : pasteBeat_(pasteBeat.value),
+PasteClipCommand::PasteClipCommand(double pasteTime, TrackId targetTrackId, ClipView targetView,
+                                   int targetSceneIndex)
+    : pasteTime_(pasteTime),
       targetTrackId_(targetTrackId),
       targetView_(targetView),
-      targetSceneIndex_(targetSceneIndex),
-      tempo_(tempo) {}
+      targetSceneIndex_(targetSceneIndex) {}
 
 bool PasteClipCommand::canExecute() const {
     return ClipManager::getInstance().hasClipsInClipboard();
@@ -633,8 +587,8 @@ void PasteClipCommand::execute() {
         sessionSnapshot_ = clipManager.getSessionClips();
     }
 
-    pastedClipIds_ = clipManager.pasteFromClipboard(beatsToTimelineSeconds(pasteBeat_, tempo_),
-                                                    targetTrackId_, targetView_, targetSceneIndex_);
+    pastedClipIds_ =
+        clipManager.pasteFromClipboard(pasteTime_, targetTrackId_, targetView_, targetSceneIndex_);
     executed_ = true;
 }
 
@@ -688,8 +642,7 @@ bool JoinClipsCommand::canExecute() const {
         return false;
 
     // Must be adjacent (left ends where right starts)
-    const double bpm = resolveTimelineBpm(tempo_);
-    if (std::abs(left->getTimelineEnd(bpm) - right->getTimelineStart(bpm)) > 0.001)
+    if (std::abs(left->getEndTime() - right->startTime) > 0.001)
         return false;
 
     return true;
@@ -736,8 +689,8 @@ void JoinClipsCommand::performAction() {
 
     if (left->isMidi()) {
         // MIDI join: copy right clip's notes into left, adjusting beat positions
-        const double bpm = resolveTimelineBpm(tempo_);
-        double beatOffset = right->getStartBeats(bpm) - left->getStartBeats(bpm);
+        const double beatsPerSecond = tempo_ / 60.0;
+        double beatOffset = (right->startTime - left->startTime) * beatsPerSecond;
 
         for (const auto& note : right->midiNotes) {
             MidiNote adjustedNote = note;
@@ -750,10 +703,7 @@ void JoinClipsCommand::performAction() {
     }
 
     // Extend left clip length
-    const double bpm = resolveTimelineBpm(tempo_);
-    const double newEndBeats = right->getEndBeats(bpm);
-    left->setPlacementBeats(left->getStartBeats(bpm), newEndBeats - left->getStartBeats(bpm));
-    left->deriveTimesFromBeats(bpm);
+    left->length += right->length;
 
     // Delete right clip
     clipManager.deleteClip(rightClipId_);
@@ -962,9 +912,16 @@ void RenderClipCommand::execute() {
     params.useMasterPlugins = false;
     params.checkNodesForAudio = false;
 
-    const double projectBPM = currentProjectBpm();
-    const double renderStart = clip->getTimelineStart(projectBPM);
-    const double renderEnd = clip->getTimelineEnd(projectBPM);
+    // Set time range — use seconds directly (authoritative for non-autoTempo clips)
+    double projectBPM = ProjectManager::getInstance().getCurrentProjectInfo().tempo;
+    double renderStart = clip->startTime;
+    double renderEnd = clip->startTime + clip->length;
+
+    // For autoTempo clips (lengthBeats > 0), beats are authoritative
+    if (clip->lengthBeats > 0.0 && projectBPM > 0.0) {
+        renderStart = clip->startBeats * 60.0 / projectBPM;
+        renderEnd = (clip->startBeats + clip->lengthBeats) * 60.0 / projectBPM;
+    }
 
     params.time = te::TimeRange(te::TimePosition::fromSeconds(renderStart),
                                 te::TimePosition::fromSeconds(renderEnd));
@@ -988,11 +945,17 @@ void RenderClipCommand::execute() {
         return;
     }
 
-    // Capture original clip properties before deletion
-    double startBeats = clip->getStartBeats(projectBPM);
-    double lengthBeats = clip->getLengthInBeats(projectBPM);
-    double startTime = clip->getTimelineStart(projectBPM);
-    double length = clip->getTimelineLength(projectBPM);
+    // Capture original clip properties before deletion — use seconds directly
+    double startBeats = clip->startBeats;
+    double lengthBeats = clip->lengthBeats;
+    double startTime = clip->startTime;
+    double length = clip->length;
+
+    // For autoTempo clips, derive seconds from beats (beats are authoritative)
+    if (lengthBeats > 0.0 && projectBPM > 0.0) {
+        startTime = startBeats * 60.0 / projectBPM;
+        length = lengthBeats * 60.0 / projectBPM;
+    }
     TrackId trackId = clip->trackId;
     juce::Colour colour = clip->colour;
     juce::String name = clip->name;
@@ -1237,6 +1200,15 @@ void RenderTimeSelectionCommand::undo() {
 }
 
 // ============================================================================
+// Helper: trim a looped clip's boundaries without splitting/deleting notes.
+// For looped clips, time selection operations just adjust the container
+// (startTime, length, midiOffset) — the notes repeat and don't need modification.
+// Returns true if the clip was handled as a looped clip.
+static void syncClipPlacementFromSeconds(ClipInfo& clip, double tempo) {
+    if (tempo > 0.0)
+        clip.setPlacementBeats(clip.startTime * tempo / 60.0, clip.length * tempo / 60.0);
+}
+
 static bool trimLoopedClip(ClipManager& clipManager, const ClipInfo& clip, double selStart,
                            double selEnd, bool ripple, double duration,
                            std::vector<ClipId>& clipsToDelete, double tempo) {
@@ -1247,11 +1219,8 @@ static bool trimLoopedClip(ClipManager& clipManager, const ClipInfo& clip, doubl
     if (!liveClip)
         return false;
 
-    const double bpm = resolveTimelineBpm(tempo);
-    const double clipStart = clip.getTimelineStart(bpm);
-    const double clipLength = clip.getTimelineLength(bpm);
-    const double clipEnd = clip.getTimelineEnd(bpm);
-    bool startsBeforeSel = clipStart < selStart;
+    double clipEnd = clip.startTime + clip.length;
+    bool startsBeforeSel = clip.startTime < selStart;
     bool endsAfterSel = clipEnd > selEnd;
 
     if (startsBeforeSel && endsAfterSel) {
@@ -1260,23 +1229,27 @@ static bool trimLoopedClip(ClipManager& clipManager, const ClipInfo& clip, doubl
             return false;
         }
         // Ripple: reduce length by duration, gap gets closed
-        ClipOperations::setTimelinePlacement(*liveClip, liveClip->getTimelineStart(bpm),
-                                             liveClip->getTimelineLength(bpm) - duration, bpm);
+        liveClip->length -= duration;
+        syncClipPlacementFromSeconds(*liveClip, tempo);
     } else if (startsBeforeSel) {
         // Spans left boundary: trim right edge
-        ClipOperations::setTimelinePlacement(*liveClip, liveClip->getTimelineStart(bpm),
-                                             selStart - clipStart, bpm);
+        liveClip->length = selStart - clip.startTime;
+        syncClipPlacementFromSeconds(*liveClip, tempo);
     } else if (endsAfterSel) {
         // Spans right boundary: trim left edge, adjust phase
-        double trimAmount = selEnd - clipStart;
-        ClipOperations::setTimelinePlacement(*liveClip, ripple ? selStart : selEnd,
-                                             clipLength - trimAmount, bpm);
+        double trimAmount = selEnd - clip.startTime;
+        liveClip->startTime = ripple ? selStart : selEnd;
+        liveClip->length -= trimAmount;
+        syncClipPlacementFromSeconds(*liveClip, tempo);
 
         // Adjust midiOffset (phase) for the trimmed portion
-        if (clip.isMidi()) {
+        if (clip.isMidi() && clip.loopLength > 0.0) {
+            double bpm = 120.0;
+            if (auto* controller = magda::TimelineController::getCurrent()) {
+                bpm = controller->getState().tempo.bpm;
+            }
             double trimBeats = trimAmount * bpm / 60.0;
-            double loopLengthBeats =
-                clip.loopLengthBeats > 0.0 ? clip.loopLengthBeats : clip.placement.lengthBeats;
+            double loopLengthBeats = clip.loopLength * bpm / 60.0;
             if (loopLengthBeats > 0.0) {
                 double newPhase = std::fmod(clip.midiOffset + trimBeats, loopLengthBeats);
                 if (newPhase < 0.0)
@@ -1309,7 +1282,6 @@ void RippleDeleteTimeSelectionCommand::execute() {
     double duration = endTime_ - startTime_;
     if (duration <= 0.0)
         return;
-    const double bpm = resolveTimelineBpm(tempo_);
 
     // Helper: check if a clip's track is affected
     auto isAffectedTrack = [this](TrackId trackId) {
@@ -1328,11 +1300,10 @@ void RippleDeleteTimeSelectionCommand::execute() {
         if (!isAffectedTrack(clip.trackId))
             continue;
 
-        const double clipStart = clip.getTimelineStart(bpm);
-        const double clipEnd = clip.getTimelineEnd(bpm);
+        double clipEnd = clip.startTime + clip.length;
 
         // No overlap
-        if (clipStart >= endTime_ || clipEnd <= startTime_)
+        if (clip.startTime >= endTime_ || clipEnd <= startTime_)
             continue;
 
         // Looped clips: just adjust boundaries, don't split/delete notes
@@ -1340,7 +1311,7 @@ void RippleDeleteTimeSelectionCommand::execute() {
                            tempo_))
             continue;
 
-        bool startsBeforeSel = clipStart < startTime_;
+        bool startsBeforeSel = clip.startTime < startTime_;
         bool endsAfterSel = clipEnd > endTime_;
 
         if (startsBeforeSel && endsAfterSel) {
@@ -1356,18 +1327,18 @@ void RippleDeleteTimeSelectionCommand::execute() {
                 if (tailId != INVALID_CLIP_ID) {
                     auto* tailClip = clipManager.getClip(tailId);
                     if (tailClip) {
-                        ClipOperations::setTimelinePlacement(*tailClip, startTime_,
-                                                             tailClip->getTimelineLength(bpm), bpm);
+                        tailClip->startTime = startTime_;  // Shift left to fill gap
+                        syncClipPlacementFromSeconds(*tailClip, tempo_);
                     }
                 }
             }
         } else if (startsBeforeSel) {
             // Clip spans left boundary only: trim right edge to startTime_
-            double newLength = startTime_ - clipStart;
+            double newLength = startTime_ - clip.startTime;
             auto* liveClip = clipManager.getClip(clip.id);
             if (liveClip) {
-                ClipOperations::setTimelinePlacement(*liveClip, liveClip->getTimelineStart(bpm),
-                                                     newLength, bpm);
+                liveClip->length = newLength;
+                syncClipPlacementFromSeconds(*liveClip, tempo_);
             }
         } else if (endsAfterSel) {
             // Clip spans right boundary only: split at endTime_, shift right portion left
@@ -1378,8 +1349,8 @@ void RippleDeleteTimeSelectionCommand::execute() {
             if (tailId != INVALID_CLIP_ID) {
                 auto* tailClip = clipManager.getClip(tailId);
                 if (tailClip) {
-                    ClipOperations::setTimelinePlacement(*tailClip, startTime_,
-                                                         tailClip->getTimelineLength(bpm), bpm);
+                    tailClip->startTime = startTime_;
+                    syncClipPlacementFromSeconds(*tailClip, tempo_);
                 }
             }
         } else {
@@ -1400,10 +1371,9 @@ void RippleDeleteTimeSelectionCommand::execute() {
 
         // Use non-const access
         auto* liveClip = clipManager.getClip(clip.id);
-        if (liveClip && liveClip->getTimelineStart(bpm) >= endTime_) {
-            ClipOperations::setTimelinePlacement(*liveClip,
-                                                 liveClip->getTimelineStart(bpm) - duration,
-                                                 liveClip->getTimelineLength(bpm), bpm);
+        if (liveClip && liveClip->startTime >= endTime_) {
+            liveClip->startTime -= duration;
+            syncClipPlacementFromSeconds(*liveClip, tempo_);
         }
     }
 
@@ -1450,7 +1420,6 @@ void DeleteTimeSelectionCommand::execute() {
     double duration = endTime_ - startTime_;
     if (duration <= 0.0)
         return;
-    const double bpm = resolveTimelineBpm(tempo_);
 
     auto isAffectedTrack = [this](TrackId trackId) {
         if (trackIds_.empty())
@@ -1465,11 +1434,10 @@ void DeleteTimeSelectionCommand::execute() {
         if (!isAffectedTrack(clip.trackId))
             continue;
 
-        const double clipStart = clip.getTimelineStart(bpm);
-        const double clipEnd = clip.getTimelineEnd(bpm);
+        double clipEnd = clip.startTime + clip.length;
 
         // No overlap
-        if (clipStart >= endTime_ || clipEnd <= startTime_)
+        if (clip.startTime >= endTime_ || clipEnd <= startTime_)
             continue;
 
         // Looped clips: just adjust boundaries, don't split/delete notes
@@ -1477,7 +1445,7 @@ void DeleteTimeSelectionCommand::execute() {
                            tempo_))
             continue;
 
-        bool startsBeforeSel = clipStart < startTime_;
+        bool startsBeforeSel = clip.startTime < startTime_;
         bool endsAfterSel = clipEnd > endTime_;
 
         if (startsBeforeSel && endsAfterSel) {
@@ -1492,11 +1460,11 @@ void DeleteTimeSelectionCommand::execute() {
             }
         } else if (startsBeforeSel) {
             // Clip spans left boundary: trim right edge to startTime_
-            double newLength = startTime_ - clipStart;
+            double newLength = startTime_ - clip.startTime;
             auto* liveClip = clipManager.getClip(clip.id);
             if (liveClip) {
-                ClipOperations::setTimelinePlacement(*liveClip, liveClip->getTimelineStart(bpm),
-                                                     newLength, bpm);
+                liveClip->length = newLength;
+                syncClipPlacementFromSeconds(*liveClip, tempo_);
             }
         } else if (endsAfterSel) {
             // Clip spans right boundary: split at endTime_, delete left portion
@@ -1668,11 +1636,9 @@ void BounceInPlaceCommand::execute() {
 
     // Time range = clip timeline range + tail allowance
     double endAllowance = 2.0;
-    const double projectBPM = currentProjectBpm();
-    const double clipStart = clip->getTimelineStart(projectBPM);
-    const double clipEnd = clip->getTimelineEnd(projectBPM);
-    params.time = te::TimeRange(te::TimePosition::fromSeconds(clipStart),
-                                te::TimePosition::fromSeconds(clipEnd + endAllowance));
+    params.time =
+        te::TimeRange(te::TimePosition::fromSeconds(clip->startTime),
+                      te::TimePosition::fromSeconds(clip->startTime + clip->length + endAllowance));
 
     juce::BigInteger trackBits;
     trackBits.setBit(trackIndex);
@@ -1699,8 +1665,8 @@ void BounceInPlaceCommand::execute() {
 
     // Replace MIDI clip with audio clip using the original snapshot
     // (clip pointer may be invalidated by render/transport operations)
-    double startTime = originalClipSnapshot_.getTimelineStart(projectBPM);
-    double length = originalClipSnapshot_.getTimelineLength(projectBPM);
+    double startTime = originalClipSnapshot_.startTime;
+    double length = originalClipSnapshot_.length;
     TrackId trackId = originalClipSnapshot_.trackId;
     juce::Colour colour = originalClipSnapshot_.colour;
     juce::String name = originalClipSnapshot_.name;
@@ -1842,11 +1808,9 @@ void BounceToNewTrackCommand::execute() {
     params.checkNodesForAudio = false;
 
     double endAllowance = 2.0;
-    const double projectBPM = currentProjectBpm();
-    const double clipStart = clip->getTimelineStart(projectBPM);
-    const double clipEnd = clip->getTimelineEnd(projectBPM);
-    params.time = te::TimeRange(te::TimePosition::fromSeconds(clipStart),
-                                te::TimePosition::fromSeconds(clipEnd + endAllowance));
+    params.time =
+        te::TimeRange(te::TimePosition::fromSeconds(clip->startTime),
+                      te::TimePosition::fromSeconds(clip->startTime + clip->length + endAllowance));
 
     juce::BigInteger trackBits;
     trackBits.setBit(trackIndex);
@@ -1870,8 +1834,8 @@ void BounceToNewTrackCommand::execute() {
     // listener callbacks that may invalidate the clip pointer
     const auto clipName = clip->name;
     const auto clipColour = clip->colour;
-    const auto clipStartTime = clipStart;
-    const auto clipLength = clip->getTimelineLength(projectBPM);
+    const auto clipStartTime = clip->startTime;
+    const auto clipLength = clip->length;
     const auto clipTrackId = clip->trackId;
 
     // Create new audio track after the source track
@@ -2015,9 +1979,7 @@ void sliceClipAtTimes(ClipId clipId, const std::vector<double>& splitTimes, doub
     ClipId currentClipId = clipId;
 
     for (double splitTime : splitTimes) {
-        const double bpm = resolveTimelineBpm(tempo);
-        auto cmd = std::make_unique<SplitClipCommand>(currentClipId,
-                                                      BeatPosition{splitTime * bpm / 60.0}, bpm);
+        auto cmd = std::make_unique<SplitClipCommand>(currentClipId, splitTime, tempo);
         auto* cmdPtr = cmd.get();
         undoManager.executeCommand(std::move(cmd));
         currentClipId = cmdPtr->getRightClipId();
@@ -2048,10 +2010,9 @@ void sliceClipAtWarpMarkers(ClipId clipId, double tempo, AudioBridge* bridge) {
     clip->warpEnabled = false;
     bridge->disableWarp(clipId);
 
-    const double bpm = resolveTimelineBpm(tempo);
-    double clipStart = clip->getTimelineStart(bpm);
-    double clipEnd = clip->getTimelineEnd(bpm);
-    double clipOffset = clip->getSourceOffset();
+    double clipStart = clip->startTime;
+    double clipEnd = clip->startTime + clip->length;
+    double clipOffset = clip->offset;
 
     std::vector<double> splitTimes;
     splitTimes.reserve(markers.size());
@@ -2062,8 +2023,8 @@ void sliceClipAtWarpMarkers(ClipId clipId, double tempo, AudioBridge* bridge) {
     for (size_t i = 1; i + 1 < markers.size(); ++i) {
         double sourceDelta = markers[i].sourceTime - clipOffset;
         double splitTime;
-        if (clip->autoTempo && clip->audio().interpretation.bpm > 0.0) {
-            splitTime = clipStart + sourceDelta * clip->audio().interpretation.bpm / bpm;
+        if (clip->autoTempo && clip->audio().interpretation.bpm > 0.0 && tempo > 0.0) {
+            splitTime = clipStart + sourceDelta * clip->audio().interpretation.bpm / tempo;
         } else {
             splitTime = clipStart + sourceDelta / clip->speedRatio;
         }
@@ -2093,9 +2054,8 @@ void sliceClipAtGrid(ClipId clipId, double gridInterval, double tempo, AudioBrid
             bridge->disableWarp(clipId);
     }
 
-    const double bpm = resolveTimelineBpm(tempo);
-    double clipStart = clip->getTimelineStart(bpm);
-    double clipEnd = clip->getTimelineEnd(bpm);
+    double clipStart = clip->startTime;
+    double clipEnd = clip->startTime + clip->length;
 
     double startK = std::ceil(clipStart / gridInterval);
     double iterStart = startK * gridInterval;
@@ -2197,15 +2157,13 @@ void buildDrumGridFromSlices(const std::vector<SliceRegion>& slices, const ClipI
 
     // Create MIDI clip with notes triggering each pad
     auto& clipManager = ClipManager::getInstance();
-    const double bpm = resolveTimelineBpm(tempo);
-    double clipStart = clip.getTimelineStart(bpm);
-    double clipEnd = clip.getTimelineEnd(bpm);
-    ClipId midiClipId =
-        clipManager.createMidiClip(newTrackId, clipStart, clip.getTimelineLength(bpm));
+    double clipStart = clip.startTime;
+    double clipEnd = clip.startTime + clip.length;
+    ClipId midiClipId = clipManager.createMidiClip(newTrackId, clipStart, clip.length);
     if (midiClipId == INVALID_CLIP_ID)
         return;
 
-    double beatsPerSecond = bpm / 60.0;
+    double beatsPerSecond = tempo / 60.0;
 
     for (int i = 0; i < numSlices; ++i) {
         const auto& slice = slices[static_cast<size_t>(i)];
@@ -2251,10 +2209,9 @@ void sliceWarpMarkersToDrumGrid(ClipId clipId, double tempo, AudioBridge* bridge
     if (!audioFile.existsAsFile())
         return;
 
-    const double bpm = resolveTimelineBpm(tempo);
-    double clipStart = clip->getTimelineStart(bpm);
-    double clipEnd = clip->getTimelineEnd(bpm);
-    double clipOffset = clip->getSourceOffset();
+    double clipStart = clip->startTime;
+    double clipEnd = clip->startTime + clip->length;
+    double clipOffset = clip->offset;
 
     // Build sorted interior marker source times
     std::vector<double> interiorSourceTimes;
@@ -2278,8 +2235,8 @@ void sliceWarpMarkersToDrumGrid(ClipId clipId, double tempo, AudioBridge* bridge
 
     auto sourceToTimeline = [&](double sourceTime) -> double {
         double sourceDelta = sourceTime - clipOffset;
-        if (clip->autoTempo && clip->audio().interpretation.bpm > 0.0)
-            return clipStart + sourceDelta * clip->audio().interpretation.bpm / bpm;
+        if (clip->autoTempo && clip->audio().interpretation.bpm > 0.0 && tempo > 0.0)
+            return clipStart + sourceDelta * clip->audio().interpretation.bpm / tempo;
         else
             return clipStart + sourceDelta / clip->speedRatio;
     };
@@ -2310,16 +2267,15 @@ void sliceAtGridToDrumGrid(ClipId clipId, double gridInterval, double tempo, Aud
     if (!audioFile.existsAsFile())
         return;
 
-    const double bpm = resolveTimelineBpm(tempo);
-    double clipStart = clip->getTimelineStart(bpm);
-    double clipEnd = clip->getTimelineEnd(bpm);
-    double clipOffset = clip->getSourceOffset();
+    double clipStart = clip->startTime;
+    double clipEnd = clip->startTime + clip->length;
+    double clipOffset = clip->offset;
 
     // Convert timeline grid lines to source-file boundaries
     auto timelineToSource = [&](double timelinePos) -> double {
         double delta = timelinePos - clipStart;
-        if (clip->autoTempo && clip->audio().interpretation.bpm > 0.0)
-            return clipOffset + delta * bpm / clip->audio().interpretation.bpm;
+        if (clip->autoTempo && clip->audio().interpretation.bpm > 0.0 && tempo > 0.0)
+            return clipOffset + delta * tempo / clip->audio().interpretation.bpm;
         else
             return clipOffset + delta * clip->speedRatio;
     };

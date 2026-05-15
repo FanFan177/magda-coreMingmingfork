@@ -79,10 +79,7 @@ void SessionRecorder::updatePreviews() {
         if (!sessionClip || !sessionClip->isMidi() || sessionClip->midiNotes.empty())
             continue;
 
-        double bpm = tempoSeq.getBpmAt(te::TimePosition());
-        if (bpm <= 0.0)
-            bpm = 120.0;
-        double clipLengthBeats = sessionClip->getLengthInBeats(bpm);
+        double clipLengthBeats = sessionClip->lengthBeats;
         if (clipLengthBeats <= 0.0)
             clipLengthBeats = 4.0;
 
@@ -254,32 +251,24 @@ void SessionRecorder::finalizeRecording(const ActiveRecording& rec, double stopT
             newClip->lengthBeats = endBeatPos.inBeats() - startBeatPos.inBeats();
             newClip->autoTempo = true;
         } else {
-            double bpm = edit_.tempoSequence.getBpmAt(te::TimePosition());
-            if (bpm <= 0.0)
-                bpm = 120.0;
-            newClip->lengthBeats = sessionClip->getLengthInBeats(bpm);
+            newClip->lengthBeats = sessionClip->lengthBeats;
         }
 
         // For looping audio: enable loop if duration exceeds one pass
-        double bpm = edit_.tempoSequence.getBpmAt(te::TimePosition());
-        if (bpm <= 0.0)
-            bpm = 120.0;
-        double onePassDuration = sessionClip->getTimelineLength(bpm);
+        double onePassDuration = sessionClip->length;
         if (sessionClip->loopEnabled && duration > onePassDuration) {
             newClip->loopEnabled = true;
         }
     } else if (sessionClip->isMidi()) {
         // For MIDI: tile notes across the played duration if looping
-        double bpm = edit_.tempoSequence.getBpmAt(te::TimePosition());
-        if (bpm <= 0.0)
-            bpm = 120.0;
-        double clipLengthBeats = sessionClip->getLengthInBeats(bpm);
+        double clipLengthBeats = sessionClip->lengthBeats;
         if (clipLengthBeats <= 0.0)
             clipLengthBeats = 4.0;
 
         auto& tempoSeq = edit_.tempoSequence;
-        auto beatPos = tempoSeq.toBeats(te::TimePosition::fromSeconds(rec.arrangementStartTime));
-        auto endBeatPos = tempoSeq.toBeats(te::TimePosition::fromSeconds(stopTime));
+        auto beatPos =
+            tempoSeq.timeToBeats(te::TimePosition::fromSeconds(rec.arrangementStartTime));
+        auto endBeatPos = tempoSeq.timeToBeats(te::TimePosition::fromSeconds(stopTime));
         double totalBeats = endBeatPos.inBeats() - beatPos.inBeats();
 
         if (sessionClip->loopEnabled && totalBeats > clipLengthBeats) {

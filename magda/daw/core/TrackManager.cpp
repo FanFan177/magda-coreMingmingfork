@@ -1226,8 +1226,6 @@ void TrackManager::removeDeviceFromTrack(TrackId trackId, DeviceId deviceId) {
         if (it != elements.end()) {
             DBG("Removed device: " << magda::getDevice(*it).name << " (id=" << deviceId
                                    << ") from track " << trackId);
-            SelectionManager::getInstance().clearSelectionForDeletedChainNode(
-                ChainNodePath::topLevelDevice(trackId, deviceId));
             elements.erase(it);
             notifyTrackDevicesChanged(trackId);
         }

@@ -218,7 +218,7 @@ class AutomationManager : public TrackManagerListener {
         touchSuppressionListener_ = std::move(listener);
     }
 
-    void setLaneSnapEditsToBeatGrid(AutomationLaneId laneId, bool snap);
+    void setLaneSnapTime(AutomationLaneId laneId, bool snap);
     void setLaneSnapValue(AutomationLaneId laneId, bool snap);
     void setLaneHeight(AutomationLaneId laneId, int height);
 
@@ -229,7 +229,7 @@ class AutomationManager : public TrackManagerListener {
     /**
      * @brief Create an automation clip on a lane
      */
-    AutomationClipId createClip(AutomationLaneId laneId, double startBeats, double lengthBeats);
+    AutomationClipId createClip(AutomationLaneId laneId, double startTime, double length);
 
     /**
      * @brief Delete an automation clip
@@ -273,14 +273,13 @@ class AutomationManager : public TrackManagerListener {
     /**
      * @brief Add a point to an absolute lane
      */
-    AutomationPointId addPoint(AutomationLaneId laneId, double beatPosition, double value,
+    AutomationPointId addPoint(AutomationLaneId laneId, double time, double value,
                                AutomationCurveType curveType = AutomationCurveType::Linear);
 
     /**
      * @brief Add a point to a clip
      */
-    AutomationPointId addPointToClip(AutomationClipId clipId, double localBeatPosition,
-                                     double value,
+    AutomationPointId addPointToClip(AutomationClipId clipId, double localTime, double value,
                                      AutomationCurveType curveType = AutomationCurveType::Linear);
 
     /**
@@ -299,15 +298,15 @@ class AutomationManager : public TrackManagerListener {
     void deletePointFromClip(AutomationClipId clipId, AutomationPointId pointId);
 
     /**
-     * @brief Move a point to a new beat/value
+     * @brief Move a point to a new time/value
      */
-    void movePoint(AutomationLaneId laneId, AutomationPointId pointId, double newBeatPosition,
+    void movePoint(AutomationLaneId laneId, AutomationPointId pointId, double newTime,
                    double newValue);
 
     /**
      * @brief Move a point within a clip
      */
-    void movePointInClip(AutomationClipId clipId, AutomationPointId pointId, double newBeatPosition,
+    void movePointInClip(AutomationClipId clipId, AutomationPointId pointId, double newTime,
                          double newValue);
 
     /**
@@ -350,20 +349,20 @@ class AutomationManager : public TrackManagerListener {
     // ========================================================================
 
     /**
-     * @brief Get interpolated value at a beat position on a lane
+     * @brief Get interpolated value at a time on a lane
      * @param laneId Lane to query
-     * @param beatPosition Position in beats
+     * @param time Time in seconds
      * @return Normalized value 0-1 (0.5 if no points)
      */
-    double getValueAtBeat(AutomationLaneId laneId, double beatPosition) const;
+    double getValueAtTime(AutomationLaneId laneId, double time) const;
 
     /**
-     * @brief Get interpolated value at a beat position within a clip
+     * @brief Get interpolated value at a time within a clip
      * @param clipId Clip to query
-     * @param localBeatPosition Beat position within clip (0 to length)
+     * @param localTime Time within clip (0 to length)
      * @return Normalized value 0-1
      */
-    double getClipValueAtBeat(AutomationClipId clipId, double localBeatPosition) const;
+    double getClipValueAtTime(AutomationClipId clipId, double localTime) const;
 
     // ========================================================================
     // Listener Management
@@ -526,7 +525,7 @@ class AutomationManager : public TrackManagerListener {
     // Interpolation helpers
     double interpolateLinear(double t, double v1, double v2) const;
     double interpolateBezier(double t, const AutomationPoint& p1, const AutomationPoint& p2) const;
-    double interpolatePoints(const std::vector<AutomationPoint>& points, double beatPosition) const;
+    double interpolatePoints(const std::vector<AutomationPoint>& points, double time) const;
 
     // Point management helpers
     AutomationPoint* findPoint(std::vector<AutomationPoint>& points, AutomationPointId pointId);

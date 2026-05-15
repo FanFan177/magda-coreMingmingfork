@@ -308,8 +308,8 @@ void AutomationPlaybackEngine::bakeLane(const AutomationLaneInfo& lane) {
     double dataEndBeats = 0.0;
 
     if (lane.isAbsolute() && !lane.absolutePoints.empty()) {
-        dataStartBeats = lane.absolutePoints.front().beatPosition;
-        dataEndBeats = lane.absolutePoints.back().beatPosition;
+        dataStartBeats = lane.absolutePoints.front().time;
+        dataEndBeats = lane.absolutePoints.back().time;
     } else if (lane.isClipBased()) {
         // Find the overall range from all clips
         bool first = true;
@@ -317,10 +317,10 @@ void AutomationPlaybackEngine::bakeLane(const AutomationLaneInfo& lane) {
             const auto* clip = autoMgr.getClip(clipId);
             if (!clip)
                 continue;
-            if (first || clip->startBeats < dataStartBeats)
-                dataStartBeats = clip->startBeats;
-            if (first || clip->getEndBeats() > dataEndBeats)
-                dataEndBeats = clip->getEndBeats();
+            if (first || clip->startTime < dataStartBeats)
+                dataStartBeats = clip->startTime;
+            if (first || clip->getEndTime() > dataEndBeats)
+                dataEndBeats = clip->getEndTime();
             first = false;
         }
     }
@@ -364,8 +364,8 @@ void AutomationPlaybackEngine::bakeLane(const AutomationLaneInfo& lane) {
     const float bakedTeMin = bakedInfo.teMinValue;
     const float bakedTeSpan = bakedInfo.teMaxValue - bakedInfo.teMinValue;
     const bool bakedUseTeRange = bakedIsDeviceParam && bakedTeSpan > 0.0f &&
-                                 !ParameterUtils::infoMatchesTeRange(bakedInfo) &&
-                                 !ParameterUtils::isDisplayMappedInternalValue(bakedInfo);
+                                 (std::abs(bakedInfo.minValue - bakedInfo.teMinValue) > 1e-6f ||
+                                  std::abs(bakedInfo.maxValue - bakedInfo.teMaxValue) > 1e-6f);
     // For the info == TE-range path (most internal plugins, VSTs without
     // AI-Detect), we still need normalizedToReal to honour info.scale/
     // scaleAnchor. Precompute the info once — convertToTEValue itself
@@ -377,10 +377,11 @@ void AutomationPlaybackEngine::bakeLane(const AutomationLaneInfo& lane) {
             return bakedTeMin + static_cast<float>(magdaNormalized) * bakedTeSpan;
         if (!bakedIsDeviceParam)
             return convertToTEValue(lane.target, param, magdaNormalized);
-        return ParameterUtils::normalizedToModelValue(
-                   ParameterNormalizedValue::clamped(static_cast<float>(magdaNormalized)),
-                   bakedInfo)
-            .value;
+        if (bakedInfo.maxValue > bakedInfo.minValue)
+            return ParameterUtils::normalizedToReal(static_cast<float>(magdaNormalized), bakedInfo);
+        if (bakedTeSpan > 0.0f)
+            return bakedTeMin + static_cast<float>(magdaNormalized) * bakedTeSpan;
+        return static_cast<float>(magdaNormalized);
     };
 
     // Bake: write ONE TE point per source MAGDA point. te::AutomationCurve
@@ -413,26 +414,26 @@ void AutomationPlaybackEngine::bakeLane(const AutomationLaneInfo& lane) {
             // point's position, then jump — TE's linear iterator otherwise
             // ramps between the two points and lets the old value through.
             if (i > 0 && (*sourcePoints)[i - 1].curveType == AutomationCurveType::Step) {
-                double preStepBeat = point.beatPosition - kStepEpsilon;
-                if (preStepBeat > (*sourcePoints)[i - 1].beatPosition)
-                    addTEPoint(preStepBeat, autoMgr.getValueAtBeat(lane.id, preStepBeat));
+                double preStepBeat = point.time - kStepEpsilon;
+                if (preStepBeat > (*sourcePoints)[i - 1].time)
+                    addTEPoint(preStepBeat, autoMgr.getValueAtTime(lane.id, preStepBeat));
             }
 
             // Bezier: tessellate the segment between the previous and current
             // point, so TE's linear interpolation follows the curved shape.
             if (i > 0 && (*sourcePoints)[i - 1].curveType == AutomationCurveType::Bezier) {
                 const auto& prev = (*sourcePoints)[i - 1];
-                const double span = point.beatPosition - prev.beatPosition;
+                const double span = point.time - prev.time;
                 if (span > 0.0) {
                     for (int s = 1; s < kBezierSegments; ++s) {
                         double t = static_cast<double>(s) / kBezierSegments;
-                        double beat = prev.beatPosition + span * t;
-                        addTEPoint(beat, autoMgr.getValueAtBeat(lane.id, beat));
+                        double beat = prev.time + span * t;
+                        addTEPoint(beat, autoMgr.getValueAtTime(lane.id, beat));
                     }
                 }
             }
 
-            addTEPoint(point.beatPosition, point.value);
+            addTEPoint(point.time, point.value);
         }
     }
 
@@ -507,9 +508,11 @@ float AutomationPlaybackEngine::convertToTEValue(const AutomationTarget& target,
                 return range.getStart() +
                        static_cast<float>(magdaNormalized) * (range.getEnd() - range.getStart());
             }
-            return ParameterUtils::normalizedToModelValue(
-                       ParameterNormalizedValue::clamped(static_cast<float>(magdaNormalized)), info)
-                .value;
+            const bool infoMatchesTeRange = std::abs(info.minValue - info.teMinValue) < 1e-6f &&
+                                            std::abs(info.maxValue - info.teMaxValue) < 1e-6f;
+            if (infoMatchesTeRange && info.maxValue > info.minValue)
+                return ParameterUtils::normalizedToReal(static_cast<float>(magdaNormalized), info);
+            return info.teMinValue + static_cast<float>(magdaNormalized) * teSpan;
         }
     }
 }
@@ -623,7 +626,12 @@ double AutomationPlaybackEngine::convertFromTEValue(const AutomationTarget& targ
                 return juce::jlimit(0.0, 1.0,
                                     static_cast<double>((teValue - range.getStart()) / span));
             }
-            return ParameterUtils::modelToNormalizedValue(ParameterModelValue{teValue}, info).value;
+            const bool infoMatchesTeRange = std::abs(info.minValue - info.teMinValue) < 1e-6f &&
+                                            std::abs(info.maxValue - info.teMaxValue) < 1e-6f;
+            if (infoMatchesTeRange && info.maxValue > info.minValue)
+                return ParameterUtils::realToNormalized(teValue, info);
+            return juce::jlimit(0.0, 1.0,
+                                static_cast<double>((teValue - info.teMinValue) / teSpan));
         }
     }
 }

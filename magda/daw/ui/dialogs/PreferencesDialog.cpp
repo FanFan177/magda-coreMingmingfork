@@ -32,7 +32,6 @@ void setupTextSlider(juce::Component& owner, magda::daw::ui::TextSlider& slider,
 
     slider.setRange(min, max, interval);
     slider.setOrientation(magda::daw::ui::TextSlider::Orientation::Horizontal);
-    slider.setShowFillIndicator(false);
     slider.setValueFormatter(
         [decimals, suffix](double value) { return juce::String(value, decimals) + suffix; });
     slider.setValueParser([suffix](const juce::String& text) {
@@ -155,9 +154,6 @@ class GeneralPage : public juce::Component {
         scaleCombo.addItem("175%", 5);
         scaleCombo.addItem("200%", 6);
         addAndMakeVisible(scaleCombo);
-
-        setupTextSlider(*this, fontScaleSlider, fontScaleLabel, tr("preferences.font_scale.label"),
-                        80.0, 150.0, 5.0, 0, "%");
     }
 
     int getPreferredHeight(int width) const {
@@ -232,7 +228,6 @@ class GeneralPage : public juce::Component {
         restartHint.setVisible(false);
 
         scaleCombo.setSelectedId(scaleIdForValue(config.getUIScale()), juce::dontSendNotification);
-        fontScaleSlider.setValue(config.getUIFontScale() * 100.0, juce::dontSendNotification);
     }
 
     void applySettings(Config& config) {
@@ -268,8 +263,6 @@ class GeneralPage : public juce::Component {
             config.setUIScale(0.0);
             config.save();
         }
-
-        config.setUIFontScale(fontScaleSlider.getValue() / 100.0);
     }
 
   private:
@@ -288,7 +281,7 @@ class GeneralPage : public juce::Component {
         return padding + headerH + 4 + (rowH * 3) + 8 + secGap + headerH + 4 + (rowH * 2) + 4 +
                secGap + headerH + 4 + rowH + secGap + headerH + 4 + rowH + 4 + rowH + secGap +
                headerH + 4 + rowH + secGap + headerH + 4 + (rowH * 4) + 12 + secGap + headerH + 4 +
-               rowH + 18 + secGap + headerH + 4 + (rowH * 2) + 4 + padding;
+               rowH + 18 + secGap + headerH + 4 + rowH + padding;
     }
 
     static int getLeftColumnPreferredHeight() {
@@ -308,7 +301,7 @@ class GeneralPage : public juce::Component {
         constexpr int secGap = 12;
 
         return padding + headerH + 4 + rowH + secGap + headerH + 4 + (rowH * 4) + 12 + secGap +
-               headerH + 4 + rowH + 18 + secGap + headerH + 4 + (rowH * 2) + 4 + padding;
+               headerH + 4 + rowH + 18 + secGap + headerH + 4 + rowH + padding;
     }
 
     void layoutSingleColumn(juce::Rectangle<int> bounds, int rowH, int sliderH, int headerH,
@@ -374,8 +367,6 @@ class GeneralPage : public juce::Component {
         scaleHeader.setBounds(bounds.removeFromTop(headerH));
         bounds.removeFromTop(4);
         layoutComboRow(bounds, scaleLabel, scaleCombo, rowH);
-        bounds.removeFromTop(4);
-        layoutTextSliderRow(bounds, fontScaleLabel, fontScaleSlider, rowH, sliderH);
     }
 
     void layoutTwoColumns(juce::Rectangle<int> bounds, int rowH, int sliderH, int headerH,
@@ -447,8 +438,6 @@ class GeneralPage : public juce::Component {
         scaleHeader.setBounds(right.removeFromTop(headerH));
         right.removeFromTop(4);
         layoutComboRow(right, scaleLabel, scaleCombo, rowH);
-        right.removeFromTop(4);
-        layoutTextSliderRow(right, fontScaleLabel, fontScaleSlider, rowH, sliderH);
     }
 
     void setupComboLabel(juce::Label& label, const juce::String& text) {
@@ -543,8 +532,6 @@ class GeneralPage : public juce::Component {
     juce::String initialLanguage_;
     juce::Label scaleLabel;
     juce::ComboBox scaleCombo;
-    juce::Label fontScaleLabel;
-    magda::daw::ui::TextSlider fontScaleSlider;
 };
 
 // ---- Colours tab: Track colour palette ------------------------------------
@@ -1819,44 +1806,10 @@ bool copyFolderIfNeeded(const juce::File& from, const juce::File& to) {
     return from.copyDirectoryTo(to);
 }
 
-void scaleExplicitFonts(juce::Component& component, double ratio) {
-    if (std::abs(ratio - 1.0) < 0.001)
-        return;
-
-    const auto scaleFont = [ratio](juce::Font font) {
-        return font.withHeight(font.getHeight() * static_cast<float>(ratio));
-    };
-
-    if (auto* label = dynamic_cast<juce::Label*>(&component))
-        label->setFont(scaleFont(label->getFont()));
-    else if (auto* editor = dynamic_cast<juce::TextEditor*>(&component))
-        editor->setFont(scaleFont(editor->getFont()));
-
-    for (int i = 0; i < component.getNumChildComponents(); ++i) {
-        if (auto* child = component.getChildComponent(i))
-            scaleExplicitFonts(*child, ratio);
-    }
-}
-
-void refreshFontScaleForOpenWindows(double oldScale, double newScale) {
-    if (oldScale <= 0.0)
-        oldScale = 1.0;
-
-    const double ratio = newScale / oldScale;
-    for (int i = juce::TopLevelWindow::getNumTopLevelWindows(); --i >= 0;) {
-        if (auto* window = juce::TopLevelWindow::getTopLevelWindow(i)) {
-            scaleExplicitFonts(*window, ratio);
-            window->resized();
-            window->repaint();
-        }
-    }
-}
-
 }  // namespace
 
 void PreferencesDialog::applySettings() {
     auto& config = Config::getInstance();
-    const double oldFontScale = config.getUIFontScale();
 
     // Snapshot the path changes the user committed at Browse time. Capture
     // these before applying pages so the values don't shift mid-flight.
@@ -1884,9 +1837,6 @@ void PreferencesDialog::applySettings() {
     shortcutsPage->applySettings(config);
     pathsPage->applySettings(config);  // no-op for path values
     config.save();
-
-    const double newFontScale = config.getUIFontScale();
-    refreshFontScaleForOpenWindows(oldFontScale, newFontScale);
 
     // Apply auto-save settings
     ProjectManager::getInstance().setAutoSaveEnabled(config.getAutoSaveEnabled(),

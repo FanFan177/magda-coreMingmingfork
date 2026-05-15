@@ -15,23 +15,15 @@ namespace magda {
 // Forward declarations
 class TracktionEngineWrapper;
 
-struct BeatPosition {
-    double value = 0.0;
-};
-
-struct BeatDuration {
-    double value = 0.0;
-};
-
 /**
- * @brief Command for splitting a clip at a given beat position
+ * @brief Command for splitting a clip at a given time
  *
  * Uses SnapshotCommand for complete state capture and reliable undo.
  * Creates a new clip (right half) and modifies the original (left half).
  */
 class SplitClipCommand : public SnapshotCommand<ClipInfo> {
   public:
-    SplitClipCommand(ClipId clipId, BeatPosition splitBeat, double tempo = 0.0);
+    SplitClipCommand(ClipId clipId, double splitTime, double tempo = 120.0);
 
     juce::String getDescription() const override {
         return "Split Clip";
@@ -52,19 +44,19 @@ class SplitClipCommand : public SnapshotCommand<ClipInfo> {
 
   private:
     ClipId clipId_;
-    double splitBeat_;
+    double splitTime_;
     double tempo_;
     ClipId rightClipId_ = INVALID_CLIP_ID;
 };
 
 /**
- * @brief Command for moving a clip to a new beat position
+ * @brief Command for moving a clip to a new time position
  *
  * Supports merging consecutive small moves into a single undo step.
  */
 class MoveClipCommand : public ValidatedCommand {
   public:
-    MoveClipCommand(ClipId clipId, BeatPosition newStartBeat, double tempo = 0.0);
+    MoveClipCommand(ClipId clipId, double newStartTime);
 
     juce::String getDescription() const override {
         return "Move Clip";
@@ -78,8 +70,7 @@ class MoveClipCommand : public ValidatedCommand {
 
   private:
     ClipId clipId_;
-    double newStartBeat_;
-    double tempo_;
+    double newStartTime_;
     std::vector<ClipInfo> arrangementSnapshot_;
 };
 
@@ -130,14 +121,14 @@ class MoveClipToTrackCommand : public ValidatedCommand {
 };
 
 /**
- * @brief Command for resizing a clip to a new beat length
+ * @brief Command for resizing a clip
  *
  * Supports merging consecutive resize operations.
  */
 class ResizeClipCommand : public SnapshotCommand<ClipInfo> {
   public:
-    ResizeClipCommand(ClipId clipId, BeatDuration newLength, bool fromStart = false,
-                      double tempo = 0.0);
+    ResizeClipCommand(ClipId clipId, double newLength, bool fromStart = false,
+                      double tempo = 120.0);
 
     juce::String getDescription() const override {
         return "Resize Clip";
@@ -153,7 +144,7 @@ class ResizeClipCommand : public SnapshotCommand<ClipInfo> {
 
   private:
     ClipId clipId_;
-    double newLengthBeats_;
+    double newLength_;
     bool fromStart_;
     double tempo_;
 };
@@ -188,9 +179,9 @@ class DeleteClipCommand : public SnapshotCommand<ClipInfo> {
  */
 class CreateClipCommand : public ValidatedCommand {
   public:
-    CreateClipCommand(ClipType type, TrackId trackId, BeatPosition startBeat,
-                      BeatDuration lengthBeats, const juce::String& audioFilePath = {},
-                      ClipView view = ClipView::Arrangement, double tempo = 0.0);
+    CreateClipCommand(ClipType type, TrackId trackId, double startTime, double length,
+                      const juce::String& audioFilePath = {},
+                      ClipView view = ClipView::Arrangement);
 
     juce::String getDescription() const override {
         return type_ == ClipType::Audio ? "Create Audio Clip" : "Create MIDI Clip";
@@ -207,11 +198,10 @@ class CreateClipCommand : public ValidatedCommand {
   private:
     ClipType type_;
     TrackId trackId_;
-    double startBeat_;
-    double lengthBeats_;
+    double startTime_;
+    double length_;
     juce::String audioFilePath_;
     ClipView view_;
-    double tempo_;
     ClipId createdClipId_ = INVALID_CLIP_ID;
     std::vector<ClipInfo> arrangementSnapshot_;
 };
@@ -221,12 +211,9 @@ class CreateClipCommand : public ValidatedCommand {
  */
 class DuplicateClipCommand : public ValidatedCommand {
   public:
-    explicit DuplicateClipCommand(ClipId sourceClipId);
-    DuplicateClipCommand(ClipId sourceClipId, BeatPosition startBeat,
+    DuplicateClipCommand(ClipId sourceClipId, double startTime = -1.0,
                          TrackId targetTrackId = INVALID_TRACK_ID, double tempo = 0.0,
                          int targetSceneIndex = -1);
-    static std::unique_ptr<DuplicateClipCommand> forSessionSlot(
-        ClipId sourceClipId, TrackId targetTrackId = INVALID_TRACK_ID, int targetSceneIndex = -1);
 
     juce::String getDescription() const override {
         return "Duplicate Clip";
@@ -242,10 +229,9 @@ class DuplicateClipCommand : public ValidatedCommand {
 
   private:
     ClipId sourceClipId_;
-    bool hasExplicitStartBeat_ = false;
-    double startBeat_ = 0.0;
+    double startTime_;       // -1 = use default (after source)
     TrackId targetTrackId_;  // INVALID = same track
-    double tempo_;           // BPM for derived seconds cache (0 = project tempo)
+    double tempo_;           // BPM for beat field sync (0 = skip)
     int targetSceneIndex_;   // -1 = keep/unplaced; session clips only
     ClipId duplicatedClipId_ = INVALID_CLIP_ID;
 };
@@ -258,9 +244,8 @@ std::vector<std::unique_ptr<DuplicateClipCommand>> createArrangementBlockDuplica
  */
 class PasteClipCommand : public ValidatedCommand {
   public:
-    PasteClipCommand(BeatPosition pasteBeat, TrackId targetTrackId = INVALID_TRACK_ID,
-                     ClipView targetView = ClipView::Arrangement, int targetSceneIndex = -1,
-                     double tempo = 0.0);
+    PasteClipCommand(double pasteTime, TrackId targetTrackId = INVALID_TRACK_ID,
+                     ClipView targetView = ClipView::Arrangement, int targetSceneIndex = -1);
 
     juce::String getDescription() const override {
         return "Paste Clip";
@@ -275,11 +260,10 @@ class PasteClipCommand : public ValidatedCommand {
     }
 
   private:
-    double pasteBeat_;
+    double pasteTime_;
     TrackId targetTrackId_;
     ClipView targetView_;
     int targetSceneIndex_;
-    double tempo_;
     std::vector<ClipId> pastedClipIds_;
     std::vector<ClipInfo> arrangementSnapshot_;
     std::vector<ClipInfo> sessionSnapshot_;

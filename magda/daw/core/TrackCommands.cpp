@@ -2,9 +2,7 @@
 
 #include "../audio/AudioBridge.hpp"
 #include "../engine/AudioEngine.hpp"
-#include "../project/ProjectManager.hpp"
 #include "ClipManager.hpp"
-#include "TempoUtils.hpp"
 
 namespace magda {
 
@@ -149,13 +147,10 @@ void DuplicateTrackCommand::execute() {
     if (duplicateContent_ && duplicatedTrackId_ != INVALID_TRACK_ID) {
         auto& clipManager = ClipManager::getInstance();
         auto clipIds = clipManager.getClipsOnTrack(sourceTrackId_);
-        const double projectBpm = ProjectManager::getInstance().getCurrentProjectInfo().tempo;
-        const double bpm = isValidBpm(projectBpm) ? projectBpm : DEFAULT_BPM;
         for (auto clipId : clipIds) {
             const auto* clip = clipManager.getClip(clipId);
             if (clip) {
-                clipManager.duplicateClipAt(clipId, clip->getTimelineStart(bpm), duplicatedTrackId_,
-                                            bpm);
+                clipManager.duplicateClipAt(clipId, clip->startTime, duplicatedTrackId_);
             }
         }
     }

@@ -73,8 +73,6 @@ juce_add_binary_data(MagdaAssets
     ../../assets/icons/general/folder-open.svg
     ../../assets/icons/general/piano_roll.svg
     ../../assets/icons/general/drum_grid.svg
-    ../../assets/icons/general/faust-logo.svg
-    ../../assets/icons/general/faust-text-logo.svg
     ../../assets/icons/general/script.svg
     ../../assets/icons/general/volume_up.svg
     ../../assets/icons/general/volume_off.svg
@@ -222,18 +220,6 @@ juce_add_binary_data(MagdaAssets
     # plugin packs; MAGDA-internal plugin aliases live in
     # core/aliases/InternalPluginAliases.cpp).
     ../../assets/aliases/curated_index.json
-    # Bundled Faust starter DSPs — embedded so users always have something
-    # in the loader picker even on a fresh install.
-    audio/faust_dsp/magda_drive.dsp
-    audio/faust_dsp/magda_tremolo.dsp
-    audio/faust_dsp/magda_delay.dsp
-    audio/faust_dsp/magda_granular_delay.dsp
-    audio/faust_dsp/magda_filter_svf.dsp
-    audio/faust_dsp/magda_filter_ladder.dsp
-    audio/faust_dsp/magda_filter_korg35.dsp
-    audio/faust_dsp/magda_filter_oberheim.dsp
-    audio/faust_dsp/magda_filter_sk.dsp
-    audio/faust_dsp/magda_filter_diode.dsp
 )
 
 # =============================================================================
@@ -351,10 +337,9 @@ target_link_libraries(magda_daw
     tracktion::tracktion_engine
     juce_llm
     MagdaAssets
+    # Link GTK/WebKit and curl dependencies on Linux
     $<$<PLATFORM_ID:Linux>:juce::pkgconfig_JUCE_BROWSER_LINUX_DEPS>
     $<$<PLATFORM_ID:Linux>:juce::pkgconfig_JUCE_CURL_LINUX_DEPS>
-    PRIVATE
-    faust::libfaust
 )
 
 target_compile_definitions(magda_daw
@@ -414,7 +399,6 @@ target_include_directories(magda_daw
     ${CMAKE_CURRENT_BINARY_DIR}/generated
     PRIVATE
     ${CMAKE_SOURCE_DIR}
-    ${CMAKE_SOURCE_DIR}/third_party/faust/architecture
 )
 
 target_include_directories(magda_daw_app
@@ -548,25 +532,5 @@ else()
             "${MAGDA_CONTROLLERS_SRC}"
             "$<TARGET_FILE_DIR:magda_daw_app>/controllers"
         COMMENT "Copying controller profiles alongside app executable"
-    )
-endif()
-
-# Copy faustlibraries (stdfaust.lib + dependencies) into the app so libfaust's
-# `import("stdfaust.lib")` resolves at runtime. FaustPlugin passes this dir as
-# `-I` argv to the interpreter compiler. Submodule path: third_party/faust/libraries.
-set(MAGDA_FAUST_LIBS_SRC "${CMAKE_SOURCE_DIR}/third_party/faust/libraries")
-if(APPLE)
-    add_custom_command(TARGET magda_daw_app POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_directory
-            "${MAGDA_FAUST_LIBS_SRC}"
-            "$<TARGET_BUNDLE_CONTENT_DIR:magda_daw_app>/Resources/faustlibraries"
-        COMMENT "Copying Faust standard libraries to app bundle Resources"
-    )
-else()
-    add_custom_command(TARGET magda_daw_app POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_directory
-            "${MAGDA_FAUST_LIBS_SRC}"
-            "$<TARGET_FILE_DIR:magda_daw_app>/faustlibraries"
-        COMMENT "Copying Faust standard libraries alongside app executable"
     )
 endif()

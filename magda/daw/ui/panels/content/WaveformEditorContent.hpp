@@ -21,7 +21,7 @@ namespace magda::daw::ui {
  * - ScrollNotifyingViewport (scrolling)
  * - WaveformGridComponent (scrollable waveform content)
  * - TimeRuler (synchronized with scroll)
- * - Source-relative time ruler
+ * - ABS/REL mode toggle
  * - Zoom controls
  *
  * Architecture based on PianoRollContent pattern.
@@ -79,17 +79,18 @@ class WaveformEditorContent : public PanelContent,
         return editingClipId_;
     }
 
-    // Waveform editor is always source-relative.
+    // Timeline mode
     void setRelativeTimeMode(bool relative);
     bool isRelativeTimeMode() const {
-        return true;
+        return relativeTimeMode_;
     }
     void setSnapEnabledFromUI(bool enabled);
 
   private:
     magda::ClipId editingClipId_ = magda::INVALID_CLIP_ID;
 
-    bool relativeTimeMode_ = true;
+    // Timeline mode
+    bool relativeTimeMode_ = false;  // false = absolute (timeline), true = relative (clip)
 
     // Zoom
     double horizontalZoom_ = 100.0;  // pixels per second

@@ -7,7 +7,6 @@
 
 #include "../layout/LayoutConfig.hpp"
 #include "core/ClipTypes.hpp"
-#include "core/TempoUtils.hpp"
 
 namespace magda {
 
@@ -21,7 +20,7 @@ enum class TimeDisplayMode {
 struct GridQuantize {
     bool autoGrid = true;  // When true, use smart grid based on zoom level
     int numerator = 1;     // e.g. 1, 2, 3
-    int denominator = DEFAULT_TIME_SIGNATURE_DENOMINATOR;  // Must be power of 2: 1, 2, 4, 8, 16, 32
+    int denominator = 4;   // Must be power of 2: 1, 2, 4, 8, 16, 32
 
     // Display-only: effective grid when in auto mode (set by MIDI editors)
     int autoEffectiveNumerator = 1;
@@ -199,7 +198,7 @@ struct TimeSelection {
     bool visuallyHidden = false;  // When true, selection is hidden visually but data remains
 
     bool isActive() const {
-        return startBeats >= 0.0 && endBeats > startBeats;
+        return startTime >= 0 && endTime > startTime;
     }
     bool isVisuallyActive() const {
         return isActive() && !visuallyHidden;
@@ -227,27 +226,6 @@ struct TimeSelection {
     double getDuration() const {
         return isActive() ? (endTime - startTime) : 0.0;
     }
-
-    double getDurationBeats() const {
-        return isActive() ? (endBeats - startBeats) : 0.0;
-    }
-
-    void setFromBeats(double start, double end, double bpm) {
-        if (start > end)
-            std::swap(start, end);
-        startBeats = juce::jmax(0.0, start);
-        endBeats = juce::jmax(startBeats, end);
-        const double validBpm = clampBpm(bpm);
-        startTime = startBeats * 60.0 / validBpm;
-        endTime = endBeats * 60.0 / validBpm;
-    }
-
-    void setFromSeconds(double start, double end, double bpm) {
-        if (start > end)
-            std::swap(start, end);
-        const double validBpm = clampBpm(bpm);
-        setFromBeats(start * validBpm / 60.0, end * validBpm / 60.0, validBpm);
-    }
 };
 
 /**
@@ -261,7 +239,7 @@ struct LoopRegion {
     bool enabled = false;
 
     bool isValid() const {
-        return startBeats >= 0.0 && endBeats > startBeats;
+        return startTime >= 0 && endTime > startTime;
     }
     void clear() {
         startTime = -1.0;
@@ -272,27 +250,6 @@ struct LoopRegion {
     }
     double getDuration() const {
         return isValid() ? (endTime - startTime) : 0.0;
-    }
-
-    double getDurationBeats() const {
-        return isValid() ? (endBeats - startBeats) : 0.0;
-    }
-
-    void setFromBeats(double start, double end, double bpm) {
-        if (start > end)
-            std::swap(start, end);
-        startBeats = juce::jmax(0.0, start);
-        endBeats = juce::jmax(startBeats, end);
-        const double validBpm = clampBpm(bpm);
-        startTime = startBeats * 60.0 / validBpm;
-        endTime = endBeats * 60.0 / validBpm;
-    }
-
-    void setFromSeconds(double start, double end, double bpm) {
-        if (start > end)
-            std::swap(start, end);
-        const double validBpm = clampBpm(bpm);
-        setFromBeats(start * validBpm / 60.0, end * validBpm / 60.0, validBpm);
     }
 };
 
@@ -308,7 +265,7 @@ struct PunchRegion {
     bool punchOutEnabled = false;
 
     bool isValid() const {
-        return startBeats >= 0.0 && endBeats > startBeats;
+        return startTime >= 0 && endTime > startTime;
     }
     bool isEnabled() const {
         return punchInEnabled || punchOutEnabled;
@@ -324,36 +281,15 @@ struct PunchRegion {
     double getDuration() const {
         return isValid() ? (endTime - startTime) : 0.0;
     }
-
-    double getDurationBeats() const {
-        return isValid() ? (endBeats - startBeats) : 0.0;
-    }
-
-    void setFromBeats(double start, double end, double bpm) {
-        if (start > end)
-            std::swap(start, end);
-        startBeats = juce::jmax(0.0, start);
-        endBeats = juce::jmax(startBeats, end);
-        const double validBpm = clampBpm(bpm);
-        startTime = startBeats * 60.0 / validBpm;
-        endTime = endBeats * 60.0 / validBpm;
-    }
-
-    void setFromSeconds(double start, double end, double bpm) {
-        if (start > end)
-            std::swap(start, end);
-        const double validBpm = clampBpm(bpm);
-        setFromBeats(start * validBpm / 60.0, end * validBpm / 60.0, validBpm);
-    }
 };
 
 /**
  * @brief Tempo and time signature state
  */
 struct TempoState {
-    double bpm = DEFAULT_BPM;
-    int timeSignatureNumerator = DEFAULT_TIME_SIGNATURE_NUMERATOR;
-    int timeSignatureDenominator = DEFAULT_TIME_SIGNATURE_DENOMINATOR;
+    double bpm = 120.0;
+    int timeSignatureNumerator = 4;
+    int timeSignatureDenominator = 4;
 
     // Helper methods
     double getSecondsPerBeat() const {

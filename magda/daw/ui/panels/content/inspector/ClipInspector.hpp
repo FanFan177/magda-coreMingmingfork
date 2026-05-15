@@ -5,7 +5,6 @@
 #include "../../common/BarsBeatsTicksLabel.hpp"
 #include "../../common/DraggableValueLabel.hpp"
 #include "../../common/SvgButton.hpp"
-#include "../../common/TextSlider.hpp"
 #include "BaseInspector.hpp"
 #include "clip/sections/ClipFadesSection.hpp"
 #include "core/ClipManager.hpp"
@@ -16,8 +15,8 @@ namespace magda::daw::ui {
  * @brief Inspector for clip properties
  *
  * Displays and edits comprehensive clip properties:
- * - Position (start, end, length)
- * - Source/loop controls (toggle, start, end, offset/phase)
+ * - Position (start, end, length, offset)
+ * - Loop controls (toggle, start, length, phase)
  * - Warp/auto-tempo/stretch settings
  * - Pitch (auto-pitch, transpose)
  * - Per-clip mix (volume, pan, gain)
@@ -93,8 +92,8 @@ class ClipInspector : public BaseInspector, public magda::ClipManagerListener {
     std::unique_ptr<magda::BarsBeatsTicksLabel> clipStartValue_;
     juce::Label clipEndLabel_;
     std::unique_ptr<magda::BarsBeatsTicksLabel> clipEndValue_;
-    juce::Label clipLengthLabel_;
-    std::unique_ptr<magda::BarsBeatsTicksLabel> clipLengthValue_;
+    juce::Label clipOffsetLabel_;
+    std::unique_ptr<magda::BarsBeatsTicksLabel> clipContentOffsetValue_;
 
     // Loop section
     std::unique_ptr<magda::SvgButton> clipLoopToggle_;
@@ -173,12 +172,6 @@ class ClipInspector : public BaseInspector, public magda::ClipManagerListener {
     juce::ComboBox launchModeCombo_;
     juce::Label launchQuantizeLabel_;
     juce::ComboBox launchQuantizeCombo_;
-    juce::Label followActionLabel_;
-    juce::ComboBox followActionCombo_;
-    juce::Label followActionDelayLabel_;
-    TextSlider followActionDelaySlider_;
-    juce::Label followActionLoopCountLabel_;
-    TextSlider followActionLoopCountSlider_;
     // Scrollable container for clip properties
     juce::Viewport clipPropsViewport_;
     class ClipPropsContainer : public juce::Component {
@@ -213,7 +206,7 @@ class ClipInspector : public BaseInspector, public magda::ClipManagerListener {
     double multiSpeedRatioDragStart_ = 0.0;
     double multiStartDragStart_ = 0.0;
     double multiEndDragStart_ = 0.0;
-    double multiLengthDragStart_ = 0.0;
+    double multiOffsetDragStart_ = 0.0;
 
     // Update methods
     void updateFromSelectedClip();

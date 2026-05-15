@@ -82,21 +82,9 @@ class ClipManager {
     // ========================================================================
 
     /**
-     * @brief Create an audio clip from a file — beats-authoritative API.
-     *
-     * Source duration, offset, and loop fields remain source-domain seconds.
-     * Timeline placement is stored in beats and seconds are derived only for
-     * bridge/UI compatibility.
-     */
-    ClipId createAudioClipBeats(TrackId trackId, double startBeats, double lengthBeats,
-                                const juce::String& audioFilePath,
-                                ClipView view = ClipView::Arrangement, double projectBPM = 0.0);
-
-    /**
-     * @brief Create an audio clip from timeline seconds.
-     *
-     * Thin shim around createAudioClipBeats for UI/engine boundaries whose
-     * natural input is still seconds.
+     * @brief Create an audio clip from a file
+     * @param view Which view the clip belongs to (Arrangement or Session)
+     * @param startTime Position on timeline - only used for Arrangement view
      */
     ClipId createAudioClip(TrackId trackId, double startTime, double length,
                            const juce::String& audioFilePath, ClipView view = ClipView::Arrangement,
@@ -157,13 +145,7 @@ class ClipManager {
     ClipId duplicateClip(ClipId clipId);
 
     /**
-     * @brief Duplicate a clip at a specific beat position.
-     */
-    ClipId duplicateClipAtBeats(ClipId clipId, double startBeat, TrackId trackId = INVALID_TRACK_ID,
-                                double tempo = 0.0);
-
-    /**
-     * @brief Duplicate a clip at a specific timeline-second position.
+     * @brief Duplicate a clip at a specific position
      * @param clipId The clip to duplicate
      * @param startTime Where to place the duplicate
      * @param trackId Track for the duplicate (INVALID_TRACK_ID = same track)
@@ -176,10 +158,16 @@ class ClipManager {
     // Clip Manipulation
     // ========================================================================
 
-    /** @brief Move clip to a new start beat. */
-    void moveClipBeats(ClipId clipId, double newStartBeat, double tempo = 0.0);
-
-    /** @brief Move clip to a new timeline-second start. */
+    /**
+     * @brief Move clip to a new start time
+     * @param tempo BPM used to refresh the clip's startBeats from the new
+     *              startTime. Pass <= 0 (default) to read the live project
+     *              tempo from ProjectManager — the safe path. The previous
+     *              hard-coded default of 120 silently corrupted startBeats
+     *              whenever the project was at any other tempo, which then
+     *              snapped clips to the wrong position on the next BPM
+     *              change.
+     */
     void moveClip(ClipId clipId, double newStartTime, double tempo = 0.0);
 
     /**
@@ -187,24 +175,22 @@ class ClipManager {
      */
     void moveClipToTrack(ClipId clipId, TrackId newTrackId);
 
-    /** @brief Resize clip to a new beat length. */
-    void resizeClipBeats(ClipId clipId, double newLengthBeats, bool fromStart = false,
-                         double tempo = 0.0);
-
-    /** @brief Resize clip to a new timeline-second length. */
+    /**
+     * @brief Resize clip (change length)
+     * @param fromStart If true, resize from the start edge (affects startTime)
+     * @param tempo BPM for MIDI note shifting (required when fromStart=true for MIDI clips)
+     */
     void resizeClip(ClipId clipId, double newLength, bool fromStart = false, double tempo = 120.0);
 
-    /** @brief Split a clip at a specific beat position. */
-    ClipId splitClipAtBeat(ClipId clipId, double splitBeat, double tempo = 0.0);
-
-    /** @brief Split a clip at a specific timeline-second position. */
+    /**
+     * @brief Split a clip at a specific time
+     * @return The ID of the new clip (right half)
+     */
     ClipId splitClip(ClipId clipId, double splitTime, double tempo = 120.0);
 
-    /** @brief Trim clip to a beat range. */
-    void trimClipBeats(ClipId clipId, double newStartBeat, double newLengthBeats,
-                       double tempo = 0.0);
-
-    /** @brief Trim clip to a timeline-second range. */
+    /**
+     * @brief Trim clip to a range (used for time selection based creation)
+     */
     void trimClip(ClipId clipId, double newStartTime, double newLength, double tempo = 0.0);
 
     // ========================================================================
@@ -217,9 +203,6 @@ class ClipManager {
     void setClipMidiOffset(ClipId clipId, double offsetBeats);
     void setClipLaunchMode(ClipId clipId, LaunchMode mode);
     void setClipLaunchQuantize(ClipId clipId, LaunchQuantize quantize);
-    void setClipFollowAction(ClipId clipId, FollowAction action);
-    void setClipFollowActionDelayBeats(ClipId clipId, double delayBeats);
-    void setClipFollowActionLoopCount(ClipId clipId, int loopCount);
 
     // Warp
     /** @brief Enable or disable warp markers on an audio clip */

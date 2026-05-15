@@ -1,4 +1,3 @@
-#include <algorithm>
 #include <map>
 
 #include "../audio/AudioBridge.hpp"
@@ -20,19 +19,6 @@ struct PresetIdRemap {
 
 bool targetPointsAtDevice(const ControlTarget& target, DeviceId deviceId) {
     return deviceId != INVALID_DEVICE_ID && target.devicePath.getDeviceId() == deviceId;
-}
-
-int findStoredParameterIndex(const DeviceInfo& device, int paramIndex) {
-    auto byIdentity = std::find_if(
-        device.parameters.begin(), device.parameters.end(),
-        [paramIndex](const ParameterInfo& param) { return param.paramIndex == paramIndex; });
-    if (byIdentity != device.parameters.end())
-        return static_cast<int>(std::distance(device.parameters.begin(), byIdentity));
-
-    if (paramIndex >= 0 && paramIndex < static_cast<int>(device.parameters.size()))
-        return paramIndex;
-
-    return -1;
 }
 
 void retargetPresetLink(ControlTarget& target, DeviceId presetDeviceId,
@@ -311,8 +297,6 @@ void TrackManager::removeDeviceFromChain(TrackId trackId, RackId rackId, ChainId
         if (it != elements.end()) {
             DBG("Removed device: " << magda::getDevice(*it).name << " (id=" << deviceId
                                    << ") from chain " << chainId);
-            SelectionManager::getInstance().clearSelectionForDeletedChainNode(
-                ChainNodePath::chainDevice(trackId, rackId, chainId, deviceId));
             elements.erase(it);
             notifyTrackDevicesChanged(trackId);
         }
@@ -460,7 +444,6 @@ void TrackManager::removeDeviceFromChainByPath(const ChainNodePath& devicePath) 
         if (it != elements.end()) {
             DBG("Removed top-level device: " << magda::getDevice(*it).name
                                              << " (id=" << devicePath.topLevelDeviceId << ")");
-            SelectionManager::getInstance().clearSelectionForDeletedChainNode(devicePath);
             elements.erase(it);
             notifyTrackDevicesChanged(devicePath.trackId);
         }
@@ -494,7 +477,6 @@ void TrackManager::removeDeviceFromChainByPath(const ChainNodePath& devicePath) 
         if (it != elements.end()) {
             DBG("Removed nested device via path: " << magda::getDevice(*it).name
                                                    << " (id=" << deviceId << ")");
-            SelectionManager::getInstance().clearSelectionForDeletedChainNode(devicePath);
             elements.erase(it);
             notifyTrackDevicesChanged(devicePath.trackId);
         }
@@ -691,13 +673,12 @@ void TrackManager::setDeviceVisibleParameters(DeviceId deviceId,
 }
 
 void TrackManager::setDeviceParameterValue(const ChainNodePath& devicePath, int paramIndex,
-                                           ParameterModelValue value) {
+                                           float value) {
     if (auto* device = getDeviceInChainByPath(devicePath)) {
-        const int storedIndex = findStoredParameterIndex(*device, paramIndex);
-        if (storedIndex >= 0) {
-            device->parameters[static_cast<size_t>(storedIndex)].currentValue = value.value;
+        if (paramIndex >= 0 && paramIndex < static_cast<int>(device->parameters.size())) {
+            device->parameters[static_cast<size_t>(paramIndex)].currentValue = value;
             // Use granular notification - only sync this one parameter, not all 543
-            notifyDeviceParameterChanged(device->id, paramIndex, value.value);
+            notifyDeviceParameterChanged(device->id, paramIndex, value);
         }
     }
 }
@@ -867,9 +848,8 @@ void TrackManager::setDeviceParameterValueFromPlugin(const ChainNodePath& device
     // Instead, we notify UI listeners directly about the parameter change.
 
     if (auto* device = getDeviceInChainByPath(devicePath)) {
-        const int storedIndex = findStoredParameterIndex(*device, paramIndex);
-        if (storedIndex >= 0) {
-            device->parameters[static_cast<size_t>(storedIndex)].currentValue = value;
+        if (paramIndex >= 0 && paramIndex < static_cast<int>(device->parameters.size())) {
+            device->parameters[static_cast<size_t>(paramIndex)].currentValue = value;
 
             // Notify listeners about parameter change (for UI updates)
             notifyDeviceParameterChanged(device->id, paramIndex, value);
@@ -1213,31 +1193,36 @@ void TrackManager::removeRackFromChainByPath(const ChainNodePath& rackPath) {
 
 void TrackManager::setSidechainSource(DeviceId targetDevice, TrackId sourceTrack,
                                       SidechainConfig::Type type) {
-    auto updateElements = [&](auto&& self, std::vector<ChainElement>& elements) -> bool {
-        for (auto& element : elements) {
+    // Search all tracks for the target device
+    for (auto& track : tracks_) {
+        // Search top-level chain elements
+        for (auto& element : track.chainElements) {
             if (magda::isDevice(element)) {
                 auto& device = magda::getDevice(element);
                 if (device.id == targetDevice) {
                     device.sidechain.type = type;
                     device.sidechain.sourceTrackId = sourceTrack;
                     notifyDevicePropertyChanged(targetDevice);
-                    return true;
+                    return;
                 }
             } else if (magda::isRack(element)) {
+                // Search inside racks
                 auto& rack = magda::getRack(element);
-                for (auto& chain : rack.chains)
-                    if (self(self, chain.elements))
-                        return true;
+                for (auto& chain : rack.chains) {
+                    for (auto& chainElement : chain.elements) {
+                        if (magda::isDevice(chainElement)) {
+                            auto& device = magda::getDevice(chainElement);
+                            if (device.id == targetDevice) {
+                                device.sidechain.type = type;
+                                device.sidechain.sourceTrackId = sourceTrack;
+                                notifyDevicePropertyChanged(targetDevice);
+                                return;
+                            }
+                        }
+                    }
+                }
             }
         }
-
-        return false;
-    };
-
-    // Search all tracks for the target device
-    for (auto& track : tracks_) {
-        if (updateElements(updateElements, track.chainElements))
-            return;
     }
 }
 

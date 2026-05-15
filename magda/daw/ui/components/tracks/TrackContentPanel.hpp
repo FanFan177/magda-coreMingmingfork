@@ -13,7 +13,6 @@
 #include "core/AutomationManager.hpp"
 #include "core/ClipManager.hpp"
 #include "core/ClipTypes.hpp"
-#include "core/TempoUtils.hpp"
 #include "core/TrackManager.hpp"
 #include "core/ViewModeController.hpp"
 #include "engine/AudioEngine.hpp"
@@ -216,9 +215,9 @@ class TrackContentPanel : public juce::Component,
 
     // Time display mode and tempo (for grid drawing)
     TimeDisplayMode displayMode = TimeDisplayMode::BarsBeats;
-    double tempoBPM = DEFAULT_BPM;
-    int timeSignatureNumerator = DEFAULT_TIME_SIGNATURE_NUMERATOR;
-    int timeSignatureDenominator = DEFAULT_TIME_SIGNATURE_DENOMINATOR;
+    double tempoBPM = 120.0;
+    int timeSignatureNumerator = 4;
+    int timeSignatureDenominator = 4;
 
     // Repaint only the visible viewport area (avoids invalidating 65000+ px at high zoom)
     void repaintVisible();

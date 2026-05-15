@@ -320,11 +320,7 @@ void SessionClipEditor::updateControls() {
     loopToggle_->setActive(clip->loopEnabled);
 
     // Update length label
-    const double bpm = TimelineController::getCurrent()
-                           ? TimelineController::getCurrent()->getState().tempo.bpm
-                           : 120.0;
-    lengthLabel_->setText(juce::String(clip->getLengthInBeats(bpm), 2) + " beats",
-                          juce::dontSendNotification);
+    lengthLabel_->setText(juce::String(clip->length, 2) + " beats", juce::dontSendNotification);
 
     // Update offset slider
     if (clip->audio().source.filePath.isNotEmpty()) {

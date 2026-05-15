@@ -7,7 +7,6 @@
 #include <vector>
 
 #include "ClipTypes.hpp"
-#include "TempoUtils.hpp"
 #include "TrackTypes.hpp"
 #include "TypeIds.hpp"
 
@@ -262,6 +261,11 @@ struct ClipInfo {
         return analogPitch && !autoTempo && !warpEnabled;
     }
 
+    /// Clip timeline placement is always beat-authoritative. Audio source
+    /// offsets/loops remain source-domain data and are converted at the bridge.
+    bool isBeatsAuthoritative() const {
+        return true;
+    }
     int autoPitchMode = 0;     // 0=pitchTrack, 1=chordTrackMono, 2=chordTrackPoly
     float pitchChange = 0.0f;  // -48 to +48 semitones
     int transpose = 0;         // -24 to +24 semitones (only when !autoPitch)
@@ -328,9 +332,6 @@ struct ClipInfo {
     // Session launch properties
     LaunchMode launchMode = LaunchMode::Trigger;
     LaunchQuantize launchQuantize = LaunchQuantize::OneBar;
-    FollowAction followAction = FollowAction::None;
-    double followActionDelayBeats = 0.0;
-    int followActionLoopCount = 1;
 
     // Per-clip playhead position (seconds, looped).
     // Updated by SessionClipScheduler from audio-thread data.
@@ -348,9 +349,13 @@ struct ClipInfo {
         lengthBeats = placement.lengthBeats;
     }
 
+    double getEndTime() const {
+        return startTime + length;
+    }
+
     /// Derive startTime/length from placement beats using the given BPM.
     void deriveTimesFromBeats(double bpm) {
-        if (isValidBpm(bpm)) {
+        if (bpm > 0.0) {
             if (placement.lengthBeats <= 0.0 && lengthBeats > 0.0)
                 setPlacementBeats(startBeats, lengthBeats);
             if (placement.lengthBeats > 0.0) {
@@ -358,39 +363,6 @@ struct ClipInfo {
                 length = (placement.lengthBeats * 60.0) / bpm;
             }
         }
-    }
-
-    // =========================================================================
-    // Beats-first source-domain setters (audio clips)
-    //
-    // The ONLY supported paths for writing offset / loopStart / loopLength.
-    // They take BEATS and derive the seconds mirror via the source's
-    // interpretation BPM (during the transitional period while the seconds
-    // fields still exist). When all readers are migrated off the seconds
-    // fields, those fields go away and the derive step goes with them.
-    //
-    // Deliberately no `setXxxSeconds` counterpart: a parallel seconds API
-    // would just keep call sites writing seconds and quietly recompute beats,
-    // which is the leak we're trying to close. Callers that have seconds
-    // convert at the call site: beats = seconds × interpBpm / 60.
-    // =========================================================================
-
-    void setSourceOffsetBeats(double beats, double interpBpm) {
-        offsetBeats = juce::jmax(0.0, beats);
-        if (interpBpm > 0.0)
-            offset = offsetBeats * 60.0 / interpBpm;
-    }
-
-    void setLoopStartBeats(double beats, double interpBpm) {
-        loopStartBeats = juce::jmax(0.0, beats);
-        if (interpBpm > 0.0)
-            loopStart = loopStartBeats * 60.0 / interpBpm;
-    }
-
-    void setLoopLengthBeats(double beats, double interpBpm) {
-        loopLengthBeats = juce::jmax(0.0, beats);
-        if (interpBpm > 0.0)
-            loopLength = loopLengthBeats * 60.0 / interpBpm;
     }
 
     /// Get end position in beats without BPM conversion (beats are always valid for MIDI)
@@ -410,22 +382,12 @@ struct ClipInfo {
         return timelineTime * speedRatio;  // Timeline × speed = source distance
     }
 
-    /// Effective source length: loopLength if set, otherwise derived from timeline placement.
-    double getSourceLength(double projectBPM) const {
-        return loopLength > 0.0 ? loopLength : timelineToSource(getTimelineLength(projectBPM));
-    }
-
-    /// Compatibility fallback for callers that still do not have project BPM nearby.
+    /// Effective source length: loopLength if set, otherwise derived from clip length
     double getSourceLength() const {
         return loopLength > 0.0 ? loopLength : timelineToSource(length);
     }
 
     /// Source length expressed in timeline seconds
-    double getSourceLengthOnTimeline(double projectBPM) const {
-        return sourceToTimeline(getSourceLength(projectBPM));
-    }
-
-    /// Compatibility fallback for callers that still do not have project BPM nearby.
     double getSourceLengthOnTimeline() const {
         return sourceToTimeline(getSourceLength());
     }
@@ -442,7 +404,7 @@ struct ClipInfo {
     /// For autoTempo clips, offsetBeats is authoritative and converted to
     /// timeline seconds via projectBPM at the TE boundary.
     double getTeOffset(bool looped, double projectBPM = 0.0) const {
-        if (autoTempo && isValidBpm(projectBPM)) {
+        if (autoTempo && projectBPM > 0.0) {
             // Convert source beats to timeline seconds for TE
             if (looped)
                 return (offsetBeats - loopStartBeats) * 60.0 / projectBPM;
@@ -459,11 +421,6 @@ struct ClipInfo {
     }
 
     /// TE loop end in timeline seconds (source / speedRatio)
-    double getTeLoopEnd(double projectBPM) const {
-        return sourceToTimeline(loopStart + getSourceLength(projectBPM));
-    }
-
-    /// Compatibility fallback for callers that still do not have project BPM nearby.
     double getTeLoopEnd() const {
         return sourceToTimeline(loopStart + getSourceLength());
     }
@@ -476,6 +433,30 @@ struct ClipInfo {
     /// Set loopLength from a timeline-time extent (converts to source-time)
     void setLoopLengthFromTimeline(double timelineLength) {
         loopLength = timelineToSource(timelineLength);
+    }
+
+    /// Clamp clip length so a non-looped clip doesn't exceed the available source audio.
+    /// @param fileDuration Total duration of the audio file (seconds)
+    void clampLengthToSource(double fileDuration) {
+        if (!loopEnabled && fileDuration > 0.0) {
+            double available = fileDuration - offset;
+            double maxLength = available / speedRatio;
+            if (length > maxLength) {
+                length = juce::jmax(MIN_CLIP_LENGTH, maxLength);
+            }
+        }
+    }
+
+    bool containsTime(double time) const {
+        return time >= startTime && time < getEndTime();
+    }
+
+    bool overlaps(double start, double end) const {
+        return startTime < end && getEndTime() > start;
+    }
+
+    bool overlaps(const ClipInfo& other) const {
+        return overlaps(other.startTime, other.getEndTime());
     }
 
     // =========================================================================
@@ -529,7 +510,7 @@ struct ClipInfo {
 
     /// Timeline-domain seconds for the clip's length, derived from placement.
     double getTimelineLength(double projectBPM) const {
-        if (placement.lengthBeats > 0.0 && isValidBpm(projectBPM)) {
+        if (placement.lengthBeats > 0.0 && projectBPM > 0.0) {
             return placement.lengthBeats * 60.0 / projectBPM;
         }
         return length;
@@ -537,7 +518,7 @@ struct ClipInfo {
 
     /// Timeline-domain seconds for the clip's start position, derived from placement.
     double getTimelineStart(double projectBPM) const {
-        if (isValidBpm(projectBPM)) {
+        if (projectBPM > 0.0) {
             return placement.startBeat * 60.0 / projectBPM;
         }
         return startTime;

@@ -7,7 +7,6 @@
 #include "../themes/SmallButtonLookAndFeel.hpp"
 #include "BinaryData.h"
 #include "core/StringTable.hpp"
-#include "core/TempoUtils.hpp"
 
 namespace magda {
 
@@ -903,7 +902,7 @@ void TransportPanel::setupTimeDisplayBoxes() {
 void TransportPanel::setupTempoAndQuantize() {
     // Tempo — DraggableValueLabel (Raw format with suffix)
     tempoLabel = std::make_unique<DraggableValueLabel>(DraggableValueLabel::Format::Raw);
-    tempoLabel->setRange(MIN_VALID_BPM, MAX_VALID_BPM, DEFAULT_BPM);
+    tempoLabel->setRange(20.0, 999.0, 120.0);
     tempoLabel->setValue(currentTempo, juce::dontSendNotification);
     tempoLabel->setSuffix("");
     tempoLabel->setDecimalPlaces(2);
@@ -923,8 +922,7 @@ void TransportPanel::setupTempoAndQuantize() {
     // Time signature — numerator / denominator draggable labels
     timeSigNumeratorLabel =
         std::make_unique<DraggableValueLabel>(DraggableValueLabel::Format::Integer);
-    timeSigNumeratorLabel->setRange(MIN_TIME_SIGNATURE_VALUE, MAX_TIME_SIGNATURE_VALUE,
-                                    DEFAULT_TIME_SIGNATURE_NUMERATOR);
+    timeSigNumeratorLabel->setRange(1.0, 32.0, 4.0);
     timeSigNumeratorLabel->setValue(static_cast<double>(timeSignatureNumerator),
                                     juce::dontSendNotification);
     timeSigNumeratorLabel->setTextColour(DarkTheme::getColour(DarkTheme::TEXT_PRIMARY));
@@ -937,8 +935,7 @@ void TransportPanel::setupTempoAndQuantize() {
     timeSigNumeratorLabel->setSuffix("/");
     timeSigNumeratorLabel->setJustification(juce::Justification::centredRight);
     timeSigNumeratorLabel->onValueChange = [this]() {
-        timeSignatureNumerator = clampTimeSignatureValue(
-            static_cast<int>(std::round(timeSigNumeratorLabel->getValue())));
+        timeSignatureNumerator = static_cast<int>(std::round(timeSigNumeratorLabel->getValue()));
         if (onTimeSignatureChange)
             onTimeSignatureChange(timeSignatureNumerator, timeSignatureDenominator);
     };
@@ -946,8 +943,7 @@ void TransportPanel::setupTempoAndQuantize() {
 
     timeSigDenominatorLabel =
         std::make_unique<DraggableValueLabel>(DraggableValueLabel::Format::Integer);
-    timeSigDenominatorLabel->setRange(MIN_TIME_SIGNATURE_VALUE, MAX_TIME_SIGNATURE_VALUE,
-                                      DEFAULT_TIME_SIGNATURE_DENOMINATOR);
+    timeSigDenominatorLabel->setRange(1.0, 32.0, 4.0);
     timeSigDenominatorLabel->setValue(static_cast<double>(timeSignatureDenominator),
                                       juce::dontSendNotification);
     timeSigDenominatorLabel->setTextColour(DarkTheme::getColour(DarkTheme::TEXT_PRIMARY));
@@ -959,8 +955,8 @@ void TransportPanel::setupTempoAndQuantize() {
     timeSigDenominatorLabel->setSnapToInteger(true);
     timeSigDenominatorLabel->setJustification(juce::Justification::centredLeft);
     timeSigDenominatorLabel->onValueChange = [this]() {
-        timeSignatureDenominator = clampTimeSignatureValue(
-            static_cast<int>(std::round(timeSigDenominatorLabel->getValue())));
+        timeSignatureDenominator =
+            static_cast<int>(std::round(timeSigDenominatorLabel->getValue()));
         if (onTimeSignatureChange)
             onTimeSignatureChange(timeSignatureNumerator, timeSignatureDenominator);
     };
@@ -1245,14 +1241,12 @@ void TransportPanel::setPunchRegion(double startTime, double endTime, bool punch
 }
 
 void TransportPanel::setTimeSignature(int numerator, int denominator) {
-    timeSignatureNumerator = clampTimeSignatureValue(numerator);
-    timeSignatureDenominator = clampTimeSignatureValue(denominator);
+    timeSignatureNumerator = numerator;
+    timeSignatureDenominator = denominator;
 
     // Update time signature display
-    timeSigNumeratorLabel->setValue(static_cast<double>(timeSignatureNumerator),
-                                    juce::dontSendNotification);
-    timeSigDenominatorLabel->setValue(static_cast<double>(timeSignatureDenominator),
-                                      juce::dontSendNotification);
+    timeSigNumeratorLabel->setValue(static_cast<double>(numerator), juce::dontSendNotification);
+    timeSigDenominatorLabel->setValue(static_cast<double>(denominator), juce::dontSendNotification);
 
     // Update beats per bar on BarsBeatsTicksLabels
     playheadPositionLabel->setBeatsPerBar(numerator);
@@ -1273,7 +1267,7 @@ void TransportPanel::setTimeSignature(int numerator, int denominator) {
 }
 
 void TransportPanel::setTempo(double bpm) {
-    currentTempo = clampBpm(bpm);
+    currentTempo = juce::jlimit(20.0, 999.0, bpm);
     tempoLabel->setValue(currentTempo, juce::dontSendNotification);
 
     // Refresh all displays with new tempo

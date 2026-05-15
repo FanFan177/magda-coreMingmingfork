@@ -67,10 +67,10 @@ void ClipInspector::resized() {
     int fieldWidth =
         juce::jmax(1, (containerWidth - iconSize - gap * timingFieldCount) / timingFieldCount);
 
-    // Position row: position icon — start, end, len (arrangement clips only)
+    // Position row: position icon — start, end, offset (arrangement clips only)
     if (clipPositionIcon_->isVisible()) {
-        clipLengthLabel_.setVisible(!hideSecondaryTimingFields);
-        clipLengthValue_->setVisible(!hideSecondaryTimingFields);
+        clipOffsetLabel_.setVisible(!hideSecondaryTimingFields);
+        clipContentOffsetValue_->setVisible(!hideSecondaryTimingFields);
 
         auto labelRow = addRow(labelHeight);
         labelRow.removeFromLeft(iconSize + gap);
@@ -79,7 +79,7 @@ void ClipInspector::resized() {
         clipEndLabel_.setBounds(labelRow.removeFromLeft(fieldWidth));
         if (!hideSecondaryTimingFields) {
             labelRow.removeFromLeft(gap);
-            clipLengthLabel_.setBounds(labelRow.removeFromLeft(fieldWidth));
+            clipOffsetLabel_.setBounds(labelRow.removeFromLeft(fieldWidth));
         }
 
         auto valueRow = addRow(valueHeight);
@@ -90,7 +90,7 @@ void ClipInspector::resized() {
         clipEndValue_->setBounds(valueRow.removeFromLeft(fieldWidth));
         if (!hideSecondaryTimingFields) {
             valueRow.removeFromLeft(gap);
-            clipLengthValue_->setBounds(valueRow.removeFromLeft(fieldWidth));
+            clipContentOffsetValue_->setBounds(valueRow.removeFromLeft(fieldWidth));
         }
 
         addSeparator();
@@ -102,7 +102,7 @@ void ClipInspector::resized() {
         addSeparator();
     }
 
-    // Loop row: loop toggle + start | end | offset/phase (start/end greyed when loop is off)
+    // Loop row: loop toggle + lstart | lend | phase (always shown; greyed when off)
     if (clipLoopToggle_->isVisible()) {
         clipLoopPhaseLabel_.setVisible(!hideSecondaryTimingFields);
         clipLoopPhaseValue_->setVisible(!hideSecondaryTimingFields);
@@ -337,7 +337,7 @@ void ClipInspector::resized() {
     }
 
     // Separator: after last visible section, before launch controls
-    if (launchQuantizeLabel_.isVisible() || followActionLabel_.isVisible())
+    if (launchQuantizeLabel_.isVisible())
         addSeparator();
 
     // Session clip launch properties
@@ -350,24 +350,6 @@ void ClipInspector::resized() {
         launchQuantizeLabel_.setBounds(addRow(16));
         addSpace(4);
         launchQuantizeCombo_.setBounds(addRow(22).reduced(0, 1));
-    }
-    if (followActionLabel_.isVisible()) {
-        addSpace(8);
-        followActionLabel_.setBounds(addRow(16));
-        addSpace(4);
-        followActionCombo_.setBounds(addRow(22).reduced(0, 1));
-    }
-    if (followActionDelayLabel_.isVisible()) {
-        addSpace(8);
-        followActionDelayLabel_.setBounds(addRow(16));
-        addSpace(4);
-        followActionDelaySlider_.setBounds(addRow(24).reduced(0, 1));
-    }
-    if (followActionLoopCountLabel_.isVisible()) {
-        addSpace(8);
-        followActionLoopCountLabel_.setBounds(addRow(16));
-        addSpace(4);
-        followActionLoopCountSlider_.setBounds(addRow(24).reduced(0, 1));
     }
 
     // Set container bounds to accommodate all content

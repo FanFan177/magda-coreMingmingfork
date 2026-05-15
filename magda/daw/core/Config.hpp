@@ -189,15 +189,6 @@ class Config {
         uiScale = scale;
     }
 
-    // Font size scale for MAGDA-owned UI fonts. This is independent from
-    // Desktop UI scale, which changes both text and component geometry.
-    double getUIFontScale() const {
-        return uiFontScale;
-    }
-    void setUIFontScale(double scale) {
-        uiFontScale = std::clamp(scale, 0.8, 1.5);
-    }
-
     // Audio Device Configuration
     std::string getPreferredAudioDevice() const {
         return preferredAudioDevice;
@@ -719,21 +710,6 @@ class Config {
         midiLearnDefaultScope_ = scope;
     }
 
-    // MCP Server Configuration
-    struct MCPServerConfig {
-        std::string name;
-        std::string command;
-        std::vector<std::string> args;
-        bool enabled = true;
-    };
-
-    std::vector<MCPServerConfig> getMCPServers() const {
-        return mcpServers;
-    }
-    void setMCPServers(const std::vector<MCPServerConfig>& servers) {
-        mcpServers = servers;
-    }
-
     // Save/load to platform-appropriate location:
     //   macOS  ~/Library/Application Support/MAGDA/config.json
     //   Windows  %APPDATA%\MAGDA\config.json
@@ -807,9 +783,6 @@ class Config {
 
     // UI scale: 0 = Auto (pick from display DPI), otherwise an explicit factor (1.0, 1.25, …)
     double uiScale = 0.0;
-
-    // UI font scale: multiplier applied by FontManager to app-owned text fonts.
-    double uiFontScale = 1.0;
 
     // Recent projects (most recent first, max 10)
     std::vector<std::string> recentProjects;
@@ -885,9 +858,6 @@ class Config {
     int localLlamaPort = 8080;
     int localLlamaGpuLayers = -1;  // -1 = auto
     int localLlamaContextSize = 4096;
-
-    // MCP server configs
-    std::vector<MCPServerConfig> mcpServers;
 
     std::vector<ConfigListener*> listeners_;
 

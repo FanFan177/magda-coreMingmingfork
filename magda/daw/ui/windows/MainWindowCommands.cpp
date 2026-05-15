@@ -23,29 +23,6 @@
 
 namespace magda {
 
-namespace {
-
-double timelineStartSeconds(const ClipInfo& clip, double bpm) {
-    return clip.getTimelineStart(bpm);
-}
-
-double timelineEndSeconds(const ClipInfo& clip, double bpm) {
-    return clip.getTimelineEnd(bpm);
-}
-
-bool containsTimelineTime(const ClipInfo& clip, double timeSeconds, double bpm) {
-    return timeSeconds > timelineStartSeconds(clip, bpm) &&
-           timeSeconds < timelineEndSeconds(clip, bpm);
-}
-
-bool overlapsTimelineRange(const ClipInfo& clip, double startSeconds, double endSeconds,
-                           double bpm) {
-    return timelineStartSeconds(clip, bpm) < endSeconds &&
-           timelineEndSeconds(clip, bpm) > startSeconds;
-}
-
-}  // namespace
-
 // ============================================================================
 // Command Handling Implementation
 // ============================================================================
@@ -399,7 +376,7 @@ bool MainWindow::MainComponent::perform(const InvocationInfo& info) {
                         }
                     }
 
-                    auto cmd = std::make_unique<PasteClipCommand>(BeatPosition{0.0}, targetTrack,
+                    auto cmd = std::make_unique<PasteClipCommand>(0.0, targetTrack,
                                                                   ClipView::Session, targetScene);
                     auto* cmdPtr = cmd.get();
                     UndoManager::getInstance().executeCommand(std::move(cmd));
@@ -424,11 +401,8 @@ bool MainWindow::MainComponent::perform(const InvocationInfo& info) {
                         }
                     }
 
-                    const double bpm =
-                        mainView ? mainView->getTimelineController().getState().tempo.bpm : 120.0;
-                    auto cmd =
-                        std::make_unique<PasteClipCommand>(BeatPosition{pasteTime * bpm / 60.0},
-                                                           INVALID_TRACK_ID, ClipView::Arrangement);
+                    auto cmd = std::make_unique<PasteClipCommand>(pasteTime, INVALID_TRACK_ID,
+                                                                  ClipView::Arrangement);
                     auto* cmdPtr = cmd.get();
                     UndoManager::getInstance().executeCommand(std::move(cmd));
 
@@ -452,8 +426,7 @@ bool MainWindow::MainComponent::perform(const InvocationInfo& info) {
                 clipManager.copyTimeRangeToClipboard(sel.startTime, sel.endTime, trackIds,
                                                      state.tempo.bpm);
                 if (clipManager.hasClipsInClipboard()) {
-                    auto cmd = std::make_unique<PasteClipCommand>(
-                        BeatPosition{sel.endTime * state.tempo.bpm / 60.0});
+                    auto cmd = std::make_unique<PasteClipCommand>(sel.endTime);
                     UndoManager::getInstance().executeCommand(std::move(cmd));
 
                     // Clear clip selection so the time selection stays as active context
@@ -650,9 +623,6 @@ bool MainWindow::MainComponent::perform(const InvocationInfo& info) {
 
         case joinClips:
             if (selectedClips.size() >= 2) {
-                double tempo =
-                    mainView ? mainView->getTimelineController().getState().tempo.bpm : 120.0;
-
                 // Sort clips by start time
                 std::vector<ClipId> sortedClips(selectedClips.begin(), selectedClips.end());
                 std::sort(sortedClips.begin(), sortedClips.end(), [&](ClipId a, ClipId b) {
@@ -660,8 +630,11 @@ bool MainWindow::MainComponent::perform(const InvocationInfo& info) {
                     auto* cb = clipManager.getClip(b);
                     if (!ca || !cb)
                         return false;
-                    return timelineStartSeconds(*ca, tempo) < timelineStartSeconds(*cb, tempo);
+                    return ca->startTime < cb->startTime;
                 });
+
+                double tempo =
+                    mainView ? mainView->getTimelineController().getState().tempo.bpm : 120.0;
 
                 // Join sequentially: left absorbs right, then result absorbs next, etc.
                 if (sortedClips.size() > 2) {
@@ -702,17 +675,15 @@ bool MainWindow::MainComponent::perform(const InvocationInfo& info) {
                     double trimStart = state.selection.startTime;
                     double trimEnd = state.selection.endTime;
 
-                    const auto selectedTrackIds = resolveTimeSelectionTrackIds();
-                    const std::unordered_set<TrackId> selectedTrackSet(selectedTrackIds.begin(),
-                                                                       selectedTrackIds.end());
-
                     std::vector<ClipId> clipsToSplit;
-                    for (const auto& clip : clipManager.getArrangementClips()) {
-                        const bool trackInSelection = state.selection.isAllTracks() ||
-                                                      selectedTrackSet.count(clip.trackId) > 0;
-                        if (trackInSelection &&
-                            overlapsTimelineRange(clip, trimStart, trimEnd, tempo)) {
-                            clipsToSplit.push_back(clip.id);
+                    if (!selectedClips.empty()) {
+                        clipsToSplit.assign(selectedClips.begin(), selectedClips.end());
+                    } else {
+                        for (const auto& clip : clipManager.getArrangementClips()) {
+                            double clipEnd = clip.startTime + clip.length;
+                            if (clip.startTime < trimEnd && clipEnd > trimStart) {
+                                clipsToSplit.push_back(clip.id);
+                            }
                         }
                     }
 
@@ -726,17 +697,16 @@ bool MainWindow::MainComponent::perform(const InvocationInfo& info) {
                             if (!clip)
                                 continue;
 
-                            double clipStart = timelineStartSeconds(*clip, tempo);
-                            double clipEnd = timelineEndSeconds(*clip, tempo);
-                            if (clipStart >= trimEnd || clipEnd <= trimStart)
+                            double clipEnd = clip->startTime + clip->length;
+                            if (clip->startTime >= trimEnd || clipEnd <= trimStart)
                                 continue;
 
                             ClipId currentClipId = clipId;
 
                             // Split at left edge if clip extends before selection
-                            if (clipStart < trimStart && trimStart < clipEnd) {
+                            if (clip->startTime < trimStart && trimStart < clipEnd) {
                                 auto splitCmd = std::make_unique<SplitClipCommand>(
-                                    currentClipId, BeatPosition{trimStart * tempo / 60.0}, tempo);
+                                    currentClipId, trimStart, tempo);
                                 auto* cmdPtr = splitCmd.get();
                                 UndoManager::getInstance().executeCommand(std::move(splitCmd));
                                 currentClipId = cmdPtr->getRightClipId();
@@ -744,13 +714,13 @@ bool MainWindow::MainComponent::perform(const InvocationInfo& info) {
                                 clip = clipManager.getClip(currentClipId);
                                 if (!clip)
                                     continue;
-                                clipEnd = timelineEndSeconds(*clip, tempo);
+                                clipEnd = clip->startTime + clip->length;
                             }
 
                             // Split at right edge if clip extends after selection
                             if (trimEnd < clipEnd) {
-                                auto splitCmd = std::make_unique<SplitClipCommand>(
-                                    currentClipId, BeatPosition{trimEnd * tempo / 60.0}, tempo);
+                                auto splitCmd = std::make_unique<SplitClipCommand>(currentClipId,
+                                                                                   trimEnd, tempo);
                                 UndoManager::getInstance().executeCommand(std::move(splitCmd));
                             }
 
@@ -782,14 +752,16 @@ bool MainWindow::MainComponent::perform(const InvocationInfo& info) {
 
                         for (auto cid : selectedClips) {
                             const auto* clip = clipManager.getClip(cid);
-                            if (clip && containsTimelineTime(*clip, splitTime, tempo)) {
+                            if (clip && splitTime > clip->startTime &&
+                                splitTime < clip->startTime + clip->length) {
                                 clipsToSplit.push_back(cid);
                             }
                         }
 
                         if (clipsToSplit.empty()) {
                             for (const auto& clip : clipManager.getArrangementClips()) {
-                                if (containsTimelineTime(clip, splitTime, tempo)) {
+                                if (splitTime > clip.startTime &&
+                                    splitTime < clip.startTime + clip.length) {
                                     clipsToSplit.push_back(clip.id);
                                 }
                             }
@@ -800,8 +772,8 @@ bool MainWindow::MainComponent::perform(const InvocationInfo& info) {
                                 UndoManager::getInstance().beginCompoundOperation("Split Clips");
                             }
                             for (auto cid : clipsToSplit) {
-                                auto cmd = std::make_unique<SplitClipCommand>(
-                                    cid, BeatPosition{splitTime * tempo / 60.0}, tempo);
+                                auto cmd =
+                                    std::make_unique<SplitClipCommand>(cid, splitTime, tempo);
                                 UndoManager::getInstance().executeCommand(std::move(cmd));
                             }
                             if (clipsToSplit.size() > 1) {
@@ -891,9 +863,8 @@ bool MainWindow::MainComponent::perform(const InvocationInfo& info) {
             if (selectedClipId != INVALID_CLIP_ID) {
                 const auto* clip = clipManager.getClip(selectedClipId);
                 if (clip && mainView) {
-                    double tempo = mainView->getTimelineController().getState().tempo.bpm;
-                    mainView->getTimelineController().dispatch(SetLoopRegionEvent{
-                        timelineStartSeconds(*clip, tempo), timelineEndSeconds(*clip, tempo)});
+                    mainView->getTimelineController().dispatch(
+                        SetLoopRegionEvent{clip->startTime, clip->getEndTime()});
                 }
             }
             return true;

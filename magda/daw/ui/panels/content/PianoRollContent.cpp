@@ -12,7 +12,6 @@
 #include "core/ChordAnnotationCommands.hpp"
 #include "core/MidiNoteCommands.hpp"
 #include "core/SelectionManager.hpp"
-#include "core/TempoUtils.hpp"
 #include "core/TrackManager.hpp"
 #include "core/UndoManager.hpp"
 #include "music/ChordEngine.hpp"
@@ -156,10 +155,11 @@ PianoRollContent::~PianoRollContent() {
 
 void PianoRollContent::setupGridCallbacks() {
     // Handle note addition
-    gridComponent_->onNoteAdded = [](magda::ClipId clipId, double beat, int noteNumber,
-                                     double lengthBeats, int velocity) {
+    gridComponent_->onNoteAdded = [this](magda::ClipId clipId, double beat, int noteNumber,
+                                         int velocity) {
+        double defaultLength = gridComponent_->getGridResolutionBeats();
         auto cmd = std::make_unique<magda::AddMidiNoteCommand>(clipId, beat, noteNumber,
-                                                               lengthBeats, velocity);
+                                                               defaultLength, velocity);
         magda::UndoManager::getInstance().executeCommand(std::move(cmd));
         // Note: UI refresh handled via ClipManagerListener::clipPropertyChanged()
     };
@@ -1364,7 +1364,7 @@ void PianoRollContent::detectChordsFromNotes() {
     if (!clip || clip->midiNotes.empty())
         return;
 
-    int beatsPerBar = magda::DEFAULT_TIME_SIGNATURE_NUMERATOR;
+    int beatsPerBar = 4;
     if (auto* controller = magda::TimelineController::getCurrent())
         beatsPerBar = controller->getState().tempo.timeSignatureNumerator;
 

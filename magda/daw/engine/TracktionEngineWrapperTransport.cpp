@@ -2,7 +2,6 @@
 #include "../audio/session/SessionClipScheduler.hpp"
 #include "../audio/session/SessionRecorder.hpp"
 #include "../core/ClipManager.hpp"
-#include "../core/TempoUtils.hpp"
 #include "../core/TrackManager.hpp"
 #include "../core/ViewModeController.hpp"
 #include "TracktionEngineWrapper.hpp"
@@ -202,7 +201,6 @@ bool TracktionEngineWrapper::isRecording() const {
 }
 
 void TracktionEngineWrapper::setTempo(double bpm) {
-    bpm = clampBpm(bpm);
     if (currentEdit_) {
         auto& tempoSeq = currentEdit_->tempoSequence;
         if (tempoSeq.getNumTempos() > 0) {
@@ -219,7 +217,7 @@ double TracktionEngineWrapper::getTempo() const {
         auto timePos = tracktion::TimePosition::fromSeconds(0.0);
         return currentEdit_->tempoSequence.getTempoAt(timePos).getBpm();
     }
-    return DEFAULT_BPM;
+    return 120.0;
 }
 
 void TracktionEngineWrapper::setTimeSignature(int numerator, int denominator) {

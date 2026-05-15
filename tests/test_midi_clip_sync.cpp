@@ -17,22 +17,14 @@
  * - Notes beyond clip boundary are handled correctly
  */
 
-namespace {
-constexpr double kTestBpm = 120.0;
-
-void setPlacementBeats(magda::ClipInfo& clip, double startBeat, double lengthBeats) {
-    clip.setPlacementBeats(startBeat, lengthBeats);
-    clip.deriveTimesFromBeats(kTestBpm);
-}
-}  // namespace
-
 TEST_CASE("MidiNote - Clip-relative storage", "[midi][clip][storage]") {
     using namespace magda;
 
     SECTION("Notes are stored relative to clip start") {
         ClipInfo clip;
         clip.setMidiContent();
-        setPlacementBeats(clip, 8.0, 16.0);  // Clip at 4 seconds, 8 seconds long at 120 BPM
+        clip.startTime = 4.0;  // Clip at 4 seconds (bar 2 at 120 BPM)
+        clip.length = 8.0;     // 4 bars
 
         MidiNote note;
         note.startBeat = 0.0;  // Relative to clip start
@@ -47,15 +39,15 @@ TEST_CASE("MidiNote - Clip-relative storage", "[midi][clip][storage]") {
 
         // Absolute timeline position would be: clipStart + noteStart
         // In this case: 4.0s + 0 beats = 4.0s (but note stores 0, not 4)
-        REQUIRE(clip.placement.startBeat == Catch::Approx(8.0));
-        REQUIRE(clip.startTime == Catch::Approx(4.0));
-        REQUIRE(clip.midiNotes[0].startBeat != clip.placement.startBeat);
+        REQUIRE(clip.startTime == 4.0);
+        REQUIRE(clip.midiNotes[0].startBeat != clip.startTime);
     }
 
     SECTION("Multiple notes at different clip-relative positions") {
         ClipInfo clip;
         clip.setMidiContent();
-        setPlacementBeats(clip, 0.0, 16.0);
+        clip.startTime = 0.0;
+        clip.length = 8.0;
 
         // Add notes at beats 0, 1, 2, 3 (clip-relative)
         for (int i = 0; i < 4; i++) {
@@ -81,7 +73,8 @@ TEST_CASE("MidiClip - Position changes don't affect notes", "[midi][clip][positi
     SECTION("Moving clip preserves note positions") {
         ClipInfo clip;
         clip.setMidiContent();
-        setPlacementBeats(clip, 0.0, 16.0);
+        clip.startTime = 0.0;
+        clip.length = 8.0;
 
         MidiNote note;
         note.startBeat = 2.0;  // Note at beat 2 within clip
@@ -92,8 +85,8 @@ TEST_CASE("MidiClip - Position changes don't affect notes", "[midi][clip][positi
 
         double originalNoteBeat = clip.midiNotes[0].startBeat;
 
-        // Move clip to a different timeline position
-        setPlacementBeats(clip, 20.0, clip.placement.lengthBeats);
+        // Move clip to different timeline position
+        clip.startTime = 10.0;  // Move to bar 5
 
         // Note position within clip should be unchanged
         REQUIRE(clip.midiNotes[0].startBeat == originalNoteBeat);
@@ -103,7 +96,8 @@ TEST_CASE("MidiClip - Position changes don't affect notes", "[midi][clip][positi
     SECTION("Moving clip multiple times preserves notes") {
         ClipInfo clip;
         clip.setMidiContent();
-        setPlacementBeats(clip, 0.0, 8.0);
+        clip.startTime = 0.0;
+        clip.length = 4.0;
 
         MidiNote note;
         note.startBeat = 1.5;
@@ -113,13 +107,13 @@ TEST_CASE("MidiClip - Position changes don't affect notes", "[midi][clip][positi
         clip.midiNotes.push_back(note);
 
         // Move clip multiple times
-        setPlacementBeats(clip, 4.0, clip.placement.lengthBeats);
+        clip.startTime = 2.0;
         REQUIRE(clip.midiNotes[0].startBeat == 1.5);
 
-        setPlacementBeats(clip, 16.0, clip.placement.lengthBeats);
+        clip.startTime = 8.0;
         REQUIRE(clip.midiNotes[0].startBeat == 1.5);
 
-        setPlacementBeats(clip, 0.0, clip.placement.lengthBeats);
+        clip.startTime = 0.0;
         REQUIRE(clip.midiNotes[0].startBeat == 1.5);
     }
 }
@@ -130,7 +124,8 @@ TEST_CASE("MidiClip - Length changes preserve note positions", "[midi][clip][len
     SECTION("Shortening clip from end preserves notes at start") {
         ClipInfo clip;
         clip.setMidiContent();
-        setPlacementBeats(clip, 0.0, 32.0);
+        clip.startTime = 0.0;
+        clip.length = 16.0;  // 16 seconds = 32 beats = 8 bars at 120 BPM
 
         // Add 4 notes at beats 0, 1, 2, 3
         for (int i = 0; i < 4; i++) {
@@ -142,8 +137,8 @@ TEST_CASE("MidiClip - Length changes preserve note positions", "[midi][clip][len
             clip.midiNotes.push_back(note);
         }
 
-        // Shorten clip to 2 bars
-        setPlacementBeats(clip, clip.placement.startBeat, 8.0);
+        // Shorten clip to 2 bars (4 seconds = 8 beats at 120 BPM)
+        clip.length = 4.0;
 
         // ALL notes should still have same positions
         REQUIRE(clip.midiNotes[0].startBeat == 0.0);
@@ -152,7 +147,7 @@ TEST_CASE("MidiClip - Length changes preserve note positions", "[midi][clip][len
         REQUIRE(clip.midiNotes[3].startBeat == 3.0);
 
         // Notes are within new clip length, so they should all play
-        double clipLengthInBeats = clip.placement.lengthBeats;
+        double clipLengthInBeats = 8.0;  // 4 seconds = 8 beats at 120 BPM
         for (const auto& note : clip.midiNotes) {
             REQUIRE(note.startBeat < clipLengthInBeats);
         }
@@ -161,7 +156,8 @@ TEST_CASE("MidiClip - Length changes preserve note positions", "[midi][clip][len
     SECTION("Extending clip doesn't shift existing notes") {
         ClipInfo clip;
         clip.setMidiContent();
-        setPlacementBeats(clip, 4.0, 4.0);
+        clip.startTime = 2.0;
+        clip.length = 2.0;  // 2 seconds = 4 beats = 1 bar at 120 BPM
 
         MidiNote note;
         note.startBeat = 0.5;
@@ -172,8 +168,8 @@ TEST_CASE("MidiClip - Length changes preserve note positions", "[midi][clip][len
 
         double originalBeat = clip.midiNotes[0].startBeat;
 
-        // Extend clip to 4 bars
-        setPlacementBeats(clip, clip.placement.startBeat, 16.0);
+        // Extend clip to 4 bars (8 seconds = 16 beats at 120 BPM)
+        clip.length = 8.0;
 
         // Note position unchanged
         REQUIRE(clip.midiNotes[0].startBeat == originalBeat);
@@ -187,7 +183,8 @@ TEST_CASE("MidiClip - Notes beyond clip boundary", "[midi][clip][boundary]") {
     SECTION("Identify notes within clip length") {
         ClipInfo clip;
         clip.setMidiContent();
-        setPlacementBeats(clip, 0.0, 8.0);
+        clip.startTime = 0.0;
+        clip.length = 4.0;  // 4 seconds = 8 beats = 2 bars at 120 BPM
 
         // Add notes at various positions
         MidiNote note1;
@@ -208,7 +205,7 @@ TEST_CASE("MidiClip - Notes beyond clip boundary", "[midi][clip][boundary]") {
         note3.noteNumber = 67;
         clip.midiNotes.push_back(note3);
 
-        double clipLengthInBeats = clip.placement.lengthBeats;
+        double clipLengthInBeats = 8.0;  // 4 seconds = 8 beats at 120 BPM
 
         // Check which notes are within boundary
         REQUIRE(clip.midiNotes[0].startBeat < clipLengthInBeats);  // note1: YES
@@ -219,7 +216,8 @@ TEST_CASE("MidiClip - Notes beyond clip boundary", "[midi][clip][boundary]") {
     SECTION("Notes at clip boundaries") {
         ClipInfo clip;
         clip.setMidiContent();
-        setPlacementBeats(clip, 0.0, 4.0);
+        clip.startTime = 0.0;
+        clip.length = 2.0;  // Exactly 1 bar = 4 beats at 120 BPM
 
         MidiNote noteAtStart;
         noteAtStart.startBeat = 0.0;  // Exactly at start
@@ -233,7 +231,7 @@ TEST_CASE("MidiClip - Notes beyond clip boundary", "[midi][clip][boundary]") {
         noteAtEnd.noteNumber = 64;
         clip.midiNotes.push_back(noteAtEnd);
 
-        double clipLengthInBeats = clip.placement.lengthBeats;
+        double clipLengthInBeats = 4.0;
 
         REQUIRE(clip.midiNotes[0].startBeat == 0.0);
         REQUIRE(clip.midiNotes[0].startBeat < clipLengthInBeats);
@@ -249,7 +247,7 @@ TEST_CASE("MidiNoteCommands - Observer pattern", "[midi][commands][observer]") {
         ClipManager::getInstance().shutdown();
 
         // Create a clip
-        ClipId clipId = ClipManager::getInstance().createMidiClipBeats(1, 0.0, 16.0);
+        ClipId clipId = ClipManager::getInstance().createMidiClip(1, 0.0, 8.0);
         REQUIRE(clipId != INVALID_CLIP_ID);
 
         // Add note via command
@@ -284,7 +282,8 @@ TEST_CASE("MidiClip - Real-world scenario", "[midi][clip][integration]") {
 
         ClipInfo clip;
         clip.setMidiContent();
-        setPlacementBeats(clip, 0.0, 16.0);
+        clip.startTime = 0.0;  // Bar 1
+        clip.length = 8.0;     // 8 seconds = 16 beats = 4 bars at 120 BPM
 
         // Add 4 notes at start
         for (int i = 0; i < 4; i++) {
@@ -298,11 +297,11 @@ TEST_CASE("MidiClip - Real-world scenario", "[midi][clip][integration]") {
 
         // Verify initial state
         REQUIRE(clip.midiNotes.size() == 4);
-        REQUIRE(clip.placement.startBeat == Catch::Approx(0.0));
-        REQUIRE(clip.placement.lengthBeats == Catch::Approx(16.0));
+        REQUIRE(clip.startTime == 0.0);
+        REQUIRE(clip.length == 8.0);
 
-        // Resize from bar 5 to bar 4
-        setPlacementBeats(clip, clip.placement.startBeat, 12.0);
+        // Resize from bar 5 to bar 4 (shorten by 1 bar = 2 seconds)
+        clip.length = 6.0;  // 3 bars
 
         // CRITICAL: Note positions must be unchanged
         REQUIRE(clip.midiNotes[0].startBeat == 0.0);
@@ -311,13 +310,13 @@ TEST_CASE("MidiClip - Real-world scenario", "[midi][clip][integration]") {
         REQUIRE(clip.midiNotes[3].startBeat == 3.0);
 
         // All notes still within the shortened clip (6 seconds = 12 beats)
-        double clipLengthInBeats = clip.placement.lengthBeats;
+        double clipLengthInBeats = 12.0;
         for (const auto& note : clip.midiNotes) {
             REQUIRE(note.startBeat < clipLengthInBeats);
         }
 
         // Clip start unchanged
-        REQUIRE(clip.placement.startBeat == Catch::Approx(0.0));
+        REQUIRE(clip.startTime == 0.0);
     }
 }
 

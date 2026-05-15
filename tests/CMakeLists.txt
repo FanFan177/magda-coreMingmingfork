@@ -58,10 +58,6 @@ set(TEST_SOURCES
     test_automation_modes.cpp
     test_automation_singleton.cpp
     test_compact_executor_context.cpp
-    # Faust pool refactor (Phase 1: metadata parser)
-    test_faust_metadata_parser.cpp
-    test_faust_param_pool.cpp
-    test_faust_param_info.cpp
     # Parameter alias system tests (PR 1)
     test_param_name_normalize.cpp
     test_alias_parser.cpp
@@ -158,7 +154,6 @@ target_sources(magda_juce_tests PRIVATE
     ../magda/daw/ui/panels/content/inspector/clip/ClipInspectorState.cpp
     ../magda/daw/ui/panels/content/inspector/clip/sections/ClipFadesSection.cpp
     ../magda/daw/ui/components/common/BarsBeatsTicksLabel.cpp
-    ../magda/daw/ui/components/common/ValueLabelControl.cpp
     ../magda/daw/ui/components/common/DraggableValueLabel.cpp
     ../magda/daw/ui/components/common/SvgButton.cpp
     ../magda/daw/ui/themes/FontManager.cpp
@@ -172,11 +167,7 @@ target_link_libraries(magda_juce_tests
     juce::juce_core
     juce::juce_events
     juce::juce_gui_basics
-    # Linux: juce_gui_extra is pulled in transitively via magda_daw's
-    # JUCE_MODULE_AVAILABLE flags (so its .cpp gets compiled into this
-    # target). Its compilation requires GTK / WebKit headers — expose
-    # the same pkgconfig deps the GUI app uses, plus curl.
-    $<$<PLATFORM_ID:Linux>:juce::pkgconfig_JUCE_BROWSER_LINUX_DEPS>
+    # Link curl dependencies on Linux
     $<$<PLATFORM_ID:Linux>:juce::pkgconfig_JUCE_CURL_LINUX_DEPS>
 )
 

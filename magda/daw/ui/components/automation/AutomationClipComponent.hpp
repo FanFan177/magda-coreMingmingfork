@@ -10,6 +10,8 @@
 
 namespace magda {
 
+class AutomationLaneComponent;
+
 /**
  * @brief Automation clip for clip-based automation
  *
@@ -20,7 +22,7 @@ class AutomationClipComponent : public juce::Component,
                                 public AutomationManagerListener,
                                 public SelectionManagerListener {
   public:
-    explicit AutomationClipComponent(AutomationClipId clipId);
+    AutomationClipComponent(AutomationClipId clipId, AutomationLaneComponent* parent);
     ~AutomationClipComponent() override;
 
     // Component
@@ -54,27 +56,28 @@ class AutomationClipComponent : public juce::Component,
     void setSelected(bool selected);
 
     // Configuration
-    void setPixelsPerBeat(double ppb) {
-        pixelsPerBeat_ = ppb;
+    void setPixelsPerSecond(double pps) {
+        pixelsPerSecond_ = pps;
     }
-    double getPixelsPerBeat() const {
-        return pixelsPerBeat_;
+    double getPixelsPerSecond() const {
+        return pixelsPerSecond_;
     }
 
     // Callbacks
     std::function<void(AutomationClipId)> onClipSelected;
-    std::function<void(AutomationClipId, double)> onClipMoved;  // clipId, newStartBeat
+    std::function<void(AutomationClipId, double)> onClipMoved;  // clipId, newStartTime
     std::function<void(AutomationClipId, double, bool)>
-        onClipResized;  // clipId, newLengthBeats, fromStart
+        onClipResized;  // clipId, newLength, fromStart
     std::function<void(AutomationClipId)> onClipDoubleClicked;
-    std::function<double(double)> snapBeatToGrid;
+    std::function<double(double)> snapTimeToGrid;
 
     // Resize edge detection
     static constexpr int RESIZE_EDGE_WIDTH = 6;
 
   private:
     AutomationClipId clipId_;
-    double pixelsPerBeat_ = 10.0;
+    AutomationLaneComponent* parentLane_;
+    double pixelsPerSecond_ = 100.0;
 
     bool isSelected_ = false;
     bool isHovered_ = false;
@@ -84,10 +87,10 @@ class AutomationClipComponent : public juce::Component,
     bool isDragging_ = false;
 
     juce::Point<int> dragStartPos_;
-    double dragStartBeat_ = 0.0;
-    double dragStartLengthBeats_ = 0.0;
-    double previewStartBeat_ = 0.0;
-    double previewLengthBeats_ = 0.0;
+    double dragStartTime_ = 0.0;
+    double dragStartLength_ = 0.0;
+    double previewStartTime_ = 0.0;
+    double previewLength_ = 0.0;
 
     // Helpers
     bool isOnLeftEdge(int x) const {

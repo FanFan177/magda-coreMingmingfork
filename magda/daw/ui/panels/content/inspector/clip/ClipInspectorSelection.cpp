@@ -1,6 +1,5 @@
 #include "../../../../state/TimelineController.hpp"
 #include "../ClipInspector.hpp"
-#include "core/TempoUtils.hpp"
 
 namespace magda::daw::ui {
 
@@ -30,7 +29,7 @@ void ClipInspector::clipPropertyChanged(magda::ClipId clipId) {
     // disrupts the drag interaction.  Skip the update for value-only changes.
     bool anyDragging = (clipStartValue_ && clipStartValue_->isDragging()) ||
                        (clipEndValue_ && clipEndValue_->isDragging()) ||
-                       (clipLengthValue_ && clipLengthValue_->isDragging()) ||
+                       (clipContentOffsetValue_ && clipContentOffsetValue_->isDragging()) ||
                        (clipLoopStartValue_ && clipLoopStartValue_->isDragging()) ||
                        (clipLoopEndValue_ && clipLoopEndValue_->isDragging()) ||
                        (clipLoopPhaseValue_ && clipLoopPhaseValue_->isDragging()) ||
@@ -51,7 +50,7 @@ void ClipInspector::clipPropertyChanged(magda::ClipId clipId) {
         if (clip && clip->isAudio()) {
             updateAudioSourceValueDisplays(*clip);
             double projectBPM = 120.0;
-            int beatsPerBar = magda::DEFAULT_TIME_SIGNATURE_NUMERATOR;
+            int beatsPerBar = 4;
             if (timelineController_) {
                 const auto& state = timelineController_->getState();
                 projectBPM = state.tempo.bpm;
