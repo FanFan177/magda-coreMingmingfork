@@ -84,6 +84,7 @@ enum class SelectionType {
     Note,            // MIDI note(s) selected in piano roll
     Device,          // Device selected in track chain
     ChainNode,       // Any node in the chain view (rack, chain, device)
+    MultiChainNode,  // Multiple nodes in the same chain view context
     Mod,             // Individual modulator selected → show mod editor
     Macro,           // Individual macro selected → show macro editor
     ModsPanel,       // Mods panel selected → show mods panel settings
@@ -140,16 +141,22 @@ struct DeviceSelection {
  * @brief Time range selection data
  */
 struct TimeRangeSelection {
-    double startTime = 0.0;
-    double endTime = 0.0;
+    double startTime = 0.0;         // seconds cache derived from beats
+    double endTime = 0.0;           // seconds cache derived from beats
+    double startBeats = 0.0;        // authoritative timeline position
+    double endBeats = 0.0;          // authoritative timeline position
     std::vector<TrackId> trackIds;  // Which tracks are included
 
     bool isValid() const {
-        return endTime > startTime && !trackIds.empty();
+        return endBeats > startBeats && !trackIds.empty();
     }
 
     double getLength() const {
         return endTime - startTime;
+    }
+
+    double getLengthBeats() const {
+        return endBeats - startBeats;
     }
 };
 
@@ -641,6 +648,16 @@ class SelectionManager {
                          const juce::String& displayType);
 
     /**
+     * @brief Toggle a chain node in the current multi-selection.
+     */
+    void toggleChainNodeSelection(const ChainNodePath& path);
+
+    /**
+     * @brief Replace the current chain-node selection with ordered paths.
+     */
+    void selectChainNodes(const std::vector<ChainNodePath>& paths);
+
+    /**
      * @brief Clear chain node selection
      */
     void clearChainNodeSelection();
@@ -650,6 +667,15 @@ class SelectionManager {
      */
     const ChainNodePath& getSelectedChainNode() const {
         return selectedChainNode_;
+    }
+
+    const std::vector<ChainNodePath>& getSelectedChainNodes() const {
+        return selectedChainNodes_;
+    }
+
+    bool isChainNodeSelected(const ChainNodePath& path) const {
+        return std::find(selectedChainNodes_.begin(), selectedChainNodes_.end(), path) !=
+               selectedChainNodes_.end();
     }
 
     /**
@@ -670,7 +696,13 @@ class SelectionManager {
      * @brief Check if there's a valid chain node selection
      */
     bool hasChainNodeSelection() const {
-        return selectionType_ == SelectionType::ChainNode && selectedChainNode_.isValid();
+        return (selectionType_ == SelectionType::ChainNode ||
+                selectionType_ == SelectionType::MultiChainNode) &&
+               selectedChainNode_.isValid();
+    }
+
+    bool hasMultipleChainNodeSelection() const {
+        return selectionType_ == SelectionType::MultiChainNode && selectedChainNodes_.size() > 1;
     }
 
     // ========================================================================
@@ -962,6 +994,14 @@ class SelectionManager {
      */
     void clearSelection();
 
+    /**
+     * @brief Clear the active selection if it points at a chain node that is about to be deleted.
+     *
+     * Device/rack deletion happens in TrackManager, not SelectionManager, so callers need an
+     * explicit hook to avoid leaving the Inspector focused on a stale ChainNodePath.
+     */
+    void clearSelectionForDeletedChainNode(const ChainNodePath& deletedPath);
+
     // ========================================================================
     // Listeners
     // ========================================================================
@@ -990,7 +1030,8 @@ class SelectionManager {
     TimeRangeSelection timeRangeSelection_;
     NoteSelection noteSelection_;
     DeviceSelection deviceSelection_;
-    ChainNodePath selectedChainNode_;    // For exclusive chain node selection
+    ChainNodePath selectedChainNode_;  // For exclusive chain node selection
+    std::vector<ChainNodePath> selectedChainNodes_;
     juce::String chainNodeDisplayName_;  // Optional display override (e.g., pad chain plugin name)
     juce::String chainNodeDisplayType_;  // Optional display override (e.g., pad chain plugin type)
     ModSelection modSelection_;

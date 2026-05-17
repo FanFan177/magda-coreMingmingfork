@@ -86,7 +86,8 @@ class TrackHeadersPanel : public juce::Component,
     // Ghost-header preview: paints one phantom track-header row per label below
     // the last real (non-master) track. Called during drag-to-create flows from
     // both file drops and device drops. Pass an empty StringArray to clear.
-    void setGhostHeaders(const juce::StringArray& labels);
+    void setGhostHeaders(const juce::StringArray& labels,
+                         const juce::StringArray& detailLabels = {});
 
     // Track management
     void selectTrack(int index);
@@ -202,14 +203,14 @@ class TrackHeadersPanel : public juce::Component,
     std::vector<TrackId> visibleTrackIds_;  // Track IDs in display order
     std::unordered_map<TrackId, std::vector<AutomationLaneId>> visibleAutomationLanes_;
 
-    // Per-lane header buttons (snap time / snap value / bypass / delete).
+    // Per-lane header buttons (snap beat grid / snap value / bypass / delete).
     // All four are custom LaneHeaderButton subclasses defined in the .cpp, but
     // the struct only needs to hold them as juce::Button base pointers. Real
     // child components — rebuilt on automationLanesChanged and positioned in
     // updateTrackHeaderLayout.
     struct AutoLaneHeaderButtons {
         AutomationLaneId laneId = INVALID_AUTOMATION_LANE_ID;
-        std::unique_ptr<juce::Button> snapTimeBtn;
+        std::unique_ptr<juce::Button> snapEditGridBtn;
         std::unique_ptr<juce::Button> snapValueBtn;
         std::unique_ptr<juce::Button> bypassBtn;
         std::unique_ptr<juce::Button> deleteBtn;
@@ -278,6 +279,7 @@ class TrackHeadersPanel : public juce::Component,
 
     // Ghost-header preview (file/device drags that will spawn new tracks)
     juce::StringArray ghostHeaderLabels_;
+    juce::StringArray ghostHeaderDetailLabels_;
 
     // Routing device management
     void populateAudioInputOptions(RoutingSelector* selector, TrackId trackId = INVALID_TRACK_ID);

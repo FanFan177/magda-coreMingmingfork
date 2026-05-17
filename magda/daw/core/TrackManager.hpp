@@ -124,6 +124,12 @@ class TrackManager {
     DeviceId allocateDeviceId() {
         return nextDeviceId_++;
     }
+    RackId allocateRackId() {
+        return nextRackId_++;
+    }
+    ChainId allocateChainId() {
+        return nextChainId_++;
+    }
     // Ensure the counter is above a restored ID (prevents collisions on project load)
     void ensureDeviceIdAbove(DeviceId id) {
         nextDeviceId_ = std::max(nextDeviceId_, id + 1);
@@ -308,6 +314,15 @@ class TrackManager {
     void moveDeviceInChain(TrackId trackId, RackId rackId, ChainId chainId, DeviceId deviceId,
                            int newIndex);
     void moveElementInChainByPath(const ChainNodePath& chainPath, int fromIndex, int toIndex);
+    bool moveChainElement(const ChainNodePath& sourceElementPath,
+                          const ChainNodePath& destinationChainPath, int insertIndex);
+    std::vector<ChainElement> copyChainElements(const std::vector<ChainNodePath>& paths) const;
+    bool insertChainElementsByPath(const ChainNodePath& destinationChainPath,
+                                   std::vector<ChainElement> elements, int insertIndex,
+                                   bool reassignIds = true);
+    RackId wrapChainElementsInRack(const std::vector<ChainNodePath>& paths,
+                                   const juce::String& rackName = "Rack");
+    int getChainElementIndex(const ChainNodePath& elementPath);
     DeviceInfo* getDeviceInChain(TrackId trackId, RackId rackId, ChainId chainId,
                                  DeviceId deviceId);
     DeviceInfo* getDeviceInChainByPath(const ChainNodePath& devicePath);
@@ -336,8 +351,13 @@ class TrackManager {
     void updateDeviceParameters(DeviceId deviceId, const std::vector<ParameterInfo>& params);
     void setDeviceVisibleParameters(DeviceId deviceId, const std::vector<int>& visibleParams);
 
-    // Set a specific device parameter value
-    void setDeviceParameterValue(const ChainNodePath& devicePath, int paramIndex, float value);
+    // Set a specific device parameter value in ParameterInfo model units,
+    // not MAGDA-normalized automation/controller units.
+    void setDeviceParameterValue(const ChainNodePath& devicePath, int paramIndex,
+                                 ParameterModelValue value);
+    void setDeviceParameterValue(const ChainNodePath& devicePath, int paramIndex, float value) {
+        setDeviceParameterValue(devicePath, paramIndex, ParameterModelValue{value});
+    }
 
     /**
      * @brief Apply a deserialized DeviceInfo (from a .mps preset) to a live device.
@@ -478,7 +498,8 @@ class TrackManager {
     // bpm parameter is used for tempo-synced LFOs (default 120 if not provided)
     // transportJustStarted/Looped flags trigger phase reset for Transport trigger mode
     void updateAllMods(double deltaTime, double bpm = 120.0, bool transportJustStarted = false,
-                       bool transportJustLooped = false, bool transportJustStopped = false);
+                       bool transportJustLooped = false, bool transportJustStopped = false,
+                       bool transportPlaying = false);
 
     /**
      * @brief Signal that a MIDI note-on was received on a track
@@ -502,6 +523,7 @@ class TrackManager {
 
     struct TransportSnapshot {
         double bpm;
+        bool playing;
         bool justStarted;
         bool justLooped;
         bool justStopped;

@@ -19,6 +19,7 @@ set(TEST_SOURCES
     test_modulation.cpp
     test_control_target.cpp
     test_chain_fingerprint.cpp
+    test_chain_routing_model.cpp
     test_group_tracks_and_macros.cpp
     test_parameter_utils.cpp
     test_update_checker.cpp
@@ -57,7 +58,11 @@ set(TEST_SOURCES
     test_automation_agent.cpp
     test_automation_modes.cpp
     test_automation_singleton.cpp
-    test_compact_executor_context.cpp
+    test_instruction_executor_context.cpp
+    # Faust pool refactor (Phase 1: metadata parser)
+    test_faust_metadata_parser.cpp
+    test_faust_param_pool.cpp
+    test_faust_param_info.cpp
     # Parameter alias system tests (PR 1)
     test_param_name_normalize.cpp
     test_alias_parser.cpp
@@ -143,9 +148,12 @@ target_sources(magda_juce_tests PRIVATE
     # test_export_no_assertion_juce.cpp  # Disabled - see issue #611 (generator device export)
     test_midi_recording_juce.cpp
     test_clip_sync_integration_juce.cpp
+    test_session_slot_recording_juce.cpp
     test_timeline_loop_activation_juce.cpp
     test_midi_signal_routing_juce.cpp
     test_clip_inspector_juce.cpp
+    test_multiband_curve_view_juce.cpp
+    ../magda/daw/ui/components/chain/compiled/CompiledMultibandCurveView.cpp
     ../magda/daw/ui/panels/content/inspector/clip/ClipInspectorInit.cpp
     ../magda/daw/ui/panels/content/inspector/clip/ClipInspectorSections.cpp
     ../magda/daw/ui/panels/content/inspector/clip/ClipInspectorLifecycle.cpp
@@ -154,10 +162,12 @@ target_sources(magda_juce_tests PRIVATE
     ../magda/daw/ui/panels/content/inspector/clip/ClipInspectorState.cpp
     ../magda/daw/ui/panels/content/inspector/clip/sections/ClipFadesSection.cpp
     ../magda/daw/ui/components/common/BarsBeatsTicksLabel.cpp
+    ../magda/daw/ui/components/common/ValueLabelControl.cpp
     ../magda/daw/ui/components/common/DraggableValueLabel.cpp
     ../magda/daw/ui/components/common/SvgButton.cpp
     ../magda/daw/ui/themes/FontManager.cpp
     test_automation_modes_juce.cpp
+    test_arrangement_transport_loop_juce.cpp
 )
 
 # Link required libraries for JUCE tests
@@ -167,9 +177,15 @@ target_link_libraries(magda_juce_tests
     juce::juce_core
     juce::juce_events
     juce::juce_gui_basics
-    # Link curl dependencies on Linux
+    # Linux: juce_gui_extra is pulled in transitively via magda_daw's
+    # JUCE_MODULE_AVAILABLE flags (so its .cpp gets compiled into this
+    # target). Its compilation requires GTK / WebKit headers — expose
+    # the same pkgconfig deps the GUI app uses, plus curl.
+    $<$<PLATFORM_ID:Linux>:juce::pkgconfig_JUCE_BROWSER_LINUX_DEPS>
     $<$<PLATFORM_ID:Linux>:juce::pkgconfig_JUCE_CURL_LINUX_DEPS>
 )
+
+target_compile_definitions(magda_juce_tests PRIVATE MAGDA_ENABLE_TEST_HOOKS=1)
 
 # Include directories for JUCE tests
 target_include_directories(magda_juce_tests
@@ -182,6 +198,13 @@ target_include_directories(magda_juce_tests
     ${CMAKE_SOURCE_DIR}/magda/daw/ui/panels/content
     ${CMAKE_SOURCE_DIR}/magda/daw/ui/state
     ${CMAKE_SOURCE_DIR}/magda/daw/ui/components
+    ${CMAKE_SOURCE_DIR}/magda/daw/ui/components/chain
     ${CMAKE_SOURCE_DIR}/magda/daw/ui/components/common
     ${CMAKE_SOURCE_DIR}/magda/daw/ui/components/common/curve
 )
+
+add_test(NAME arrangement_transport_loop_juce
+         COMMAND magda_juce_tests "Arrangement Transport Loop Tests")
+
+add_test(NAME multiband_curve_view_juce
+         COMMAND magda_juce_tests "Multiband Curve View Tests")

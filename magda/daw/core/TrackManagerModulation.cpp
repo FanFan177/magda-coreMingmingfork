@@ -4,6 +4,7 @@
 #include "../audio/plugins/SidechainTriggerBus.hpp"
 #include "ModulatorEngine.hpp"
 #include "RackInfo.hpp"
+#include "SidechainTraversal.hpp"
 #include "TrackManager.hpp"
 
 namespace magda {
@@ -16,6 +17,7 @@ struct ModTickInputs {
     float audioPeakLevel = 0.0f;
     double deltaTime = 0.0;
     double bpm = 120.0;
+    bool transportPlaying = false;
     bool transportJustStarted = false;
     bool transportJustLooped = false;
     bool transportJustStopped = false;
@@ -227,7 +229,11 @@ void TrackManager::setMacroValue(const ChainNodePath& path, int macroIndex, floa
     if (!indexInRange(node.macros, macroIndex))
         return;
     float clampedValue = juce::jlimit(0.0f, 1.0f, value);
-    (*node.macros)[macroIndex].value = clampedValue;
+    auto& macro = (*node.macros)[macroIndex];
+    if (std::abs(macro.value - clampedValue) <= 1.0e-6f)
+        return;
+
+    macro.value = clampedValue;
     notifyMacroValueChanged(path.trackId, node.scope, node.notifyId(), macroIndex, clampedValue);
 }
 
@@ -591,6 +597,7 @@ void TrackManager::triggerMidiNoteOff(TrackId trackId) {
 
 TrackManager::TransportSnapshot TrackManager::consumeTransportState() {
     return {transportBpm_.load(std::memory_order_acquire),
+            transportPlaying_.load(std::memory_order_acquire),
             transportJustStarted_.exchange(false, std::memory_order_acq_rel),
             transportJustLooped_.exchange(false, std::memory_order_acq_rel),
             transportJustStopped_.exchange(false, std::memory_order_acq_rel)};
@@ -613,7 +620,8 @@ void TrackManager::updateTransportState(bool playing, double bpm, bool justStart
 // ============================================================================
 
 void TrackManager::updateAllMods(double deltaTime, double bpm, bool transportJustStarted,
-                                 bool transportJustLooped, bool transportJustStopped) {
+                                 bool transportJustLooped, bool transportJustStopped,
+                                 bool transportPlaying) {
     // Snapshot MIDI trigger counts (thread-safe)
     std::map<TrackId, int> noteOnsThisTick;
     std::map<TrackId, int> noteOffsThisTick;
@@ -696,15 +704,15 @@ void TrackManager::updateAllMods(double deltaTime, double bpm, bool transportJus
     // scopeMacros / scopeMods are the SAME-scope macros / mods that may
     // target this mod's rate via a ModParam-kind link — used to compute the
     // effective rate so the UI animation matches what the audio LFO does.
-    auto updateMod = [deltaTime, bpm, transportJustStarted, transportJustLooped,
-                      transportJustStopped](ModInfo& mod, bool midiTriggered, bool midiNoteOff,
-                                            float audioPeakLevel,
-                                            const std::vector<MacroInfo>& scopeMacros,
-                                            const std::vector<ModInfo>& scopeMods) -> bool {
+    auto updateMod =
+        [deltaTime, bpm, transportJustStarted, transportJustLooped, transportJustStopped,
+         transportPlaying](ModInfo& mod, bool midiTriggered, bool midiNoteOff, float audioPeakLevel,
+                           const std::vector<MacroInfo>& scopeMacros,
+                           const std::vector<ModInfo>& scopeMods) -> bool {
         bool wasRunning = mod.running;
         ModTickInputs inputs{
-            midiTriggered, midiNoteOff,          audioPeakLevel,      deltaTime,
-            bpm,           transportJustStarted, transportJustLooped, transportJustStopped};
+            midiTriggered,    midiNoteOff,          audioPeakLevel,      deltaTime,           bpm,
+            transportPlaying, transportJustStarted, transportJustLooped, transportJustStopped};
         // Skip disabled mods - set value to 0 so they don't affect modulation
         if (!mod.enabled) {
             mod.value = 0.0f;
@@ -728,6 +736,11 @@ void TrackManager::updateAllMods(double deltaTime, double bpm, bool transportJus
 
             if (shouldStopRunning(mod, inputs))
                 mod.running = false;
+
+            if (mod.triggerMode == LFOTriggerMode::Transport && inputs.transportPlaying &&
+                !inputs.transportJustStopped && !mod.running) {
+                mod.running = true;
+            }
 
             if (mod.triggerMode == LFOTriggerMode::Transport && transportJustStopped &&
                 !mod.running) {
@@ -854,30 +867,15 @@ void TrackManager::updateAllMods(double deltaTime, double bpm, bool transportJus
             bool rackMidiNoteOff = midiNoteOff;
             float rackAudioPeak = audioPeak;
 
-            // Check rack-level sidechain source — replaces self triggers
-            if (rack.sidechain.sourceTrackId != INVALID_TRACK_ID) {
-                auto srcId = rack.sidechain.sourceTrackId;
+            // A rack-level mod can inherit the first explicit sidechain source
+            // from nested rack/device contents when the rack itself has no
+            // source. Keep this recursive so nested racks behave like flat racks.
+            if (auto sourceTrackId = sidechain::findFirstSource(rack)) {
+                auto srcId = *sourceTrackId;
                 rackMidiTriggered = midiNoteOnTracks.count(srcId) > 0;
                 rackMidiNoteOff = midiAllNotesOffTracks.count(srcId) > 0;
                 if (srcId >= 0 && srcId < kMaxBusTracks)
                     rackAudioPeak = audioPeakLevels[srcId];
-            }
-
-            // Check devices inside the rack for sidechain sources — replaces self triggers
-            for (const auto& chain : rack.chains) {
-                for (const auto& chainElement : chain.elements) {
-                    if (isDevice(chainElement)) {
-                        const auto& dev = magda::getDevice(chainElement);
-                        if (dev.sidechain.sourceTrackId != INVALID_TRACK_ID) {
-                            auto srcId = dev.sidechain.sourceTrackId;
-                            rackMidiTriggered = midiNoteOnTracks.count(srcId) > 0;
-                            rackMidiNoteOff = midiAllNotesOffTracks.count(srcId) > 0;
-                            if (srcId >= 0 && srcId < kMaxBusTracks)
-                                rackAudioPeak = audioPeakLevels[srcId];
-                            break;
-                        }
-                    }
-                }
             }
 
             for (auto& mod : rack.mods) {

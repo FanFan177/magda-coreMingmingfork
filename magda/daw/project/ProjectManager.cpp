@@ -7,6 +7,7 @@
 
 #include "../core/AutomationManager.hpp"
 #include "../core/ClipManager.hpp"
+#include "../core/TempoUtils.hpp"
 #include "../core/TrackManager.hpp"
 #include "serialization/ProjectSerializer.hpp"
 #include "version.hpp"
@@ -22,6 +23,29 @@ static const char* const kTempPrefix = "UnsavedProject_";
 static constexpr int kStaleTempDays = 7;
 static const char* const kAutosaveExtension = ".autosave";
 static constexpr int kDefaultAutoSaveIntervalMs = 60000;
+
+namespace {
+
+juce::File getWritableTempRoot() {
+    auto envTmp = juce::SystemStats::getEnvironmentVariable("TMPDIR", {});
+    if (envTmp.isNotEmpty()) {
+        auto envRoot = juce::File(envTmp);
+        if (envRoot.createDirectory())
+            return envRoot;
+    }
+
+    auto systemRoot = juce::File::getSpecialLocation(juce::File::tempDirectory);
+    if (systemRoot.createDirectory())
+        return systemRoot;
+
+    auto privateTmp = juce::File("/private/tmp");
+    if (privateTmp.createDirectory())
+        return privateTmp;
+
+    return systemRoot;
+}
+
+}  // namespace
 
 ProjectManager& ProjectManager::getInstance() {
     static ProjectManager instance;
@@ -115,6 +139,18 @@ bool ProjectManager::saveProjectAs(const juce::File& file) {
         actualFile = wrapperDir.getChildFile(file.getFileName());
     }
 
+    // Set up the target media directory before serializing so any clips that
+    // point at the unsaved project's temp media folder are rewritten to the
+    // durable project media folder in the saved .mgd.
+    auto oldMediaDir = mediaDirectory_;
+    juce::String mediaDirName = actualFile.getFileNameWithoutExtension() + "_Media";
+    auto targetMediaDir = actualFile.getParentDirectory().getChildFile(mediaDirName);
+    ensureMediaSubdirectories(targetMediaDir);
+
+    if (oldMediaDir != juce::File() && oldMediaDir != targetMediaDir && oldMediaDir.isDirectory()) {
+        migrateMediaFiles(oldMediaDir, targetMediaDir);
+    }
+
     // Prepare updated project info without mutating currentProject_ yet
     ProjectInfo newProject = currentProject_;
     newProject.filePath = actualFile.getFullPathName();
@@ -134,18 +170,7 @@ bool ProjectManager::saveProjectAs(const juce::File& file) {
     currentProject_ = std::move(newProject);
     currentFile_ = actualFile;
     isProjectOpen_ = true;
-
-    // Set up permanent media directory beside the project file
-    auto oldMediaDir = mediaDirectory_;
-    juce::String mediaDirName = actualFile.getFileNameWithoutExtension() + "_Media";
-    mediaDirectory_ = actualFile.getParentDirectory().getChildFile(mediaDirName);
-    ensureMediaSubdirectories(mediaDirectory_);
-
-    // Migrate files from temp directory if needed
-    if (oldMediaDir != juce::File() && oldMediaDir != mediaDirectory_ &&
-        oldMediaDir.isDirectory()) {
-        migrateMediaFiles(oldMediaDir, mediaDirectory_);
-    }
+    mediaDirectory_ = targetMediaDir;
 
     clearDirty();
     deleteAutosaveFile();
@@ -354,17 +379,20 @@ juce::String ProjectManager::getProjectName() const {
 }
 
 void ProjectManager::setTempo(double tempo) {
-    if (currentProject_.tempo != tempo) {
-        currentProject_.tempo = tempo;
+    const double clampedTempo = clampBpm(tempo);
+    if (currentProject_.tempo != clampedTempo) {
+        currentProject_.tempo = clampedTempo;
         markDirty();
     }
 }
 
 void ProjectManager::setTimeSignature(int numerator, int denominator) {
-    if (currentProject_.timeSignatureNumerator != numerator ||
-        currentProject_.timeSignatureDenominator != denominator) {
-        currentProject_.timeSignatureNumerator = numerator;
-        currentProject_.timeSignatureDenominator = denominator;
+    const int clampedNumerator = clampTimeSignatureValue(numerator);
+    const int clampedDenominator = clampTimeSignatureValue(denominator);
+    if (currentProject_.timeSignatureNumerator != clampedNumerator ||
+        currentProject_.timeSignatureDenominator != clampedDenominator) {
+        currentProject_.timeSignatureNumerator = clampedNumerator;
+        currentProject_.timeSignatureDenominator = clampedDenominator;
         markDirty();
     }
 }
@@ -458,11 +486,24 @@ juce::File ProjectManager::getBouncesDirectory() const {
 }
 
 void ProjectManager::createTempMediaDirectory() {
-    auto tempRoot =
-        juce::File::getSpecialLocation(juce::File::tempDirectory).getChildFile(kTempRootDir);
+    auto tempRoot = getWritableTempRoot().getChildFile(kTempRootDir);
+    tempRoot.createDirectory();
+
+    if (!tempRoot.isDirectory()) {
+        tempRoot = juce::File("/tmp").getChildFile(kTempRootDir);
+        tempRoot.createDirectory();
+    }
+
     juce::String timestamp = juce::Time::getCurrentTime().formatted("%Y%m%d_%H%M%S");
-    mediaDirectory_ = tempRoot.getChildFile(kTempPrefix + timestamp);
+    mediaDirectory_ = tempRoot.getNonexistentChildFile(kTempPrefix + timestamp, {});
     mediaDirectory_.createDirectory();
+
+    if (!mediaDirectory_.isDirectory()) {
+        auto fallbackRoot = juce::File("/tmp").getChildFile(kTempRootDir);
+        fallbackRoot.createDirectory();
+        mediaDirectory_ = fallbackRoot.getNonexistentChildFile(kTempPrefix + timestamp, {});
+        mediaDirectory_.createDirectory();
+    }
 }
 
 void ProjectManager::ensureMediaSubdirectories(const juce::File& mediaRoot) {
@@ -479,6 +520,7 @@ void ProjectManager::migrateMediaFiles(const juce::File& oldDir, const juce::Fil
 
     auto oldPath = oldDir.getFullPathName();
     auto newPath = newDir.getFullPathName();
+    std::vector<ClipId> updatedClipIds;
 
     // Move files from each subdirectory
     const char* subdirs[] = {kRecordingsDir, kRendersDir, kBouncesDir};
@@ -506,6 +548,7 @@ void ProjectManager::migrateMediaFiles(const juce::File& oldDir, const juce::Fil
                 if (clip) {
                     clip->audio().source.filePath =
                         clip->audio().source.filePath.replace(oldPath, newPath, false);
+                    updatedClipIds.push_back(clip->id);
                 }
             }
         }
@@ -513,6 +556,9 @@ void ProjectManager::migrateMediaFiles(const juce::File& oldDir, const juce::Fil
 
     updateClipPaths(clipManager.getArrangementClips());
     updateClipPaths(clipManager.getSessionClips());
+
+    if (!updatedClipIds.empty())
+        clipManager.forceNotifyMultipleClipPropertiesChanged(updatedClipIds);
 
     // Remove old temp directory if it's empty or under the temp root
     auto tempRoot =
@@ -630,7 +676,10 @@ bool ProjectManager::showUnsavedChangesDialog() {
         "Cancel");
 
     if (result == 0) {
-        // Cancel — abort the operation
+        // Cancel — abort the operation. Empty lastError_ so callers can
+        // distinguish "user cancelled" from "save actually failed" and
+        // suppress the spurious error dialog they would otherwise show.
+        lastError_.clear();
         return false;
     }
 
@@ -644,12 +693,27 @@ bool ProjectManager::showUnsavedChangesDialog() {
                 return false;
             }
         } else {
-            // No file path — can't save without a file chooser (synchronous context).
-            // Treat as cancel so the user can use Save As first.
-            juce::AlertWindow::showMessageBoxAsync(
-                juce::AlertWindow::InfoIcon, "Save Required",
-                "Please use File > Save As to save your project first.");
-            return false;
+            // Untitled project: run the Save-As file picker inline rather than
+            // dead-ending with a "use Save As first" prompt and aborting the
+            // outer New/Open/Close flow. JUCE_MODAL_LOOPS_PERMITTED is on for
+            // this build, so a modal FileChooser is fine here.
+            juce::FileChooser chooser(
+                "Save Project As",
+                juce::File::getSpecialLocation(juce::File::userDocumentsDirectory), "*.mgd", true);
+            if (!chooser.browseForFileToSave(true)) {
+                // User cancelled the chooser — treat as overall cancel.
+                lastError_.clear();
+                return false;
+            }
+            auto file = chooser.getResult();
+            if (!file.getFileExtension().equalsIgnoreCase(".mgd"))
+                file = file.withFileExtension("mgd");
+            if (!saveProjectAs(file)) {
+                juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::WarningIcon,
+                                                       "Save Failed",
+                                                       "Could not save project: " + lastError_);
+                return false;
+            }
         }
     }
 

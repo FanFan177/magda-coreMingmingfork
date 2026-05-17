@@ -15,8 +15,8 @@ dsl_grammar.hpp
     internal_plugins.hpp
     compact_parser.hpp
     compact_parser.cpp
-    compact_executor.hpp
-    compact_executor.cpp
+    instruction_executor.hpp
+    instruction_executor.cpp
     llm_config_utils.hpp
     llm_presets.hpp
     llm_presets.cpp
@@ -47,8 +47,17 @@ dsl_grammar.hpp
     four_osc_agent.cpp
     four_osc_apply.hpp
     four_osc_apply.cpp
+    faust_agent.hpp
+    faust_agent.cpp
+    device_ai_agent.hpp
     sound_design_agent.hpp
     sound_design_agent.cpp
+    coder_agent.hpp
+    coder_agent.cpp
+    mcp/MCPClient.hpp
+    mcp/MCPClient.cpp
+    mcp/MCPServerManager.hpp
+    mcp/MCPServerManager.cpp
 )
 
 # Create the agents library

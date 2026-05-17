@@ -185,6 +185,10 @@ bool AutomationRecordingEngine::shouldRecord() const {
     return isRecording_ && edit_.getTransport().isPlaying();
 }
 
+bool AutomationRecordingEngine::shouldIgnoreAutomationWriteback() {
+    return AutomationManager::getInstance().isApplyingAutomationWrite();
+}
+
 bool AutomationRecordingEngine::requiresUserTouched() const {
     return mode_ == AutomationMode::Touch || mode_ == AutomationMode::Latch;
 }
@@ -197,16 +201,7 @@ double AutomationRecordingEngine::getCurrentBeatTime() const {
 double AutomationRecordingEngine::normalizeDeviceParam(const AutomationTarget& target,
                                                        float rawValue) {
     ParameterInfo paramInfo = getParameterInfoForTarget(target);
-    const float teSpan = paramInfo.teMaxValue - paramInfo.teMinValue;
-    const bool infoMatchesTeRange = std::abs(paramInfo.minValue - paramInfo.teMinValue) < 1e-6f &&
-                                    std::abs(paramInfo.maxValue - paramInfo.teMaxValue) < 1e-6f;
-
-    if (teSpan > 0.0f && !infoMatchesTeRange) {
-        return juce::jlimit(0.0, 1.0,
-                            static_cast<double>((rawValue - paramInfo.teMinValue) / teSpan));
-    }
-
-    return static_cast<double>(ParameterUtils::realToNormalized(rawValue, paramInfo));
+    return ParameterUtils::modelToNormalizedValue(ParameterModelValue{rawValue}, paramInfo).value;
 }
 
 bool AutomationRecordingEngine::shouldThinPoint(AutomationLaneId laneId, double beatTime,
@@ -255,7 +250,8 @@ void AutomationRecordingEngine::recordPoint(AutomationLaneId laneId, double beat
         // Delete only pre-recording points that fall within [sweepFrom, beatTime].
         std::vector<AutomationPointId> toDelete;
         for (const auto& pt : lane->absolutePoints) {
-            if (pt.time >= sweepFrom && pt.time <= beatTime && snapshot.count(pt.id))
+            if (pt.beatPosition >= sweepFrom && pt.beatPosition <= beatTime &&
+                snapshot.count(pt.id))
                 toDelete.push_back(pt.id);
         }
         for (auto pid : toDelete) {
@@ -622,6 +618,9 @@ void AutomationRecordingEngine::onModParameterValueChanged(TrackId trackId,
 
 void AutomationRecordingEngine::onMacroValueChanged(TrackId trackId, ChainScope scope, int ownerId,
                                                     int macroIndex, float value) {
+    if (shouldIgnoreAutomationWriteback())
+        return;
+
     if (!shouldRecord())
         return;
 

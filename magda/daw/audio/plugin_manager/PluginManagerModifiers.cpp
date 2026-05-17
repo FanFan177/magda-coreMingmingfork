@@ -3,6 +3,7 @@
 #include <vector>
 
 #include "../../core/RackInfo.hpp"
+#include "../../core/SidechainTraversal.hpp"
 #include "../../core/TrackManager.hpp"
 #include "../../core/aliases/AutoAliasGenerator.hpp"
 #include "../../profiling/PerformanceProfiler.hpp"
@@ -21,6 +22,7 @@
 #include "plugins/MidiReceivePlugin.hpp"
 #include "plugins/SidechainMonitorPlugin.hpp"
 #include "plugins/StepSequencerPlugin.hpp"
+#include "processors/DeviceProcessor.hpp"
 #include "transport/TransportStateManager.hpp"
 
 namespace magda {
@@ -64,8 +66,41 @@ void PluginManager::updateDeviceModifierProperties(TrackId trackId) {
 
     DeviceTargetLookup lookup(*this);
 
+    auto forEachPlugin = [&, this](const std::function<void(te::Plugin*)>& visit) {
+        for (int pi = 0; pi < teTrack->pluginList.size(); ++pi) {
+            if (auto* plugin = teTrack->pluginList[pi])
+                visit(plugin);
+        }
+        for (const auto& el : trackInfo->chainElements) {
+            if (!isDevice(el))
+                continue;
+            const auto& dev = getDevice(el);
+            if (dev.isInstrument) {
+                if (auto* inner = instrumentRackManager_.getInnerPlugin(dev.id))
+                    visit(inner);
+            }
+        }
+        for (const auto& [drumGridDevId, padDevIds] : drumGridPadDevices_) {
+            auto sdIt = syncedDevices_.find(drumGridDevId);
+            if (sdIt == syncedDevices_.end() || sdIt->second.trackId != trackId)
+                continue;
+            for (auto padDevId : padDevIds) {
+                te::Plugin::Ptr plugin;
+                {
+                    juce::ScopedLock lock(pluginLock_);
+                    auto pIt = syncedDevices_.find(padDevId);
+                    if (pIt != syncedDevices_.end())
+                        plugin = pIt->second.plugin;
+                }
+                if (plugin)
+                    visit(plugin.get());
+            }
+        }
+    };
+
     ModifierSyncContext ctx;
     ctx.lookup = &lookup;
+    ctx.forEachScopePlugin = forEachPlugin;
 
     // Per-device: in-place LFO + assignment depth update.
     for (const auto& element : trackInfo->chainElements) {
@@ -239,7 +274,7 @@ void PluginManager::triggerLFONoteOn(TrackId trackId) {
 
         for (auto& [_modId, mod] : it->second.modifiers) {
             if (auto* lfo = dynamic_cast<te::LFOModifier*>(mod.get())) {
-                lfo->triggerNoteOn();
+                triggerLFONoteOnWithReset(lfo);
             }
         }
     }
@@ -252,7 +287,7 @@ void PluginManager::triggerLFONoteOn(TrackId trackId) {
     if (tmIt != trackModStates_.end()) {
         for (auto& [_modId, mod] : tmIt->second.modifiers) {
             if (auto* lfo = dynamic_cast<te::LFOModifier*>(mod.get())) {
-                lfo->triggerNoteOn();
+                triggerLFONoteOnWithReset(lfo);
             }
         }
     }
@@ -266,10 +301,6 @@ void PluginManager::triggerSidechainNoteOn(TrackId sourceTrackId,
 
     auto* cache = activeCache_.load(std::memory_order_acquire);
     auto& entry = cache->entries[static_cast<size_t>(sourceTrackId)];
-    DBG("[SC-TRIG] triggerSidechainNoteOn srcTrack="
-        << sourceTrackId << " cacheCount=" << entry.count
-        << " modeFilter=" << (modeFilter.has_value() ? (int)modeFilter.value() : -1)
-        << " rendering=" << (int)renderingActive_.load(std::memory_order_relaxed));
     for (int i = 0; i < entry.count; ++i) {
         // Filter by trigger mode if specified
         if (modeFilter.has_value() && entry.trigMode[static_cast<size_t>(i)] != modeFilter.value())
@@ -277,14 +308,6 @@ void PluginManager::triggerSidechainNoteOn(TrackId sourceTrackId,
 
         auto* lfo = entry.lfos[static_cast<size_t>(i)];
         bool crossTrack = entry.isCrossTrack[static_cast<size_t>(i)];
-        DBG("[SC-TRIG]   LFO[" << i << "] crossTrack=" << (int)crossTrack
-                               << " gated=" << (int)lfo->isGated()
-                               << " skipNative=" << (int)lfo->getSkipNativeResync() << " syncType="
-                               << juce::roundToInt(lfo->syncTypeParam->getCurrentValue())
-                               << " phase=" << lfo->getCurrentPhase()
-                               << " curValue=" << lfo->getCurrentValue()
-                               << " depth=" << lfo->depthParam->getCurrentValue()
-                               << " rate=" << lfo->rateParam->getCurrentValue());
         // Cross-track: force value=0 for transient gap.
         // Self-track: resync phase but preserve value (no zero gap needed).
         triggerLFONoteOnWithReset(lfo, crossTrack);
@@ -563,85 +586,22 @@ void PluginManager::rebuildSidechainLFOCache() {
             collectDeviceLFOs(device);
         }
 
-        // Also collect from racks on this track (skip racks with external sidechain)
-        {
-            bool hasRackSidechain = false;
-            for (const auto& element : track.chainElements) {
-                if (isRack(element)) {
-                    const auto& rack = getRack(element);
-                    if (rack.sidechain.sourceTrackId != INVALID_TRACK_ID) {
-                        hasRackSidechain = true;
-                        break;
-                    }
-                    // Also check devices inside rack for sidechain sources
-                    for (const auto& chain : rack.chains) {
-                        for (const auto& ce : chain.elements) {
-                            if (isDevice(ce) &&
-                                getDevice(ce).sidechain.sourceTrackId != INVALID_TRACK_ID) {
-                                hasRackSidechain = true;
-                                break;
-                            }
-                        }
-                        if (hasRackSidechain)
-                            break;
-                    }
-                }
-            }
-            if (!hasRackSidechain) {
-                size_t before = lfos.size();
-                rackSyncManager_.collectLFOModifiers(track.id, lfos);
-                // Rack LFOs default to Free trigger mode (TODO: track per-mod modes)
-                modes.resize(lfos.size(), LFOTriggerMode::Free);
-                juce::ignoreUnused(before);
-            }
-        }
+        // Also collect from racks on this track. If any nested rack scope has
+        // an external sidechain source, the rack manager will collect matching
+        // LFOs in the source-track pass below.
+        if (!sidechain::elementsContainExternalSource(track.chainElements))
+            rackSyncManager_.collectLFOModifiersWithModes(track.id, lfos, modes);
 
         selfTrackCount = static_cast<int>(lfos.size());
 
-        // 2. Cross-track LFOs: for each OTHER track that has a device sidechained
-        //    from this track, collect that destination track's LFO modifiers
+        // 2. Cross-track LFOs: for each OTHER track that has a device or rack
+        //    sidechained from this track, collect only the destination LFOs
+        //    whose sidechain source resolves to this track.
         for (const auto& otherTrack : tm.getTracks()) {
             if (otherTrack.id == track.id)
                 continue;
-            bool isDestination = false;
-            for (const auto& element : otherTrack.chainElements) {
-                if (isDevice(element)) {
-                    const auto& device = getDevice(element);
-                    if ((device.sidechain.type == SidechainConfig::Type::MIDI ||
-                         device.sidechain.type == SidechainConfig::Type::Audio) &&
-                        device.sidechain.sourceTrackId == track.id) {
-                        isDestination = true;
-                        break;
-                    }
-                } else if (isRack(element)) {
-                    const auto& rack = getRack(element);
-                    // Check rack-level sidechain
-                    if ((rack.sidechain.type == SidechainConfig::Type::MIDI ||
-                         rack.sidechain.type == SidechainConfig::Type::Audio) &&
-                        rack.sidechain.sourceTrackId == track.id) {
-                        isDestination = true;
-                        break;
-                    }
-                    for (const auto& chain : rack.chains) {
-                        for (const auto& ce : chain.elements) {
-                            if (isDevice(ce)) {
-                                const auto& device = getDevice(ce);
-                                if ((device.sidechain.type == SidechainConfig::Type::MIDI ||
-                                     device.sidechain.type == SidechainConfig::Type::Audio) &&
-                                    device.sidechain.sourceTrackId == track.id) {
-                                    isDestination = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if (isDestination)
-                            break;
-                    }
-                }
-                if (isDestination)
-                    break;
-            }
-            if (!isDestination)
+
+            if (!sidechain::elementsUseSource(otherTrack.chainElements, track.id))
                 continue;
 
             // Collect LFO modifiers only from devices on the destination track
@@ -655,13 +615,8 @@ void PluginManager::rebuildSidechainLFOCache() {
                     continue;
                 collectDeviceLFOs(device);
             }
-            // TODO: also filter rack LFOs by sidechain source
-            {
-                size_t before = lfos.size();
-                rackSyncManager_.collectLFOModifiers(otherTrack.id, lfos);
-                modes.resize(lfos.size(), LFOTriggerMode::Free);
-                juce::ignoreUnused(before);
-            }
+            rackSyncManager_.collectLFOModifiersWithModesForSidechainSource(otherTrack.id, track.id,
+                                                                            lfos, modes);
         }
 
         // Write to cache entry (capped at kMaxLFOs)

@@ -22,6 +22,15 @@ class CursorManager {
     const juce::MouseCursor& getZoomOutCursor() const {
         return zoomOutCursor;
     }
+    const juce::MouseCursor& getNoteDrawCursor() const {
+        return noteDrawCursor;
+    }
+    const juce::MouseCursor& getEraseCursor() const {
+        return eraseCursor;
+    }
+    const juce::MouseCursor& getNoteRepeatCursor() const {
+        return noteRepeatCursor;
+    }
 
   private:
     CursorManager();
@@ -33,10 +42,16 @@ class CursorManager {
     // Draw a magnifying glass cursor with optional +/- glyph
     enum class ZoomGlyph { None, Plus, Minus };
     static juce::MouseCursor createZoomCursor(ZoomGlyph glyph);
+    static juce::MouseCursor createNoteDrawCursor();
+    static juce::MouseCursor createEraseCursor();
+    static juce::MouseCursor createNoteRepeatCursor();
 
     juce::MouseCursor zoomCursor;
     juce::MouseCursor zoomInCursor;
     juce::MouseCursor zoomOutCursor;
+    juce::MouseCursor noteDrawCursor;
+    juce::MouseCursor eraseCursor;
+    juce::MouseCursor noteRepeatCursor;
 };
 
 }  // namespace magda

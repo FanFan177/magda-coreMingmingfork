@@ -165,6 +165,16 @@ class AutomationManager : public TrackManagerListener {
      */
     void setTargetTouchSuppressed(const AutomationTarget& target, bool suppressed);
 
+    /**
+     * Release any touchSuppressed flag left on any lane. Safety net for the
+     * case where a UI gesture's end-callback didn't fire (component destroyed
+     * mid-drag, modal opened, exception) and the lane stayed suppressed —
+     * the next bake would skip it and the parameter would silently stop
+     * following automation. Call at safe boundaries (transport stop) when no
+     * gesture should be in flight.
+     */
+    void clearAllTouchSuppression();
+
     // Tracks which automation targets the user is actively manipulating via
     // a mouse/touch gesture. Unlike touchSuppressed, this is set even when no
     // lane exists yet, so the recording engine can tell "user is touching" from
@@ -218,7 +228,7 @@ class AutomationManager : public TrackManagerListener {
         touchSuppressionListener_ = std::move(listener);
     }
 
-    void setLaneSnapTime(AutomationLaneId laneId, bool snap);
+    void setLaneSnapEditsToBeatGrid(AutomationLaneId laneId, bool snap);
     void setLaneSnapValue(AutomationLaneId laneId, bool snap);
     void setLaneHeight(AutomationLaneId laneId, int height);
 
@@ -229,7 +239,7 @@ class AutomationManager : public TrackManagerListener {
     /**
      * @brief Create an automation clip on a lane
      */
-    AutomationClipId createClip(AutomationLaneId laneId, double startTime, double length);
+    AutomationClipId createClip(AutomationLaneId laneId, double startBeats, double lengthBeats);
 
     /**
      * @brief Delete an automation clip
@@ -273,13 +283,14 @@ class AutomationManager : public TrackManagerListener {
     /**
      * @brief Add a point to an absolute lane
      */
-    AutomationPointId addPoint(AutomationLaneId laneId, double time, double value,
+    AutomationPointId addPoint(AutomationLaneId laneId, double beatPosition, double value,
                                AutomationCurveType curveType = AutomationCurveType::Linear);
 
     /**
      * @brief Add a point to a clip
      */
-    AutomationPointId addPointToClip(AutomationClipId clipId, double localTime, double value,
+    AutomationPointId addPointToClip(AutomationClipId clipId, double localBeatPosition,
+                                     double value,
                                      AutomationCurveType curveType = AutomationCurveType::Linear);
 
     /**
@@ -298,15 +309,15 @@ class AutomationManager : public TrackManagerListener {
     void deletePointFromClip(AutomationClipId clipId, AutomationPointId pointId);
 
     /**
-     * @brief Move a point to a new time/value
+     * @brief Move a point to a new beat/value
      */
-    void movePoint(AutomationLaneId laneId, AutomationPointId pointId, double newTime,
+    void movePoint(AutomationLaneId laneId, AutomationPointId pointId, double newBeatPosition,
                    double newValue);
 
     /**
      * @brief Move a point within a clip
      */
-    void movePointInClip(AutomationClipId clipId, AutomationPointId pointId, double newTime,
+    void movePointInClip(AutomationClipId clipId, AutomationPointId pointId, double newBeatPosition,
                          double newValue);
 
     /**
@@ -349,20 +360,20 @@ class AutomationManager : public TrackManagerListener {
     // ========================================================================
 
     /**
-     * @brief Get interpolated value at a time on a lane
+     * @brief Get interpolated value at a beat position on a lane
      * @param laneId Lane to query
-     * @param time Time in seconds
+     * @param beatPosition Position in beats
      * @return Normalized value 0-1 (0.5 if no points)
      */
-    double getValueAtTime(AutomationLaneId laneId, double time) const;
+    double getValueAtBeat(AutomationLaneId laneId, double beatPosition) const;
 
     /**
-     * @brief Get interpolated value at a time within a clip
+     * @brief Get interpolated value at a beat position within a clip
      * @param clipId Clip to query
-     * @param localTime Time within clip (0 to length)
+     * @param localBeatPosition Beat position within clip (0 to length)
      * @return Normalized value 0-1
      */
-    double getClipValueAtTime(AutomationClipId clipId, double localTime) const;
+    double getClipValueAtBeat(AutomationClipId clipId, double localBeatPosition) const;
 
     // ========================================================================
     // Listener Management
@@ -525,7 +536,7 @@ class AutomationManager : public TrackManagerListener {
     // Interpolation helpers
     double interpolateLinear(double t, double v1, double v2) const;
     double interpolateBezier(double t, const AutomationPoint& p1, const AutomationPoint& p2) const;
-    double interpolatePoints(const std::vector<AutomationPoint>& points, double time) const;
+    double interpolatePoints(const std::vector<AutomationPoint>& points, double beatPosition) const;
 
     // Point management helpers
     AutomationPoint* findPoint(std::vector<AutomationPoint>& points, AutomationPointId pointId);

@@ -2,6 +2,7 @@
 #include "../audio/session/SessionClipScheduler.hpp"
 #include "../audio/session/SessionRecorder.hpp"
 #include "../core/ClipManager.hpp"
+#include "../core/TempoUtils.hpp"
 #include "../core/TrackManager.hpp"
 #include "../core/ViewModeController.hpp"
 #include "TracktionEngineWrapper.hpp"
@@ -105,7 +106,7 @@ void TracktionEngineWrapper::record() {
         // Push TrackInfo::recordArmed onto TE's destinations right before asking
         // TE to record. Covers the project-load case where a persisted armed
         // track never saw a trackPropertyChanged arm sync (value didn't change).
-        if (audioBridge_)
+        if (audioBridge_ && !hasActiveSessionSlotRecordings())
             audioBridge_->syncAllArmedTracksToTE();
 
         // Dump all input device instances and their record-enabled state
@@ -201,6 +202,7 @@ bool TracktionEngineWrapper::isRecording() const {
 }
 
 void TracktionEngineWrapper::setTempo(double bpm) {
+    bpm = clampBpm(bpm);
     if (currentEdit_) {
         auto& tempoSeq = currentEdit_->tempoSequence;
         if (tempoSeq.getNumTempos() > 0) {
@@ -217,7 +219,7 @@ double TracktionEngineWrapper::getTempo() const {
         auto timePos = tracktion::TimePosition::fromSeconds(0.0);
         return currentEdit_->tempoSequence.getTempoAt(timePos).getBpm();
     }
-    return 120.0;
+    return DEFAULT_BPM;
 }
 
 void TracktionEngineWrapper::setTimeSignature(int numerator, int denominator) {
@@ -369,12 +371,12 @@ void TracktionEngineWrapper::onTransportStop(double returnPosition) {
     // Tracks in Session mode keep playing; the user must explicitly press
     // "back to arrangement" (per-track resume button) to return to Arrangement mode.
 
-    // Capture current position before stopping (this is the recording end time)
     double stopPosition = getCurrentPosition();
 
     // transport.stop() triggers recordingFinished() synchronously per device,
     // which populates activeRecordingClips_ for cross-device dedup.
     stop();
+    finishSessionSlotRecordings();
 
     // For any track that was recording but got 0 clips from TE (blank MIDI recording),
     // create an empty MIDI clip ourselves — but only if the track has MIDI input configured.
@@ -434,6 +436,15 @@ void TracktionEngineWrapper::onTransportRecord(double position) {
         // Clip triggering is handled by the session UI, not the transport.
         if (sessionRecorder_)
             sessionRecorder_->setArmed(true);
+        if (audioBridge_)
+            audioBridge_->syncAllArmedTracksToTE();
+        beginArmedSessionSlotRecordings();
+        if (hasActiveSessionSlotRecordings()) {
+            intendedRecordPosition_ = position;
+            if (!isPlaying())
+                locate(position);
+            record();
+        }
     } else {
         // Arrangement mode: arm session recorder + start transport + TE recording
         // so MIDI/audio input is captured on armed tracks.
@@ -460,6 +471,7 @@ void TracktionEngineWrapper::onTransportStopRecording() {
     if (currentEdit_->getTransport().isRecording()) {
         double stopPosition = getCurrentPosition();
         currentEdit_->getTransport().stopRecording(false);
+        finishSessionSlotRecordings();
 
         if (!recordingStartTimes_.empty()) {
             auto& clipManager = ClipManager::getInstance();
@@ -482,6 +494,8 @@ void TracktionEngineWrapper::onTransportStopRecording() {
         recordingNoteQueue_.clear();
         activeRecordingClips_.clear();
         recordingStartTimes_.clear();
+    } else {
+        finishSessionSlotRecordings();
     }
 }
 

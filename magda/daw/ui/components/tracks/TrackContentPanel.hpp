@@ -13,6 +13,7 @@
 #include "core/AutomationManager.hpp"
 #include "core/ClipManager.hpp"
 #include "core/ClipTypes.hpp"
+#include "core/TempoUtils.hpp"
 #include "core/TrackManager.hpp"
 #include "core/ViewModeController.hpp"
 #include "engine/AudioEngine.hpp"
@@ -215,9 +216,9 @@ class TrackContentPanel : public juce::Component,
 
     // Time display mode and tempo (for grid drawing)
     TimeDisplayMode displayMode = TimeDisplayMode::BarsBeats;
-    double tempoBPM = 120.0;
-    int timeSignatureNumerator = 4;
-    int timeSignatureDenominator = 4;
+    double tempoBPM = DEFAULT_BPM;
+    int timeSignatureNumerator = DEFAULT_TIME_SIGNATURE_NUMERATOR;
+    int timeSignatureDenominator = DEFAULT_TIME_SIGNATURE_DENOMINATOR;
 
     // Repaint only the visible viewport area (avoids invalidating 65000+ px at high zoom)
     void repaintVisible();
@@ -303,7 +304,17 @@ class TrackContentPanel : public juce::Component,
     void updateClipComponentPositions();
     void createClipFromTimeSelection();  // Called on double-click with selection
     void createMidiClipAtPosition(TrackId trackId, double startTime);
+    void createMidiClipFromBeatRange(TrackId trackId, double startBeat, double endBeat);
+    double snappedBeatForPixel(int x) const;
     ClipComponent* getClipComponentAt(int x, int y) const;
+
+    // Shift-drag clip drawing
+    bool isDrawingClip_ = false;
+    TrackId drawingClipTrackId_ = INVALID_TRACK_ID;
+    int drawingClipTrackIndex_ = -1;
+    double drawingClipStartBeat_ = 0.0;
+    double drawingClipEndBeat_ = 0.0;
+    void paintClipDrawPreview(juce::Graphics& g);
 
     // Automation lane management
     struct AutomationLaneEntry {

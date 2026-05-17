@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../../themes/StyledText.hpp"
 #include "BaseInspector.hpp"
 #include "core/SelectionManager.hpp"
 
@@ -42,6 +43,14 @@ class DeviceInspector : public BaseInspector {
     // Latency display
     juce::Label latencyLabel_;
     juce::Label latencyValue_;
+
+    // Internal device metadata
+    juce::Label categoryLabel_;
+    juce::Label categoryValue_;
+    juce::Label codenameLabel_;
+    juce::Label codenameValue_;
+    juce::Label descriptionLabel_;
+    magda::StyledTextDisplay descriptionValue_;
 
     // Update methods
     void updateFromSelectedChainNode();

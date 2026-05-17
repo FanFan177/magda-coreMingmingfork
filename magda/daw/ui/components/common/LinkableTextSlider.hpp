@@ -9,7 +9,7 @@
 #include "core/ParameterInfo.hpp"
 #include "core/controllers/ControllerRegistry.hpp"
 #include "core/controllers/MidiLearnCoordinator.hpp"
-#include "ui/components/chain/ParamModulationPainter.hpp"
+#include "ui/components/chain/params/ParamModulationPainter.hpp"
 
 namespace magda::daw::ui {
 
@@ -43,6 +43,7 @@ class LinkableTextSlider : public juce::Component,
     void setFont(const juce::Font& font);
     void setTextColour(const juce::Colour& colour);
     void setBackgroundColour(const juce::Colour& colour);
+    void setOrientation(TextSlider::Orientation orientation);
     TextSlider& getSlider();
     bool isBeingDragged() const;
 

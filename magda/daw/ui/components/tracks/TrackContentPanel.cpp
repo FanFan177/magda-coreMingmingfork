@@ -7,6 +7,7 @@
 
 #include "../../panels/state/PanelController.hpp"
 #include "../../state/TimelineEvents.hpp"
+#include "../../themes/CursorManager.hpp"
 #include "../../themes/DarkTheme.hpp"
 #include "../../utils/TimelineUtils.hpp"
 #include "../automation/AutomationLaneComponent.hpp"
@@ -14,6 +15,7 @@
 #include "Config.hpp"
 #include "core/ClipCommands.hpp"
 #include "core/SelectionManager.hpp"
+#include "core/TempoUtils.hpp"
 #include "core/TrackCommands.hpp"
 #include "core/UndoManager.hpp"
 #include "project/ProjectManager.hpp"
@@ -269,13 +271,15 @@ void TrackContentPanel::rebuildGroupExtentCache() {
             for (auto clipId : clipManager.getClipsOnTrack(childId)) {
                 const auto* clip = clipManager.getClip(clipId);
                 if (clip && clip->view == ClipView::Arrangement) {
+                    const double clipStart = clip->getTimelineStart(tempoBPM);
+                    const double clipEnd = clip->getTimelineEnd(tempoBPM);
                     if (!extent.hasClips) {
-                        extent.earliest = clip->startTime;
-                        extent.latest = clip->startTime + clip->length;
+                        extent.earliest = clipStart;
+                        extent.latest = clipEnd;
                         extent.hasClips = true;
                     } else {
-                        extent.earliest = std::min(extent.earliest, clip->startTime);
-                        extent.latest = std::max(extent.latest, clip->startTime + clip->length);
+                        extent.earliest = std::min(extent.earliest, clipStart);
+                        extent.latest = std::max(extent.latest, clipEnd);
                     }
                 }
             }
@@ -314,6 +318,8 @@ void TrackContentPanel::paint(juce::Graphics& g) {
 void TrackContentPanel::paintOverChildren(juce::Graphics& g) {
     // Draw recording previews on top of any existing clip components
     paintRecordingPreviews(g);
+
+    paintClipDrawPreview(g);
 
     // Draw edit cursor line on top of clips
     paintEditCursor(g);
@@ -521,13 +527,13 @@ void TrackContentPanel::setTimeDisplayMode(TimeDisplayMode mode) {
 }
 
 void TrackContentPanel::setTempo(double bpm) {
-    tempoBPM = juce::jlimit(20.0, 999.0, bpm);
+    tempoBPM = clampBpm(bpm);
     repaintVisible();
 }
 
 void TrackContentPanel::setTimeSignature(int numerator, int denominator) {
-    timeSignatureNumerator = juce::jlimit(1, 16, numerator);
-    timeSignatureDenominator = juce::jlimit(1, 16, denominator);
+    timeSignatureNumerator = clampTimeSignatureValue(numerator);
+    timeSignatureDenominator = clampTimeSignatureValue(denominator);
     repaintVisible();
 }
 
@@ -967,6 +973,33 @@ void TrackContentPanel::mouseDown(const juce::MouseEvent& event) {
     bool inUpperZone = isInUpperTrackZone(event.y);
     bool onClip = getClipComponentAt(event.x, event.y) != nullptr;
 
+    bool onSelectionEdge = false;
+    bool selectionEdgeIsLeft = false;
+    onSelectionEdge = isOnSelectionEdge(event.x, event.y, selectionEdgeIsLeft);
+
+    if (!onClip && event.mods.isShiftDown() && isInSelectableArea(event.x, event.y) &&
+        !onSelectionEdge && !isOnExistingSelection(event.x, event.y)) {
+        int trackIndex = getTrackIndexAtY(event.y);
+        if (trackIndex >= 0 && trackIndex < static_cast<int>(visibleTrackIds_.size())) {
+            selectTrack(trackIndex);
+            isDrawingClip_ = true;
+            drawingClipTrackIndex_ = trackIndex;
+            drawingClipTrackId_ = visibleTrackIds_[trackIndex];
+            drawingClipStartBeat_ = snappedBeatForPixel(event.x);
+            drawingClipEndBeat_ = drawingClipStartBeat_;
+            setMouseCursor(CursorManager::getInstance().getNoteDrawCursor());
+            currentDragType_ = DragType::None;
+            isCreatingSelection = false;
+            isMovingSelection = false;
+            SelectionManager::getInstance().clearSelection();
+            if (onTimeSelectionChanged)
+                onTimeSelectionChanged(-1.0, -1.0, {});
+            repaintVisible();
+            grabKeyboardFocus();
+            return;
+        }
+    }
+
     // Select track based on click position - but ONLY in upper zone
     // (Lower zone is for timeline operations, shouldn't affect track selection)
     if (inUpperZone) {
@@ -1038,11 +1071,12 @@ void TrackContentPanel::mouseDown(const juce::MouseEvent& event) {
                 }
 
                 // Check if clip overlaps with selection time range
-                double clipEnd = clip.startTime + clip.length;
-                if (clip.startTime < selection.endTime && clipEnd > selection.startTime) {
+                const double clipStart = clip.getTimelineStart(tempoBPM);
+                const double clipEnd = clip.getTimelineEnd(tempoBPM);
+                if (clipStart < selection.endTime && clipEnd > selection.startTime) {
                     ClipOriginalData data;
-                    data.originalStartTime = clip.startTime;
-                    data.originalLength = clip.length;
+                    data.originalStartTime = clipStart;
+                    data.originalLength = clip.getTimelineLength(tempoBPM);
                     data.originalTrackId = clip.trackId;
                     originalClipsInSelection_[clip.id] = data;
                 }
@@ -1088,6 +1122,12 @@ void TrackContentPanel::mouseDown(const juce::MouseEvent& event) {
 }
 
 void TrackContentPanel::mouseDrag(const juce::MouseEvent& event) {
+    if (isDrawingClip_) {
+        drawingClipEndBeat_ = snappedBeatForPixel(event.x);
+        repaintVisible();
+        return;
+    }
+
     if (currentDragType_ == DragType::ResizeSelectionLeft ||
         currentDragType_ == DragType::ResizeSelectionRight) {
         // Resizing time selection edge
@@ -1233,6 +1273,22 @@ void TrackContentPanel::mouseUp(const juce::MouseEvent& event) {
         return;
     }
 
+    if (isDrawingClip_) {
+        if (drawingClipTrackId_ != INVALID_TRACK_ID) {
+            drawingClipEndBeat_ = snappedBeatForPixel(event.x);
+            createMidiClipFromBeatRange(drawingClipTrackId_, drawingClipStartBeat_,
+                                        drawingClipEndBeat_);
+        }
+
+        isDrawingClip_ = false;
+        drawingClipTrackId_ = INVALID_TRACK_ID;
+        drawingClipTrackIndex_ = -1;
+        drawingClipStartBeat_ = 0.0;
+        drawingClipEndBeat_ = 0.0;
+        repaintVisible();
+        return;
+    }
+
     if (currentDragType_ == DragType::ResizeSelectionLeft ||
         currentDragType_ == DragType::ResizeSelectionRight) {
         // Finalize time selection resize and trim clips
@@ -1261,20 +1317,23 @@ void TrackContentPanel::mouseUp(const juce::MouseEvent& event) {
             if (!clip)
                 continue;
 
+            const double clipStart = clip->getTimelineStart(getTempo());
+            const double clipEnd = clip->getTimelineEnd(getTempo());
+
             // Check if clip overlaps with new selection
-            if (clip->startTime < newEnd && clip->getEndTime() > newStart) {
+            if (clipStart < newEnd && clipEnd > newStart) {
                 // Calculate new clip bounds (intersection of clip and selection)
-                double clipNewStart = std::max(clip->startTime, newStart);
-                double clipNewEnd = std::min(clip->getEndTime(), newEnd);
+                double clipNewStart = std::max(clipStart, newStart);
+                double clipNewEnd = std::min(clipEnd, newEnd);
                 double newLength = clipNewEnd - clipNewStart;
 
                 if (newLength > 0.01) {  // At least 10ms
                     // Trim from left if needed
-                    if (clipNewStart > clip->startTime) {
+                    if (clipNewStart > clipStart) {
                         trimOperations.push_back({clipId, {newLength, true}});
                     }
                     // Trim from right if needed
-                    else if (clipNewEnd < clip->getEndTime()) {
+                    else if (clipNewEnd < clipEnd) {
                         trimOperations.push_back({clipId, {newLength, false}});
                     }
                 }
@@ -1286,8 +1345,9 @@ void TrackContentPanel::mouseUp(const juce::MouseEvent& event) {
             UndoManager::getInstance().beginCompoundOperation("Trim Clips");
 
         for (const auto& [clipId, params] : trimOperations) {
-            auto cmd = std::make_unique<ResizeClipCommand>(clipId, params.first, params.second,
-                                                           getTempo());
+            const double bpm = getTempo();
+            auto cmd = std::make_unique<ResizeClipCommand>(
+                clipId, BeatDuration{params.first * bpm / 60.0}, params.second, bpm);
             UndoManager::getInstance().executeCommand(std::move(cmd));
         }
 
@@ -1520,13 +1580,83 @@ void TrackContentPanel::mouseDoubleClick(const juce::MouseEvent& event) {
 void TrackContentPanel::createMidiClipAtPosition(TrackId trackId, double startTime) {
     double barLength = (timeSignatureNumerator * 60.0) / tempoBPM;
 
-    auto cmd = std::make_unique<CreateClipCommand>(ClipType::MIDI, trackId, startTime, barLength);
+    auto cmd = std::make_unique<CreateClipCommand>(ClipType::MIDI, trackId,
+                                                   BeatPosition{startTime * tempoBPM / 60.0},
+                                                   BeatDuration{barLength * tempoBPM / 60.0});
     UndoManager::getInstance().executeCommand(std::move(cmd));
 
     auto clipId = ClipManager::getInstance().getClipAtPosition(trackId, startTime);
     if (clipId != INVALID_CLIP_ID) {
         SelectionManager::getInstance().selectClip(clipId);
     }
+}
+
+double TrackContentPanel::snappedBeatForPixel(int x) const {
+    const double maxBeats =
+        isValidBpm(tempoBPM) ? juce::jmax(0.0, timelineLength * tempoBPM / 60.0) : 0.0;
+    double beat = juce::jlimit(0.0, maxBeats, pixelToBeats(x));
+
+    if (snapBeatsToGrid) {
+        beat = snapBeatsToGrid(beat);
+    } else if (snapTimeToGrid && isValidBpm(tempoBPM)) {
+        beat = snapTimeToGrid(beat * 60.0 / tempoBPM) * tempoBPM / 60.0;
+    }
+
+    return juce::jlimit(0.0, maxBeats, beat);
+}
+
+void TrackContentPanel::createMidiClipFromBeatRange(TrackId trackId, double startBeat,
+                                                    double endBeat) {
+    if (trackId == INVALID_TRACK_ID)
+        return;
+
+    double start = juce::jmin(startBeat, endBeat);
+    double end = juce::jmax(startBeat, endBeat);
+    double length = end - start;
+
+    const double oneBarBeats = juce::jmax(1.0, static_cast<double>(timeSignatureNumerator));
+    if (length <= 0.000001) {
+        length = oneBarBeats;
+    } else {
+        const double gridBeats = getGridSpacingBeats ? getGridSpacingBeats() : 0.0;
+        const double minBeats = gridBeats > 0.0 ? gridBeats : 1.0 / 16.0;
+        length = juce::jmax(minBeats, length);
+    }
+
+    auto cmd = std::make_unique<CreateClipCommand>(ClipType::MIDI, trackId, BeatPosition{start},
+                                                   BeatDuration{length});
+    UndoManager::getInstance().executeCommand(std::move(cmd));
+
+    const double startTime = isValidBpm(tempoBPM) ? start * 60.0 / tempoBPM : 0.0;
+    auto clipId = ClipManager::getInstance().getClipAtPosition(trackId, startTime);
+    if (clipId != INVALID_CLIP_ID) {
+        SelectionManager::getInstance().selectClip(clipId);
+    }
+}
+
+void TrackContentPanel::paintClipDrawPreview(juce::Graphics& g) {
+    if (!isDrawingClip_ || drawingClipTrackIndex_ < 0 ||
+        drawingClipTrackIndex_ >= static_cast<int>(trackLanes.size())) {
+        return;
+    }
+
+    const auto trackArea = getTrackLaneArea(drawingClipTrackIndex_);
+    double start = juce::jmin(drawingClipStartBeat_, drawingClipEndBeat_);
+    double end = juce::jmax(drawingClipStartBeat_, drawingClipEndBeat_);
+    if (end - start <= 0.000001)
+        end = start + juce::jmax(1.0, static_cast<double>(timeSignatureNumerator));
+
+    const int x = beatsToPixel(start);
+    const int right = beatsToPixel(end);
+    const int width = juce::jmax(10, right - x);
+    const auto rect =
+        juce::Rectangle<int>(x, trackArea.getY() + 2, width, trackArea.getHeight() - 4);
+
+    const auto colour = juce::Colour(Config::getDefaultColour(drawingClipTrackIndex_));
+    g.setColour(colour.withAlpha(0.28f));
+    g.fillRoundedRectangle(rect.toFloat(), 3.0f);
+    g.setColour(colour.brighter(0.25f).withAlpha(0.9f));
+    g.drawRoundedRectangle(rect.toFloat(), 3.0f, 1.0f);
 }
 
 void TrackContentPanel::showEmptySpaceContextMenu(const juce::MouseEvent& event) {
@@ -1573,7 +1703,8 @@ void TrackContentPanel::showEmptySpaceContextMenu(const juce::MouseEvent& event)
                 break;
             }
             case 2: {  // Paste
-                auto cmd = std::make_unique<PasteClipCommand>(startTime);
+                const double bpm = safeThis ? safeThis->getTempo() : 120.0;
+                auto cmd = std::make_unique<PasteClipCommand>(BeatPosition{startTime * bpm / 60.0});
                 auto* cmdPtr = cmd.get();
                 UndoManager::getInstance().executeCommand(std::move(cmd));
 
@@ -1621,7 +1752,9 @@ void TrackContentPanel::showEmptySpaceContextMenu(const juce::MouseEvent& event)
                 if (!cm.hasClipsInClipboard())
                     return;
 
-                auto cmd = std::make_unique<PasteClipCommand>(sel.endTime);
+                const double bpm = tc.getState().tempo.bpm;
+                auto cmd =
+                    std::make_unique<PasteClipCommand>(BeatPosition{sel.endTime * bpm / 60.0});
                 UndoManager::getInstance().executeCommand(std::move(cmd));
 
                 // Shift the time selection to the duplicated region so a
@@ -1690,7 +1823,11 @@ void TrackContentPanel::updateCursorForPosition(int x, int y, bool shiftHeld) {
         }
         // Empty space in upper zone - crosshair for marquee selection
         if (isInSelectableArea(x, y)) {
-            setMouseCursor(juce::MouseCursor::CrosshairCursor);
+            if (shiftHeld) {
+                setMouseCursor(CursorManager::getInstance().getNoteDrawCursor());
+            } else {
+                setMouseCursor(juce::MouseCursor::CrosshairCursor);
+            }
         } else {
             setMouseCursor(juce::MouseCursor::NormalCursor);
         }
@@ -1712,7 +1849,11 @@ void TrackContentPanel::updateCursorForPosition(int x, int y, bool shiftHeld) {
                 }
             } else {
                 // Empty space - I-beam for creating time selection
-                setMouseCursor(juce::MouseCursor::IBeamCursor);
+                if (shiftHeld) {
+                    setMouseCursor(CursorManager::getInstance().getNoteDrawCursor());
+                } else {
+                    setMouseCursor(juce::MouseCursor::IBeamCursor);
+                }
             }
         } else {
             setMouseCursor(juce::MouseCursor::NormalCursor);
@@ -1794,8 +1935,10 @@ void TrackContentPanel::rebuildClipComponents() {
         auto clipComp = std::make_unique<ClipComponent>(clip.id, this);
 
         // Set up callbacks - all clip operations go through the undo system
-        clipComp->onClipMoved = [](ClipId id, double newStartTime) {
-            auto cmd = std::make_unique<MoveClipCommand>(id, newStartTime);
+        clipComp->onClipMoved = [this](ClipId id, double newStartTime) {
+            const double bpm = getTempo();
+            auto cmd =
+                std::make_unique<MoveClipCommand>(id, BeatPosition{newStartTime * bpm / 60.0}, bpm);
             UndoManager::getInstance().executeCommand(std::move(cmd));
         };
 
@@ -1808,7 +1951,7 @@ void TrackContentPanel::rebuildClipComponents() {
             const auto* draggedClip = ClipManager::getInstance().getClip(id);
             if (!draggedClip)
                 return;
-            double lengthDelta = newLength - draggedClip->length;
+            double lengthDelta = newLength - draggedClip->getTimelineLength(getTempo());
 
             const auto& selected = SelectionManager::getInstance().getSelectedClips();
             auto clipsToResize = (selected.size() > 1 && selected.count(id))
@@ -1822,8 +1965,10 @@ void TrackContentPanel::rebuildClipComponents() {
                 const auto* c = ClipManager::getInstance().getClip(cid);
                 if (!c)
                     continue;
-                double clipLen = juce::jmax(0.1, c->length + lengthDelta);
-                auto cmd = std::make_unique<ResizeClipCommand>(cid, clipLen, fromStart, getTempo());
+                double clipLen = juce::jmax(0.1, c->getTimelineLength(getTempo()) + lengthDelta);
+                const double bpm = getTempo();
+                auto cmd = std::make_unique<ResizeClipCommand>(
+                    cid, BeatDuration{clipLen * bpm / 60.0}, fromStart, bpm);
                 UndoManager::getInstance().executeCommand(std::move(cmd));
             }
 
@@ -1873,7 +2018,9 @@ void TrackContentPanel::rebuildClipComponents() {
         };
 
         clipComp->onClipSplit = [this](ClipId id, double splitTime) {
-            auto cmd = std::make_unique<SplitClipCommand>(id, splitTime, getTempo());
+            const double bpm = getTempo();
+            auto cmd =
+                std::make_unique<SplitClipCommand>(id, BeatPosition{splitTime * bpm / 60.0}, bpm);
             UndoManager::getInstance().executeCommand(std::move(cmd));
 
             // Get the created clip ID for selection (we need to look it up)
@@ -1942,10 +2089,10 @@ void TrackContentPanel::updateClipComponentPositions() {
         // Calculate clip bounds in beat domain (currentZoom is ppb).
         // Always use beat values when available — avoids seconds→beats
         // floating point drift that causes position to shift with zoom.
-        double startBeats =
-            (clip->startBeats >= 0.0) ? clip->startBeats : clip->startTime * tempoBPM / 60.0;
-        double clipBeats = (clip->placement.lengthBeats > 0.0) ? clip->placement.lengthBeats
-                                                               : clip->length * tempoBPM / 60.0;
+        double startBeats = clip->placement.startBeat;
+        double clipBeats = (clip->placement.lengthBeats > 0.0)
+                               ? clip->placement.lengthBeats
+                               : clip->getTimelineLength(tempoBPM) * tempoBPM / 60.0;
         int clipX = beatsToPixel(startBeats);
         int clipWidth = static_cast<int>(std::round(clipBeats * currentZoom));
 
@@ -2266,11 +2413,15 @@ bool TrackContentPanel::keyPressed(const juce::KeyPress& key) {
         // Collect clips to split
         std::vector<ClipId> clipsToSplit;
         const auto& selectedClips = selectionManager.getSelectedClips();
+        const double bpm = getTempo();
+        const auto containsSplitTime = [bpm, splitTime](const ClipInfo& clip) {
+            return splitTime > clip.getTimelineStart(bpm) && splitTime < clip.getTimelineEnd(bpm);
+        };
 
         // First, check if any selected clips contain the edit cursor
         for (ClipId clipId : selectedClips) {
             const auto* clip = ClipManager::getInstance().getClip(clipId);
-            if (clip && clip->containsTime(splitTime)) {
+            if (clip && containsSplitTime(*clip)) {
                 clipsToSplit.push_back(clipId);
             }
         }
@@ -2279,7 +2430,7 @@ bool TrackContentPanel::keyPressed(const juce::KeyPress& key) {
         if (clipsToSplit.empty()) {
             const auto& allClips = ClipManager::getInstance().getArrangementClips();
             for (const auto& clip : allClips) {
-                if (clip.containsTime(splitTime)) {
+                if (containsSplitTime(clip)) {
                     clipsToSplit.push_back(clip.id);
                 }
             }
@@ -2297,7 +2448,9 @@ bool TrackContentPanel::keyPressed(const juce::KeyPress& key) {
 
         // Split each clip through the undo system
         for (ClipId clipId : clipsToSplit) {
-            auto cmd = std::make_unique<SplitClipCommand>(clipId, splitTime, getTempo());
+            const double bpm = getTempo();
+            auto cmd = std::make_unique<SplitClipCommand>(
+                clipId, BeatPosition{splitTime * bpm / 60.0}, bpm);
             UndoManager::getInstance().executeCommand(std::move(cmd));
         }
 
@@ -2468,10 +2621,9 @@ void TrackContentPanel::rebuildAutomationLaneComponents() {
             entry.trackId = trackId;
             entry.laneId = laneId;
             entry.component = std::make_unique<AutomationLaneComponent>(laneId);
-            entry.component->setPixelsPerSecond(currentZoom * tempoBPM / 60.0);
             entry.component->setPixelsPerBeat(currentZoom);
             entry.component->setTempoBPM(tempoBPM);
-            entry.component->snapTimeToGrid = snapBeatsToGrid;
+            entry.component->snapBeatToGrid = snapBeatsToGrid;
             entry.component->getGridSpacingBeats = getGridSpacingBeats;
 
             entry.component->onHeightChanged = [this](AutomationLaneId, int) {
@@ -2516,7 +2668,6 @@ void TrackContentPanel::updateAutomationLanePositions() {
             for (auto& entry : automationLaneComponents_) {
                 if (entry.trackId == trackId && entry.laneId == laneId) {
                     entry.component->setBounds(0, y, getWidth(), height);
-                    entry.component->setPixelsPerSecond(currentZoom * tempoBPM / 60.0);
                     entry.component->setPixelsPerBeat(currentZoom);
                     entry.component->setTempoBPM(tempoBPM);
                     break;
@@ -2712,7 +2863,9 @@ void TrackContentPanel::filesDropped(const juce::StringArray& files, int x, int 
                 }
 
                 auto cmd = std::make_unique<CreateClipCommand>(
-                    ClipType::Audio, clipTrackId, dropTime, fileDuration, filePath.toStdString());
+                    ClipType::Audio, clipTrackId, BeatPosition{dropTime * tempoBPM / 60.0},
+                    BeatDuration{fileDuration * tempoBPM / 60.0}, filePath.toStdString(),
+                    ClipView::Arrangement, tempoBPM);
                 UndoManager::getInstance().executeCommand(std::move(cmd));
                 importedCount++;
             }
@@ -2735,9 +2888,10 @@ void TrackContentPanel::filesDropped(const juce::StringArray& files, int x, int 
                         static_cast<double>(reader->lengthInSamples) / reader->sampleRate;
                 }
 
-                auto cmd =
-                    std::make_unique<CreateClipCommand>(ClipType::Audio, targetTrackId, currentTime,
-                                                        fileDuration, filePath.toStdString());
+                auto cmd = std::make_unique<CreateClipCommand>(
+                    ClipType::Audio, targetTrackId, BeatPosition{currentTime * tempoBPM / 60.0},
+                    BeatDuration{fileDuration * tempoBPM / 60.0}, filePath.toStdString(),
+                    ClipView::Arrangement, tempoBPM);
                 UndoManager::getInstance().executeCommand(std::move(cmd));
 
                 currentTime += fileDuration + 0.5;
@@ -2819,8 +2973,9 @@ void TrackContentPanel::filesDropped(const juce::StringArray& files, int x, int 
                 }
 
                 // Create MIDI clip
-                auto cmd = std::make_unique<CreateClipCommand>(ClipType::MIDI, clipTrackId,
-                                                               dropTime, clipDuration);
+                auto cmd = std::make_unique<CreateClipCommand>(
+                    ClipType::MIDI, clipTrackId, BeatPosition{dropTime * projectTempo / 60.0},
+                    BeatDuration{clipDuration * projectTempo / 60.0});
                 auto* cmdPtr = cmd.get();
                 UndoManager::getInstance().executeCommand(std::move(cmd));
 
@@ -2861,9 +3016,8 @@ void TrackContentPanel::filesDropped(const juce::StringArray& files, int x, int 
                     }
                 }
 
-                // Set beat-based length and name from MIDI track/file
-                clip->lengthBeats = lengthBeats;
-                clip->startBeats = (dropTime * projectTempo) / 60.0;
+                // Set beat-based placement and name from MIDI track/file.
+                clip->setPlacementBeats((dropTime * projectTempo) / 60.0, lengthBeats);
                 auto clipName = list->getImportedFileName();
                 if (clipName.isEmpty())
                     clipName = midiFile.getFileNameWithoutExtension();

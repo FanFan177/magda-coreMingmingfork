@@ -4,6 +4,8 @@
 #include "magda/daw/audio/AudioThumbnailManager.hpp"
 #include "magda/daw/core/ClipInfo.hpp"
 #include "magda/daw/core/ClipManager.hpp"
+#include "magda/daw/ui/state/TimelineController.hpp"
+#include "magda/daw/ui/state/TimelineEvents.hpp"
 
 // Issue #1157: session/autoTempo audio clips have a single canonical update
 // path (ClipManager::applyAudioClipBeats) that separates audio source facts,
@@ -477,6 +479,63 @@ TEST_CASE("session audio import uses detector when loopInfo is still defaulted",
     path.deleteFile();
 }
 
+TEST_CASE("audio clip creation accepts beat placement without seconds round-trip",
+          "[clip][bpm][beats][audio]") {
+    ClipManager::getInstance().shutdown();
+
+    constexpr double projectBpm = 96.0;
+    constexpr double startBeats = 8.0;
+    constexpr double lengthBeats = 4.0;
+
+    ClipId clipId = ClipManager::getInstance().createAudioClipBeats(
+        1, startBeats, lengthBeats, "beat-placed.wav", ClipView::Arrangement, projectBpm);
+
+    const auto* clip = ClipManager::getInstance().getClip(clipId);
+    REQUIRE(clip != nullptr);
+    REQUIRE(clip->placement.startBeat == Approx(startBeats));
+    REQUIRE(clip->placement.lengthBeats == Approx(lengthBeats));
+    REQUIRE(clip->startBeats == Approx(startBeats));
+    REQUIRE(clip->lengthBeats == Approx(lengthBeats));
+    REQUIRE(clip->startTime == Approx(startBeats * 60.0 / projectBpm));
+    REQUIRE(clip->length == Approx(lengthBeats * 60.0 / projectBpm));
+    REQUIRE(clip->loopLength == Approx(lengthBeats * 60.0 / projectBpm));
+}
+
+TEST_CASE("audio clip manager operations accept beat placement", "[clip][bpm][beats][audio]") {
+    ClipManager::getInstance().shutdown();
+
+    constexpr double projectBpm = 96.0;
+    auto& clipManager = ClipManager::getInstance();
+    ClipId clipId = clipManager.createAudioClipBeats(1, 8.0, 4.0, "beat-ops.wav",
+                                                     ClipView::Arrangement, projectBpm);
+
+    clipManager.moveClipBeats(clipId, 16.0, projectBpm);
+    auto* clip = clipManager.getClip(clipId);
+    REQUIRE(clip != nullptr);
+    REQUIRE(clip->placement.startBeat == Approx(16.0));
+    REQUIRE(clip->startTime == Approx(16.0 * 60.0 / projectBpm));
+
+    clipManager.resizeClipBeats(clipId, 6.0, false, projectBpm);
+    REQUIRE(clip->placement.lengthBeats == Approx(6.0));
+    REQUIRE(clip->length == Approx(6.0 * 60.0 / projectBpm));
+
+    ClipId duplicateId = clipManager.duplicateClipAtBeats(clipId, 32.0, 1, projectBpm);
+    const auto* duplicate = clipManager.getClip(duplicateId);
+    REQUIRE(duplicate != nullptr);
+    REQUIRE(duplicate->placement.startBeat == Approx(32.0));
+    REQUIRE(duplicate->placement.lengthBeats == Approx(6.0));
+
+    ClipId rightId = clipManager.splitClipAtBeat(clipId, 18.0, projectBpm);
+    const auto* left = clipManager.getClip(clipId);
+    const auto* right = clipManager.getClip(rightId);
+    REQUIRE(left != nullptr);
+    REQUIRE(right != nullptr);
+    REQUIRE(left->placement.startBeat == Approx(16.0));
+    REQUIRE(left->placement.lengthBeats == Approx(2.0));
+    REQUIRE(right->placement.startBeat == Approx(18.0));
+    REQUIRE(right->placement.lengthBeats == Approx(4.0));
+}
+
 // ============================================================================
 // BPM-change invariants — the core regression suite for issue #1157.
 //
@@ -609,4 +668,45 @@ TEST_CASE("Beats-only edits never drift through float round-trips", "[clip][bpm]
         REQUIRE(c->lengthBeats == originalBeats);  // exact equality
         REQUIRE(c->getTimelineLength(bpm) == Approx(originalBeats * 60.0 / bpm));
     }
+}
+
+TEST_CASE("Tempo change never lets stale seconds resize beat-placed clips", "[clip][bpm][legacy]") {
+    ClipManager::getInstance().shutdown();
+
+    magda::TimelineController controller;
+    controller.dispatch(magda::SetTempoEvent{120.0});
+
+    ClipInfo clip;
+    clip.id = 42;
+    clip.trackId = 1;
+    clip.setMidiContent();
+    clip.view = ClipView::Arrangement;
+    clip.setPlacementBeats(8.0, 4.0);
+    clip.deriveTimesFromBeats(120.0);
+
+    // Simulate a stale seconds cache: this can happen while older UI/engine
+    // bridges still mirror beat placement into seconds asynchronously.
+    clip.length = 3.0;
+    ClipManager::getInstance().restoreClip(clip);
+
+    controller.dispatch(magda::SetTempoEvent{60.0});
+
+    const auto* updated = ClipManager::getInstance().getClip(clip.id);
+    REQUIRE(updated != nullptr);
+    REQUIRE(updated->placement.startBeat == Approx(8.0));
+    REQUIRE(updated->placement.lengthBeats == Approx(4.0));
+    REQUIRE(updated->startTime == Approx(8.0));
+    REQUIRE(updated->length == Approx(4.0));
+
+    controller.dispatch(magda::SetTempoEvent{90.0});
+
+    updated = ClipManager::getInstance().getClip(clip.id);
+    REQUIRE(updated != nullptr);
+    REQUIRE(updated->placement.startBeat == Approx(8.0));
+    REQUIRE(updated->placement.lengthBeats == Approx(4.0));
+    REQUIRE(updated->startTime == Approx(8.0 * 60.0 / 90.0));
+    REQUIRE(updated->length == Approx(4.0 * 60.0 / 90.0));
+
+    controller.dispatch(magda::SetTempoEvent{120.0});
+    ClipManager::getInstance().shutdown();
 }

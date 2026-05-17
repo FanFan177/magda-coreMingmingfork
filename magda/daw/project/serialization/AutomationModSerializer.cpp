@@ -73,7 +73,7 @@ juce::var ProjectSerializer::serializeAutomationLaneInfo(const AutomationLaneInf
     obj->setProperty("visible", lane.visible);
     obj->setProperty("expanded", lane.expanded);
     obj->setProperty("bypass", lane.bypass);
-    obj->setProperty("snapTime", lane.snapTime);
+    obj->setProperty("snapEditsToBeatGrid", lane.snapEditsToBeatGrid);
     obj->setProperty("snapValue", lane.snapValue);
     obj->setProperty("height", lane.height);
 
@@ -113,8 +113,12 @@ bool ProjectSerializer::deserializeAutomationLaneInfo(const juce::var& json,
     outLane.expanded = obj->getProperty("expanded");
     if (obj->hasProperty("bypass"))
         outLane.bypass = obj->getProperty("bypass");
-    if (obj->hasProperty("snapTime"))
-        outLane.snapTime = obj->getProperty("snapTime");
+    if (obj->hasProperty("snapEditsToBeatGrid"))
+        outLane.snapEditsToBeatGrid = obj->getProperty("snapEditsToBeatGrid");
+    else if (obj->hasProperty("snapToBeatGrid"))
+        outLane.snapEditsToBeatGrid = obj->getProperty("snapToBeatGrid");
+    else if (obj->hasProperty("snapTime"))
+        outLane.snapEditsToBeatGrid = obj->getProperty("snapTime");
     if (obj->hasProperty("snapValue"))
         outLane.snapValue = obj->getProperty("snapValue");
     outLane.height = obj->getProperty("height");
@@ -151,10 +155,10 @@ juce::var ProjectSerializer::serializeAutomationClipInfo(const AutomationClipInf
     obj->setProperty("laneId", clip.laneId);
     obj->setProperty("name", clip.name);
     obj->setProperty("colour", colourToString(clip.colour));
-    obj->setProperty("startTime", clip.startTime);
-    obj->setProperty("length", clip.length);
+    obj->setProperty("startBeats", clip.startBeats);
+    obj->setProperty("lengthBeats", clip.lengthBeats);
     obj->setProperty("looping", clip.looping);
-    obj->setProperty("loopLength", clip.loopLength);
+    obj->setProperty("loopLengthBeats", clip.loopLengthBeats);
 
     // Points
     juce::Array<juce::var> pointsArray;
@@ -179,10 +183,14 @@ bool ProjectSerializer::deserializeAutomationClipInfo(const juce::var& json,
     outClip.laneId = obj->getProperty("laneId");
     outClip.name = obj->getProperty("name").toString();
     outClip.colour = stringToColour(obj->getProperty("colour").toString());
-    outClip.startTime = obj->getProperty("startTime");
-    outClip.length = obj->getProperty("length");
+    outClip.startBeats = obj->hasProperty("startBeats") ? obj->getProperty("startBeats")
+                                                        : obj->getProperty("startTime");
+    outClip.lengthBeats = obj->hasProperty("lengthBeats") ? obj->getProperty("lengthBeats")
+                                                          : obj->getProperty("length");
     outClip.looping = obj->getProperty("looping");
-    outClip.loopLength = obj->getProperty("loopLength");
+    outClip.loopLengthBeats = obj->hasProperty("loopLengthBeats")
+                                  ? obj->getProperty("loopLengthBeats")
+                                  : obj->getProperty("loopLength");
 
     // Points
     auto pointsVar = obj->getProperty("points");
@@ -204,7 +212,7 @@ juce::var ProjectSerializer::serializeAutomationPoint(const AutomationPoint& poi
     auto* obj = new juce::DynamicObject();
 
     obj->setProperty("id", point.id);
-    obj->setProperty("time", point.time);
+    obj->setProperty("beatPosition", point.beatPosition);
     obj->setProperty("value", point.value);
     obj->setProperty("curveType", static_cast<int>(point.curveType));
     obj->setProperty("tension", point.tension);
@@ -224,7 +232,8 @@ bool ProjectSerializer::deserializeAutomationPoint(const juce::var& json,
     auto* obj = json.getDynamicObject();
 
     outPoint.id = obj->getProperty("id");
-    outPoint.time = obj->getProperty("time");
+    outPoint.beatPosition = obj->hasProperty("beatPosition") ? obj->getProperty("beatPosition")
+                                                             : obj->getProperty("time");
     outPoint.value = obj->getProperty("value");
     outPoint.curveType =
         static_cast<AutomationCurveType>(static_cast<int>(obj->getProperty("curveType")));
@@ -291,7 +300,7 @@ bool ProjectSerializer::deserializeAutomationTarget(const juce::var& json,
 juce::var ProjectSerializer::serializeBezierHandle(const BezierHandle& handle) {
     auto* obj = new juce::DynamicObject();
 
-    obj->setProperty("time", handle.time);
+    obj->setProperty("beatOffset", handle.beatOffset);
     obj->setProperty("value", handle.value);
     obj->setProperty("linked", handle.linked);
 
@@ -306,7 +315,8 @@ bool ProjectSerializer::deserializeBezierHandle(const juce::var& json, BezierHan
 
     auto* obj = json.getDynamicObject();
 
-    outHandle.time = obj->getProperty("time");
+    outHandle.beatOffset =
+        obj->hasProperty("beatOffset") ? obj->getProperty("beatOffset") : obj->getProperty("time");
     outHandle.value = obj->getProperty("value");
     outHandle.linked = obj->getProperty("linked");
 
@@ -555,10 +565,17 @@ juce::var ProjectSerializer::serializeParameterInfo(const ParameterInfo& data) {
     SER(maxValue);
     SER(defaultValue);
     SER(currentValue);
+    SER(teMinValue);
+    SER(teMaxValue);
     SER(scale);
     SER(skewFactor);
+    SER(scaleAnchor);
+    SER(displayFormat);
     SER(modulatable);
     SER(bipolarModulation);
+    SER(gateSlotIndex);
+    SER(gateNegated);
+    SER(hidden);
 
     // Choices (vector of strings — stays manual)
     juce::Array<juce::var> choicesArray;
@@ -566,6 +583,21 @@ juce::var ProjectSerializer::serializeParameterInfo(const ParameterInfo& data) {
         choicesArray.add(choice);
     }
     obj->setProperty("choices", juce::var(choicesArray));
+
+    juce::Array<juce::var> labelTicksArray;
+    for (const auto& [value, label] : data.labelTicks) {
+        auto* tickObj = new juce::DynamicObject();
+        tickObj->setProperty("value", value);
+        tickObj->setProperty("label", label);
+        labelTicksArray.add(juce::var(tickObj));
+    }
+    obj->setProperty("labelTicks", juce::var(labelTicksArray));
+
+    juce::Array<juce::var> valueTableArray;
+    for (const auto& value : data.valueTable) {
+        valueTableArray.add(value);
+    }
+    obj->setProperty("valueTable", juce::var(valueTableArray));
 
     return juce::var(obj);
 }
@@ -588,12 +620,47 @@ bool ProjectSerializer::deserializeParameterInfo(const juce::var& json, Paramete
     DESER(modulatable);
     DESER(bipolarModulation);
 
+    if (obj->hasProperty("teMinValue"))
+        DESER(teMinValue);
+    if (obj->hasProperty("teMaxValue"))
+        DESER(teMaxValue);
+    if (obj->hasProperty("scaleAnchor"))
+        DESER(scaleAnchor);
+    if (obj->hasProperty("displayFormat"))
+        DESER(displayFormat);
+    if (obj->hasProperty("gateSlotIndex"))
+        DESER(gateSlotIndex);
+    if (obj->hasProperty("gateNegated"))
+        DESER(gateNegated);
+    if (obj->hasProperty("hidden"))
+        DESER(hidden);
+
     // Choices (vector of strings — stays manual)
     auto choicesVar = obj->getProperty("choices");
     if (choicesVar.isArray()) {
         auto* arr = choicesVar.getArray();
         for (const auto& choiceVar : *arr) {
             data.choices.push_back(choiceVar.toString());
+        }
+    }
+
+    auto labelTicksVar = obj->getProperty("labelTicks");
+    if (labelTicksVar.isArray()) {
+        auto* arr = labelTicksVar.getArray();
+        for (const auto& tickVar : *arr) {
+            if (auto* tickObj = tickVar.getDynamicObject()) {
+                data.labelTicks.emplace_back(
+                    static_cast<float>(static_cast<double>(tickObj->getProperty("value"))),
+                    tickObj->getProperty("label").toString());
+            }
+        }
+    }
+
+    auto valueTableVar = obj->getProperty("valueTable");
+    if (valueTableVar.isArray()) {
+        auto* arr = valueTableVar.getArray();
+        for (const auto& valueVar : *arr) {
+            data.valueTable.push_back(valueVar.toString());
         }
     }
 

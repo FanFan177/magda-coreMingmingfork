@@ -3,6 +3,7 @@
 #include <juce_gui_basics/juce_gui_basics.h>
 
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "NoteComponent.hpp"
@@ -11,6 +12,7 @@
 #include "core/ClipManager.hpp"
 #include "core/ClipTypes.hpp"
 #include "core/MidiNoteCommands.hpp"
+#include "core/TempoUtils.hpp"
 
 namespace magda {
 
@@ -179,8 +181,8 @@ class PianoRollGridComponent : public juce::Component,
     void clipSelectionChanged(ClipId /*clipId*/) override {}
 
     // Callbacks for parent to handle undo/redo
-    std::function<void(ClipId, double, int, int)>
-        onNoteAdded;  // clipId, beat, noteNumber, velocity
+    std::function<void(ClipId, double, int, double, int)>
+        onNoteAdded;  // clipId, beat, noteNumber, length, velocity
     std::function<void(ClipId, size_t, double, int)>
         onNoteMoved;  // clipId, index, newBeat, newNoteNumber
     std::function<void(ClipId, size_t, double, int)>
@@ -253,7 +255,7 @@ class PianoRollGridComponent : public juce::Component,
     // Grid snap
     double gridResolutionBeats_ = 0.25;  // Default 1/16 note
     bool snapEnabled_ = true;
-    int timeSignatureNumerator_ = 4;
+    int timeSignatureNumerator_ = DEFAULT_TIME_SIGNATURE_NUMERATOR;
 
     // Clip position and display mode
     double clipStartBeats_ = 0.0;        // Clip's start position on timeline (in beats)
@@ -294,6 +296,18 @@ class PianoRollGridComponent : public juce::Component,
     bool isDragSelecting_ = false;
     juce::Point<int> dragSelectStart_;
     juce::Point<int> dragSelectEnd_;
+
+    // Shift-drag note creation state
+    bool isDrawingNote_ = false;
+    ClipId drawingNoteClipId_ = INVALID_CLIP_ID;
+    double drawingNoteStartBeat_ = 0.0;  // clip-relative
+    double drawingNoteEndBeat_ = 0.0;    // clip-relative
+    int drawingNoteNumber_ = 60;
+    double defaultNoteLengthBeats_ = 0.0;  // <= 0 follows current grid
+    int defaultNoteVelocity_ = 100;
+    double getDefaultNoteLengthBeats() const;
+    void addDefaultNoteMenuItems(juce::PopupMenu& menu) const;
+    bool handleDefaultNoteMenuResult(int result);
 
     // Pending selection to apply after next refresh
     ClipId pendingSelectClipId_ = INVALID_CLIP_ID;
@@ -347,6 +361,15 @@ class PianoRollGridComponent : public juce::Component,
     void updateNoteComponentBounds();
 
     // Helpers
+    struct NoteInsertPosition {
+        ClipId clipId = INVALID_CLIP_ID;
+        double beat = 0.0;  // clip-relative
+        int noteNumber = 60;
+    };
+    std::optional<NoteInsertPosition> getNoteInsertPosition(juce::Point<int> localPos) const;
+    double displayBeatForClipBeat(ClipId clipId, double clipBeat) const;
+    double clipBeatForDisplayX(ClipId clipId, int mouseX) const;
+    void updateEmptyGridCursor(const juce::ModifierKeys& mods, int mouseX);
     bool isBlackKey(int noteNumber) const;
     juce::Colour getClipColour() const;
     juce::Colour getColourForClip(ClipId clipId) const;

@@ -9,12 +9,13 @@
 #include <memory>
 #include <optional>
 
+#include "../../core/ChainNodePath.hpp"
 #include "../../core/DeviceInfo.hpp"
 #include "../../core/SelectionManager.hpp"
 #include "../../core/TypeIds.hpp"
 #include "modifiers/CurveSnapshot.hpp"
 #include "plugins/DrumGridPlugin.hpp"
-#include "processors/DeviceProcessor.hpp"
+#include "processors/base/DeviceProcessor.hpp"
 #include "racks/InstrumentRackManager.hpp"
 #include "racks/RackSyncManager.hpp"
 
@@ -132,6 +133,17 @@ class PluginManager : public daw::audio::DrumGridPlugin::Listener {
     void syncTrackPlugins(TrackId trackId);
 
     /**
+     * @brief Prepare the live TE graph for an explicit chain-element move.
+     *
+     * Captures live plugin state, then detaches runtime mappings that cannot be
+     * carried across the requested source/destination containers. This is used
+     * by TrackManager::moveChainElement, including undo/redo commands, so scope
+     * transitions don't leave a stale plugin in the old chain.
+     */
+    void prepareForChainElementMove(const ChainNodePath& sourceElementPath,
+                                    const ChainNodePath& destinationChainPath);
+
+    /**
      * @brief Clean up all PluginManager state for a deleted track
      * @param trackId The MAGDA track ID being removed
      *
@@ -217,6 +229,17 @@ class PluginManager : public daw::audio::DrumGridPlugin::Listener {
      */
     void registerRackPluginProcessor(DeviceId deviceId, te::Plugin::Ptr plugin,
                                      const DeviceInfo& device);
+
+    /**
+     * @brief Refresh DeviceInfo.parameters for a device whose processor's
+     *        parameter set changed at runtime.
+     *
+     * Re-runs `populateParameters` on the device's processor and pushes
+     * the result into TrackManager. Used by plugins that swap their
+     * parameter layout post-construction (FaustPlugin reloading a
+     * .dsp). No-op if no processor is registered for the device.
+     */
+    void refreshDeviceParameters(DeviceId deviceId);
 
     /**
      * @brief Sync a multi-output track's plugin chain
@@ -521,13 +544,11 @@ class PluginManager : public daw::audio::DrumGridPlugin::Listener {
     te::Plugin::Ptr loadDeviceAsPlugin(TrackId trackId, const DeviceInfo& device,
                                        int insertIndex = -1);
 
+    void detachDeviceRuntimeForChainMove(TrackId trackId, DeviceId deviceId);
+    void detachRackRuntimeForChainMove(RackId rackId);
+
     // Poll for async plugin load completion (TE's background thread instantiation)
     void pollAsyncPluginLoad(TrackId trackId, DeviceId deviceId, te::Plugin::Ptr plugin);
-
-    // Plugin creation helpers
-    te::Plugin::Ptr createToneGenerator(te::AudioTrack* track);
-    te::Plugin::Ptr createLevelMeter(te::AudioTrack* track);
-    te::Plugin::Ptr createFourOscSynth(te::AudioTrack* track);
 
     // Create a TE internal plugin, restoring saved ValueTree state if available.
     // Falls back to creating a fresh plugin from xmlTypeName when no saved state exists.
@@ -580,6 +601,7 @@ class PluginManager : public daw::audio::DrumGridPlugin::Listener {
             curveSnapshots;                              // ModId-only (device scope implicit)
         std::map<int, te::MacroParameter*> macroParams;  // Can be empty
         te::Plugin::Ptr midiReceivePlugin;               // Can be null
+        te::Plugin::Ptr midiRestorePlugin;               // Can be null
         bool isPendingLoad = false;                      // In-flight async load
     };
     std::map<DeviceId, SyncedDevice> syncedDevices_;

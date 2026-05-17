@@ -2,8 +2,10 @@
 
 #include <algorithm>
 
+#include "../project/ProjectManager.hpp"
 #include "ClipManager.hpp"
 #include "Config.hpp"
+#include "TempoUtils.hpp"
 #include "TrackInfo.hpp"
 #include "TrackManager.hpp"
 
@@ -369,10 +371,12 @@ void SelectionManager::extendSelectionTo(ClipId targetClipId) {
         return;
     }
 
-    // Calculate the rectangular region between anchor and target
-    double minTime = std::min(anchorClip->startTime, targetClip->startTime);
-    double maxTime = std::max(anchorClip->startTime + anchorClip->length,
-                              targetClip->startTime + targetClip->length);
+    const double bpm = ProjectManager::getInstance().getCurrentProjectInfo().tempo;
+
+    // Calculate the rectangular region between anchor and target. Placement
+    // beats are authoritative; seconds fields are only derived caches.
+    double minTime = std::min(anchorClip->getTimelineStart(bpm), targetClip->getTimelineStart(bpm));
+    double maxTime = std::max(anchorClip->getTimelineEnd(bpm), targetClip->getTimelineEnd(bpm));
 
     TrackId minTrackId = std::min(anchorClip->trackId, targetClip->trackId);
     TrackId maxTrackId = std::max(anchorClip->trackId, targetClip->trackId);
@@ -388,8 +392,9 @@ void SelectionManager::extendSelectionTo(ClipId targetClipId) {
         }
 
         // Check if clip overlaps with time range
-        double clipEnd = clip.startTime + clip.length;
-        if (clip.startTime < maxTime && clipEnd > minTime) {
+        const double clipStart = clip.getTimelineStart(bpm);
+        const double clipEnd = clip.getTimelineEnd(bpm);
+        if (clipStart < maxTime && clipEnd > minTime) {
             clipsInRange.insert(clip.id);
         }
     }
@@ -423,8 +428,14 @@ void SelectionManager::selectTimeRange(double startTime, double endTime,
     selectedClipId_ = INVALID_CLIP_ID;
 
     selectionType_ = SelectionType::TimeRange;
-    timeRangeSelection_.startTime = startTime;
-    timeRangeSelection_.endTime = endTime;
+    if (startTime > endTime)
+        std::swap(startTime, endTime);
+    const double projectBpm = ProjectManager::getInstance().getCurrentProjectInfo().tempo;
+    const double bpm = isValidBpm(projectBpm) ? projectBpm : DEFAULT_BPM;
+    timeRangeSelection_.startBeats = startTime * bpm / 60.0;
+    timeRangeSelection_.endBeats = endTime * bpm / 60.0;
+    timeRangeSelection_.startTime = timeRangeSelection_.startBeats * 60.0 / bpm;
+    timeRangeSelection_.endTime = timeRangeSelection_.endBeats * 60.0 / bpm;
     timeRangeSelection_.trackIds = trackIds;
 
     // Sync with managers (clear their selections)
@@ -657,6 +668,7 @@ void SelectionManager::clearSelection() {
     noteSelection_ = NoteSelection{};
     deviceSelection_ = DeviceSelection{};
     selectedChainNode_ = ChainNodePath{};
+    selectedChainNodes_.clear();
     modSelection_ = ModSelection{};
     macroSelection_ = MacroSelection{};
     modsPanelSelection_ = ModsPanelSelection{};
@@ -671,6 +683,59 @@ void SelectionManager::clearSelection() {
     ClipManager::getInstance().clearClipSelection();
 
     notifySelectionTypeChanged(SelectionType::None);
+}
+
+void SelectionManager::clearSelectionForDeletedChainNode(const ChainNodePath& deletedPath) {
+    if (!deletedPath.isValid() || selectionType_ == SelectionType::None)
+        return;
+
+    auto pointsAtDeletedNode = [&deletedPath](const ChainNodePath& selectedPath) {
+        if (!selectedPath.isValid())
+            return false;
+        if (selectedPath == deletedPath)
+            return true;
+
+        const auto deletedDeviceId = deletedPath.getDeviceId();
+        return deletedDeviceId != INVALID_DEVICE_ID &&
+               selectedPath.trackId == deletedPath.trackId &&
+               selectedPath.getDeviceId() == deletedDeviceId;
+    };
+
+    bool shouldClear = false;
+    switch (selectionType_) {
+        case SelectionType::ChainNode:
+            shouldClear = pointsAtDeletedNode(selectedChainNode_);
+            break;
+        case SelectionType::Param:
+            shouldClear = pointsAtDeletedNode(paramSelection_.devicePath);
+            break;
+        case SelectionType::Mod:
+            shouldClear = pointsAtDeletedNode(modSelection_.parentPath);
+            break;
+        case SelectionType::Macro:
+            shouldClear = pointsAtDeletedNode(macroSelection_.parentPath);
+            break;
+        case SelectionType::ModsPanel:
+            shouldClear = pointsAtDeletedNode(modsPanelSelection_.parentPath);
+            break;
+        case SelectionType::MacrosPanel:
+            shouldClear = pointsAtDeletedNode(macrosPanelSelection_.parentPath);
+            break;
+        case SelectionType::Device:
+            shouldClear = deviceSelection_.trackId == deletedPath.trackId &&
+                          deviceSelection_.deviceId == deletedPath.getDeviceId();
+            break;
+        default:
+            break;
+    }
+
+    if (!shouldClear)
+        return;
+
+    if (selectionType_ == SelectionType::ChainNode)
+        clearChainNodeSelection();
+    else
+        clearSelection();
 }
 
 // ============================================================================
@@ -803,6 +868,9 @@ void SelectionManager::selectChainNode(const ChainNodePath& path, const juce::St
 
     selectionType_ = SelectionType::ChainNode;
     selectedChainNode_ = path;
+    selectedChainNodes_.clear();
+    if (path.isValid())
+        selectedChainNodes_.push_back(path);
     chainNodeDisplayName_ = displayName;
     chainNodeDisplayType_ = displayType;
 
@@ -824,12 +892,96 @@ void SelectionManager::selectChainNode(const ChainNodePath& path, const juce::St
     }
 }
 
+void SelectionManager::toggleChainNodeSelection(const ChainNodePath& path) {
+    if (!path.isValid()) {
+        return;
+    }
+
+    if (selectionType_ != SelectionType::ChainNode &&
+        selectionType_ != SelectionType::MultiChainNode) {
+        selectChainNode(path);
+        return;
+    }
+
+    auto it = std::find(selectedChainNodes_.begin(), selectedChainNodes_.end(), path);
+    if (it != selectedChainNodes_.end()) {
+        selectedChainNodes_.erase(it);
+    } else {
+        selectedChainNodes_.push_back(path);
+    }
+
+    if (selectedChainNodes_.empty()) {
+        clearChainNodeSelection();
+        return;
+    }
+
+    selectionType_ =
+        selectedChainNodes_.size() > 1 ? SelectionType::MultiChainNode : SelectionType::ChainNode;
+    selectedChainNode_ = selectedChainNodes_.back();
+    chainNodeDisplayName_.clear();
+    chainNodeDisplayType_.clear();
+
+    const bool trackChanged = alignPrimaryTrackToOwner(selectedChainNode_.trackId);
+    ClipManager::getInstance().clearClipSelection();
+
+    notifySelectionTypeChanged(selectionType_);
+    notifyChainNodeSelectionChanged(selectedChainNode_);
+    if (trackChanged)
+        notifyTrackSelectionChanged(selectedTrackId_);
+}
+
+void SelectionManager::selectChainNodes(const std::vector<ChainNodePath>& paths) {
+    selectedChainNodes_.clear();
+    for (const auto& path : paths) {
+        if (path.isValid() && std::find(selectedChainNodes_.begin(), selectedChainNodes_.end(),
+                                        path) == selectedChainNodes_.end()) {
+            selectedChainNodes_.push_back(path);
+        }
+    }
+
+    if (selectedChainNodes_.empty()) {
+        clearChainNodeSelection();
+        return;
+    }
+
+    const auto newType =
+        selectedChainNodes_.size() > 1 ? SelectionType::MultiChainNode : SelectionType::ChainNode;
+    const bool typeChanged = selectionType_ != newType;
+
+    selectedClipId_ = INVALID_CLIP_ID;
+    selectedClipIds_.clear();
+    timeRangeSelection_ = TimeRangeSelection{};
+    noteSelection_ = NoteSelection{};
+    deviceSelection_ = DeviceSelection{};
+    modSelection_ = ModSelection{};
+    macroSelection_ = MacroSelection{};
+    modsPanelSelection_ = ModsPanelSelection{};
+    macrosPanelSelection_ = MacrosPanelSelection{};
+    paramSelection_ = ParamSelection{};
+
+    selectionType_ = newType;
+    selectedChainNode_ = selectedChainNodes_.back();
+    chainNodeDisplayName_.clear();
+    chainNodeDisplayType_.clear();
+
+    const bool trackChanged = alignPrimaryTrackToOwner(selectedChainNode_.trackId);
+    ClipManager::getInstance().clearClipSelection();
+
+    if (typeChanged)
+        notifySelectionTypeChanged(selectionType_);
+    notifyChainNodeSelectionChanged(selectedChainNode_);
+    if (trackChanged)
+        notifyTrackSelectionChanged(selectedTrackId_);
+}
+
 void SelectionManager::clearChainNodeSelection() {
-    if (selectionType_ != SelectionType::ChainNode) {
+    if (selectionType_ != SelectionType::ChainNode &&
+        selectionType_ != SelectionType::MultiChainNode) {
         return;
     }
 
     selectedChainNode_ = ChainNodePath{};
+    selectedChainNodes_.clear();
 
     // Return to track selection if we have a track
     if (selectedTrackId_ != INVALID_TRACK_ID) {
@@ -880,6 +1032,7 @@ void SelectionManager::selectMod(const ChainNodePath& parentPath, int modIndex) 
     noteSelection_ = NoteSelection{};
     deviceSelection_ = DeviceSelection{};
     selectedChainNode_ = ChainNodePath{};
+    selectedChainNodes_.clear();
     macroSelection_ = MacroSelection{};
     modsPanelSelection_ = ModsPanelSelection{};
     macrosPanelSelection_ = MacrosPanelSelection{};
@@ -945,6 +1098,7 @@ void SelectionManager::selectMacro(const ChainNodePath& parentPath, int macroInd
     noteSelection_ = NoteSelection{};
     deviceSelection_ = DeviceSelection{};
     selectedChainNode_ = ChainNodePath{};
+    selectedChainNodes_.clear();
     modSelection_ = ModSelection{};
     modsPanelSelection_ = ModsPanelSelection{};
     macrosPanelSelection_ = MacrosPanelSelection{};
@@ -1016,6 +1170,7 @@ void SelectionManager::selectParam(const ChainNodePath& devicePath, int paramInd
     noteSelection_ = NoteSelection{};
     deviceSelection_ = DeviceSelection{};
     selectedChainNode_ = ChainNodePath{};
+    selectedChainNodes_.clear();
     modSelection_ = ModSelection{};
     macroSelection_ = MacroSelection{};
     modsPanelSelection_ = ModsPanelSelection{};
@@ -1080,6 +1235,7 @@ void SelectionManager::selectModsPanel(const ChainNodePath& parentPath) {
     noteSelection_ = NoteSelection{};
     deviceSelection_ = DeviceSelection{};
     selectedChainNode_ = ChainNodePath{};
+    selectedChainNodes_.clear();
     modSelection_ = ModSelection{};
     macroSelection_ = MacroSelection{};
     macrosPanelSelection_ = MacrosPanelSelection{};
@@ -1143,6 +1299,7 @@ void SelectionManager::selectMacrosPanel(const ChainNodePath& parentPath) {
     noteSelection_ = NoteSelection{};
     deviceSelection_ = DeviceSelection{};
     selectedChainNode_ = ChainNodePath{};
+    selectedChainNodes_.clear();
     modSelection_ = ModSelection{};
     macroSelection_ = MacroSelection{};
     modsPanelSelection_ = ModsPanelSelection{};
@@ -1206,6 +1363,7 @@ void SelectionManager::selectAutomationLane(AutomationLaneId laneId) {
     noteSelection_ = NoteSelection{};
     deviceSelection_ = DeviceSelection{};
     selectedChainNode_ = ChainNodePath{};
+    selectedChainNodes_.clear();
     modSelection_ = ModSelection{};
     macroSelection_ = MacroSelection{};
     modsPanelSelection_ = ModsPanelSelection{};
@@ -1274,6 +1432,7 @@ void SelectionManager::selectAutomationClip(AutomationClipId clipId, AutomationL
     noteSelection_ = NoteSelection{};
     deviceSelection_ = DeviceSelection{};
     selectedChainNode_ = ChainNodePath{};
+    selectedChainNodes_.clear();
     modSelection_ = ModSelection{};
     macroSelection_ = MacroSelection{};
     modsPanelSelection_ = ModsPanelSelection{};
@@ -1338,6 +1497,7 @@ void SelectionManager::selectAutomationPoint(AutomationLaneId laneId, Automation
     noteSelection_ = NoteSelection{};
     deviceSelection_ = DeviceSelection{};
     selectedChainNode_ = ChainNodePath{};
+    selectedChainNodes_.clear();
     modSelection_ = ModSelection{};
     macroSelection_ = MacroSelection{};
     modsPanelSelection_ = ModsPanelSelection{};
@@ -1383,6 +1543,7 @@ void SelectionManager::selectAutomationPoints(AutomationLaneId laneId,
     noteSelection_ = NoteSelection{};
     deviceSelection_ = DeviceSelection{};
     selectedChainNode_ = ChainNodePath{};
+    selectedChainNodes_.clear();
     modSelection_ = ModSelection{};
     macroSelection_ = MacroSelection{};
     modsPanelSelection_ = ModsPanelSelection{};

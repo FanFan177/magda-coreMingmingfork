@@ -11,6 +11,23 @@ namespace magda {
 
 namespace te = tracktion;
 
+struct ModifierAssignmentMapping {
+    float value = 0.0f;
+    float offset = 0.0f;
+};
+
+inline ModifierAssignmentMapping mapLinkAssignment(float amount, bool bipolar) {
+    return {bipolar ? amount * 2.0f : amount, bipolar ? -amount : 0.0f};
+}
+
+template <typename Link>
+inline te::AutomatableParameter::ModifierAssignment::Ptr addLinkModifier(
+    te::AutomatableParameter& param, te::AutomatableParameter::ModifierSource& source,
+    const Link& link) {
+    const auto mapping = mapLinkAssignment(link.amount, link.bipolar);
+    return param.addModifier(source, mapping.value, mapping.offset);
+}
+
 inline float mapWaveform(LFOWaveform waveform) {
     switch (waveform) {
         case LFOWaveform::Sine:
@@ -111,6 +128,19 @@ inline void applyLFOProperties(te::LFOModifier* lfo, const ModInfo& modInfo,
     lfo->phaseParam->setParameterFromHost(modInfo.phaseOffset, juce::dontSendNotification);
     lfo->syncTypeParam->setParameterFromHost(syncType, juce::dontSendNotification);
     lfo->rateTypeParam->setParameterFromHost(rateType, juce::dontSendNotification);
+
+    // MIDI-triggered LFOs are gated from MAGDA's held-note model, not from
+    // TE's native modifier input. That keeps top-level and rack-contained
+    // LFOs consistent: note-on opens the gate, all-notes-off closes it.
+    //
+    // Audio-triggered LFOs are still gated by the audio sidechain path so
+    // one-shots can continue through release while normal loops close on
+    // the audio gate.
+    lfo->setGateOnTriggerSource(modInfo.triggerMode == LFOTriggerMode::MIDI);
+    if (modInfo.triggerMode == LFOTriggerMode::MIDI)
+        lfo->setGated(!modInfo.running);
+    else if (modInfo.triggerMode != LFOTriggerMode::Audio)
+        lfo->setGated(false);
 }
 
 /**

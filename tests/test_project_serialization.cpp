@@ -117,6 +117,40 @@ TEST_CASE("Project Serialization Basics", "[project][serialization]") {
         // Cleanup
     }
 
+    SECTION("Save As serializes migrated media paths") {
+        auto& projectManager = ProjectManager::getInstance();
+        REQUIRE(projectManager.newProject());
+
+        auto trackId = TrackManager::getInstance().createTrack("Audio Track", TrackType::Audio);
+
+        auto sourceFile =
+            projectManager.getRecordingsDirectory().getChildFile("unsaved_recording.wav");
+        auto sourceDir = sourceFile.getParentDirectory();
+        sourceDir.createDirectory();
+        REQUIRE(sourceDir.isDirectory());
+        REQUIRE(sourceFile.replaceWithText("placeholder audio"));
+
+        auto clipId = ClipManager::getInstance().createAudioClipBeats(
+            trackId, 0.0, 4.0, sourceFile.getFullPathName(), ClipView::Arrangement, 120.0);
+        REQUIRE(clipId != INVALID_CLIP_ID);
+
+        auto tempFile = fixture.createTempProjectFile(".mgd");
+        auto actualFile = ProjectTestFixture::wrappedPath(tempFile);
+        REQUIRE(projectManager.saveProjectAs(tempFile));
+
+        auto expectedFile = actualFile.getParentDirectory()
+                                .getChildFile(actualFile.getFileNameWithoutExtension() + "_Media")
+                                .getChildFile("recordings")
+                                .getChildFile(sourceFile.getFileName());
+
+        StagedProjectData staged;
+        REQUIRE(ProjectSerializer::loadAndStage(actualFile, staged));
+        REQUIRE(staged.clips.size() == 1);
+        REQUIRE(staged.clips[0].isAudio());
+        REQUIRE(staged.clips[0].audio().source.filePath == expectedFile.getFullPathName());
+        REQUIRE(expectedFile.existsAsFile());
+    }
+
     SECTION("Project info serialization roundtrip") {
         ProjectInfo info;
         info.name = "Test Project";
@@ -213,6 +247,110 @@ TEST_CASE("Audio clip serialization separates source facts from interpretation",
     REQUIRE(restored->audio().interpretation.totalBeats == Approx(8.0));
     REQUIRE(restored->audio().interpretation.totalBeatsLocked);
     REQUIRE(restored->loopLengthBeats == Approx(8.0));
+}
+
+TEST_CASE("Session clip follow action settings roundtrip", "[project][serialization][session]") {
+    ProjectTestFixture fixture;
+
+    auto trackId = TrackManager::getInstance().createTrack("MIDI", TrackType::Audio);
+
+    ClipInfo clip;
+    clip.id = 91;
+    clip.trackId = trackId;
+    clip.name = "Follow";
+    clip.setMidiContent();
+    clip.view = ClipView::Session;
+    clip.sceneIndex = 2;
+    clip.loopEnabled = true;
+    clip.setPlacementBeats(0.0, 4.0);
+    clip.loopLengthBeats = 4.0;
+    clip.launchQuantize = LaunchQuantize::QuarterBar;
+    clip.followAction = FollowAction::PlayNext;
+    clip.followActionDelayBeats = 0.5;
+    clip.followActionLoopCount = 3;
+    ClipManager::getInstance().restoreClip(clip);
+
+    ProjectInfo info;
+    info.name = "Follow Actions";
+    info.tempo = 120.0;
+
+    auto json = ProjectSerializer::serializeProject(info);
+    auto* rootObj = json.getDynamicObject();
+    REQUIRE(rootObj != nullptr);
+    auto* clips = rootObj->getProperty("clips").getArray();
+    REQUIRE(clips != nullptr);
+    REQUIRE(clips->size() == 1);
+
+    auto* clipObj = clips->getReference(0).getDynamicObject();
+    REQUIRE(clipObj != nullptr);
+    REQUIRE(static_cast<int>(clipObj->getProperty("followAction")) ==
+            static_cast<int>(FollowAction::PlayNext));
+    REQUIRE(static_cast<double>(clipObj->getProperty("followActionDelayBeats")) == Approx(0.5));
+    REQUIRE(static_cast<int>(clipObj->getProperty("followActionLoopCount")) == 3);
+
+    ProjectInfo loaded;
+    REQUIRE(ProjectSerializer::deserializeProject(json, loaded));
+    auto* restored = ClipManager::getInstance().getClip(clip.id);
+    REQUIRE(restored != nullptr);
+    REQUIRE(restored->followAction == FollowAction::PlayNext);
+    REQUIRE(restored->followActionDelayBeats == Approx(0.5));
+    REQUIRE(restored->followActionLoopCount == 3);
+}
+
+TEST_CASE("Looped MIDI clip serialization preserves loop region separate from placement",
+          "[project][serialization][midi][loop]") {
+    ProjectTestFixture fixture;
+
+    auto trackId = TrackManager::getInstance().createTrack("MIDI", TrackType::Audio);
+
+    ClipInfo clip;
+    clip.id = 92;
+    clip.trackId = trackId;
+    clip.name = "Two Bar Loop";
+    clip.setMidiContent();
+    clip.view = ClipView::Arrangement;
+    clip.loopEnabled = true;
+    clip.setPlacementBeats(0.0, 68.0);  // 17 bars at 4/4
+    clip.loopLengthBeats = 8.0;         // 2 bars at 4/4
+    clip.loopLength = 4.0;              // 8 beats at 120 BPM
+    clip.midiOffset = 1.0;
+
+    MidiNote note;
+    note.startBeat = 0.0;
+    note.lengthBeats = 1.0;
+    note.noteNumber = 60;
+    clip.midiNotes.push_back(note);
+
+    ClipManager::getInstance().restoreClip(clip);
+
+    ProjectInfo info;
+    info.name = "Looped MIDI";
+    info.tempo = 120.0;
+
+    auto json = ProjectSerializer::serializeProject(info);
+    auto* rootObj = json.getDynamicObject();
+    REQUIRE(rootObj != nullptr);
+    auto* clips = rootObj->getProperty("clips").getArray();
+    REQUIRE(clips != nullptr);
+    REQUIRE(clips->size() == 1);
+
+    auto* clipObj = clips->getReference(0).getDynamicObject();
+    REQUIRE(clipObj != nullptr);
+    auto* placementObj = clipObj->getProperty("placement").getDynamicObject();
+    REQUIRE(placementObj != nullptr);
+    REQUIRE(static_cast<double>(placementObj->getProperty("lengthBeats")) == Approx(68.0));
+    REQUIRE(static_cast<double>(clipObj->getProperty("loopLengthBeats")) == Approx(8.0));
+
+    ProjectInfo loaded;
+    REQUIRE(ProjectSerializer::deserializeProject(json, loaded));
+    auto* restored = ClipManager::getInstance().getClip(clip.id);
+    REQUIRE(restored != nullptr);
+    REQUIRE(restored->isMidi());
+    REQUIRE(restored->loopEnabled);
+    REQUIRE(restored->placement.lengthBeats == Approx(68.0));
+    REQUIRE(restored->loopLengthBeats == Approx(8.0));
+    REQUIRE(restored->loopLength == Approx(4.0));
+    REQUIRE(restored->midiOffset == Approx(1.0));
 }
 
 TEST_CASE("Clip serialization validates type and audio schema", "[project][serialization][audio]") {
@@ -325,6 +463,160 @@ TEST_CASE("Clip serialization validates type and audio schema", "[project][seria
         REQUIRE(restored->warpMarkers.front().sourceTime == Approx(1.0));
         REQUIRE(restored->warpMarkers.front().warpTime == Approx(1.25));
     }
+}
+
+TEST_CASE("Automation serialization uses beat-domain property names",
+          "[project][serialization][automation][beats]") {
+    ProjectTestFixture fixture;
+
+    auto trackId = TrackManager::getInstance().createTrack("Automation", TrackType::Audio);
+    auto& automation = AutomationManager::getInstance();
+    auto laneId =
+        automation.createLane(ControlTarget::trackVolume(trackId), AutomationLaneType::ClipBased);
+    automation.setLaneSnapEditsToBeatGrid(laneId, false);
+    auto clipId = automation.createClip(laneId, 4.0, 8.0);
+    REQUIRE(clipId != INVALID_AUTOMATION_CLIP_ID);
+    automation.setClipLooping(clipId, true);
+    automation.setClipLoopLength(clipId, 2.0);
+    auto pointId = automation.addPointToClip(clipId, 1.5, 0.75, AutomationCurveType::Bezier);
+    REQUIRE(pointId != INVALID_AUTOMATION_POINT_ID);
+    BezierHandle inHandle;
+    inHandle.beatOffset = -0.25;
+    inHandle.value = -0.1;
+    BezierHandle outHandle;
+    outHandle.beatOffset = 0.5;
+    outHandle.value = 0.2;
+    automation.setPointHandlesInClip(clipId, pointId, inHandle, outHandle);
+
+    ProjectInfo info;
+    info.name = "Automation Beats";
+    auto json = ProjectSerializer::serializeProject(info);
+    auto* rootObj = json.getDynamicObject();
+    REQUIRE(rootObj != nullptr);
+    auto* automationObj = rootObj->getProperty("automation").getDynamicObject();
+    REQUIRE(automationObj != nullptr);
+    auto* lanes = automationObj->getProperty("lanes").getArray();
+    REQUIRE(lanes != nullptr);
+    REQUIRE(lanes->size() == 1);
+    auto* laneObj = lanes->getReference(0).getDynamicObject();
+    REQUIRE(laneObj != nullptr);
+    REQUIRE(laneObj->hasProperty("snapEditsToBeatGrid"));
+    REQUIRE_FALSE(laneObj->hasProperty("snapToBeatGrid"));
+    REQUIRE_FALSE(laneObj->hasProperty("snapTime"));
+    REQUIRE(static_cast<bool>(laneObj->getProperty("snapEditsToBeatGrid")) == false);
+
+    auto* clips = automationObj->getProperty("clips").getArray();
+    REQUIRE(clips != nullptr);
+    REQUIRE(clips->size() == 1);
+
+    auto* obj = clips->getReference(0).getDynamicObject();
+    REQUIRE(obj != nullptr);
+    REQUIRE(obj->hasProperty("startBeats"));
+    REQUIRE(obj->hasProperty("lengthBeats"));
+    REQUIRE(obj->hasProperty("loopLengthBeats"));
+    REQUIRE_FALSE(obj->hasProperty("startTime"));
+    REQUIRE_FALSE(obj->hasProperty("length"));
+    REQUIRE_FALSE(obj->hasProperty("loopLength"));
+    REQUIRE(static_cast<double>(obj->getProperty("startBeats")) == Approx(4.0));
+    REQUIRE(static_cast<double>(obj->getProperty("lengthBeats")) == Approx(8.0));
+    REQUIRE(static_cast<double>(obj->getProperty("loopLengthBeats")) == Approx(2.0));
+
+    auto* points = obj->getProperty("points").getArray();
+    REQUIRE(points != nullptr);
+    REQUIRE(points->size() == 1);
+    auto* pointObj = points->getReference(0).getDynamicObject();
+    REQUIRE(pointObj != nullptr);
+    REQUIRE(pointObj->hasProperty("beatPosition"));
+    REQUIRE_FALSE(pointObj->hasProperty("time"));
+    REQUIRE(static_cast<double>(pointObj->getProperty("beatPosition")) == Approx(1.5));
+
+    auto* inHandleObj = pointObj->getProperty("inHandle").getDynamicObject();
+    auto* outHandleObj = pointObj->getProperty("outHandle").getDynamicObject();
+    REQUIRE(inHandleObj != nullptr);
+    REQUIRE(outHandleObj != nullptr);
+    REQUIRE(inHandleObj->hasProperty("beatOffset"));
+    REQUIRE(outHandleObj->hasProperty("beatOffset"));
+    REQUIRE_FALSE(inHandleObj->hasProperty("time"));
+    REQUIRE_FALSE(outHandleObj->hasProperty("time"));
+    REQUIRE(static_cast<double>(inHandleObj->getProperty("beatOffset")) == Approx(-0.25));
+    REQUIRE(static_cast<double>(outHandleObj->getProperty("beatOffset")) == Approx(0.5));
+
+    REQUIRE(ProjectSerializer::deserializeProject(json, info));
+    const auto& restoredClips = AutomationManager::getInstance().getClips();
+    REQUIRE(restoredClips.size() == 1);
+    REQUIRE(restoredClips[0].startBeats == Approx(4.0));
+    REQUIRE(restoredClips[0].lengthBeats == Approx(8.0));
+    REQUIRE(restoredClips[0].loopLengthBeats == Approx(2.0));
+    REQUIRE(restoredClips[0].points.size() == 1);
+    REQUIRE(restoredClips[0].points[0].beatPosition == Approx(1.5));
+    REQUIRE(restoredClips[0].points[0].inHandle.beatOffset == Approx(-0.25));
+    REQUIRE(restoredClips[0].points[0].outHandle.beatOffset == Approx(0.5));
+    const auto* restoredLane = AutomationManager::getInstance().getLane(laneId);
+    REQUIRE(restoredLane != nullptr);
+    REQUIRE_FALSE(restoredLane->snapEditsToBeatGrid);
+}
+
+TEST_CASE("Automation serialization reads legacy time-named beat properties",
+          "[project][serialization][automation][beats]") {
+    ProjectTestFixture fixture;
+
+    auto* obj = new juce::DynamicObject();
+    obj->setProperty("id", 9);
+    obj->setProperty("laneId", 4);
+    obj->setProperty("name", "Legacy Auto");
+    obj->setProperty("colour", "#ff00ff00");
+    obj->setProperty("startTime", 3.0);
+    obj->setProperty("length", 6.0);
+    obj->setProperty("looping", true);
+    obj->setProperty("loopLength", 1.5);
+
+    auto* pointObj = new juce::DynamicObject();
+    pointObj->setProperty("id", 13);
+    pointObj->setProperty("time", 2.25);
+    pointObj->setProperty("value", 0.4);
+    pointObj->setProperty("curveType", static_cast<int>(AutomationCurveType::Bezier));
+    pointObj->setProperty("tension", 0.1);
+
+    auto* inHandleObj = new juce::DynamicObject();
+    inHandleObj->setProperty("time", -0.5);
+    inHandleObj->setProperty("value", -0.2);
+    inHandleObj->setProperty("linked", false);
+    pointObj->setProperty("inHandle", juce::var(inHandleObj));
+
+    auto* outHandleObj = new juce::DynamicObject();
+    outHandleObj->setProperty("time", 0.75);
+    outHandleObj->setProperty("value", 0.3);
+    outHandleObj->setProperty("linked", false);
+    pointObj->setProperty("outHandle", juce::var(outHandleObj));
+
+    juce::Array<juce::var> points;
+    points.add(juce::var(pointObj));
+    obj->setProperty("points", juce::var(points));
+
+    juce::Array<juce::var> clips;
+    clips.add(juce::var(obj));
+
+    auto* automationObj = new juce::DynamicObject();
+    automationObj->setProperty("lanes", juce::Array<juce::var>{});
+    automationObj->setProperty("clips", juce::var(clips));
+
+    ProjectInfo info;
+    auto json = ProjectSerializer::serializeProject(info);
+    auto* rootObj = json.getDynamicObject();
+    REQUIRE(rootObj != nullptr);
+    rootObj->setProperty("automation", juce::var(automationObj));
+
+    REQUIRE(ProjectSerializer::deserializeProject(json, info));
+    const auto& restoredClips = AutomationManager::getInstance().getClips();
+    REQUIRE(restoredClips.size() == 1);
+    REQUIRE(restoredClips[0].startBeats == Approx(3.0));
+    REQUIRE(restoredClips[0].lengthBeats == Approx(6.0));
+    REQUIRE(restoredClips[0].looping);
+    REQUIRE(restoredClips[0].loopLengthBeats == Approx(1.5));
+    REQUIRE(restoredClips[0].points.size() == 1);
+    REQUIRE(restoredClips[0].points[0].beatPosition == Approx(2.25));
+    REQUIRE(restoredClips[0].points[0].inHandle.beatOffset == Approx(-0.5));
+    REQUIRE(restoredClips[0].points[0].outHandle.beatOffset == Approx(0.75));
 }
 
 TEST_CASE("Project with Tracks", "[project][serialization][tracks]") {
@@ -736,6 +1028,248 @@ TEST_CASE("DeviceInfo pluginState roundtrip", "[project][serialization][pluginSt
         const auto& restoredDevice = getDevice(tracks[0].chainElements[0]);
         REQUIRE(restoredDevice.pluginState.isEmpty());
     }
+}
+
+TEST_CASE("TrackInfo persistent runtime seeds roundtrip", "[project][serialization][track]") {
+    ProjectTestFixture fixture;
+
+    auto& trackManager = TrackManager::getInstance();
+    auto trackId = trackManager.createTrack("Session Track", TrackType::Audio);
+    auto* track = trackManager.getTrack(trackId);
+    REQUIRE(track != nullptr);
+    track->volume = 0.25f;
+    track->pan = -0.5f;
+    track->manualVolume = 0.75f;
+    track->manualPan = 0.25f;
+    track->playbackMode = TrackPlaybackMode::Session;
+
+    ProjectInfo info;
+    auto json = ProjectSerializer::serializeProject(info);
+
+    auto* rootObj = json.getDynamicObject();
+    REQUIRE(rootObj != nullptr);
+    auto* tracks = rootObj->getProperty("tracks").getArray();
+    REQUIRE(tracks != nullptr);
+    REQUIRE(tracks->size() == 1);
+    auto* trackObj = tracks->getReference(0).getDynamicObject();
+    REQUIRE(trackObj != nullptr);
+    REQUIRE(trackObj->hasProperty("manualVolume"));
+    REQUIRE(trackObj->hasProperty("manualPan"));
+    REQUIRE(trackObj->hasProperty("playbackMode"));
+
+    ProjectInfo loadedInfo;
+    REQUIRE(ProjectSerializer::deserializeProject(json, loadedInfo));
+    auto* loaded = trackManager.getTrack(trackId);
+    REQUIRE(loaded != nullptr);
+    REQUIRE(loaded->volume == Approx(0.25f));
+    REQUIRE(loaded->pan == Approx(-0.5f));
+    REQUIRE(loaded->manualVolume == Approx(0.75f));
+    REQUIRE(loaded->manualPan == Approx(0.25f));
+    REQUIRE(loaded->playbackMode == TrackPlaybackMode::Session);
+}
+
+TEST_CASE("DeviceInfo panel UI state roundtrip", "[project][serialization][device]") {
+    ProjectTestFixture fixture;
+
+    auto& trackManager = TrackManager::getInstance();
+    auto trackId = trackManager.createTrack("Device Track", TrackType::Audio);
+
+    DeviceInfo device;
+    device.id = 23;
+    device.name = "AI Device";
+    device.pluginId = "internal.ai";
+    device.format = PluginFormat::Internal;
+    device.modPanelOpen = true;
+    device.gainPanelOpen = true;
+    device.paramPanelOpen = true;
+    device.aiPanelOpen = true;
+    device.aiPanelOutput = "transient output";
+    REQUIRE(trackManager.addDeviceToTrack(trackId, device) != INVALID_DEVICE_ID);
+
+    ProjectInfo info;
+    auto json = ProjectSerializer::serializeProject(info);
+
+    ProjectInfo loadedInfo;
+    REQUIRE(ProjectSerializer::deserializeProject(json, loadedInfo));
+    auto* loadedTrack = trackManager.getTrack(trackId);
+    REQUIRE(loadedTrack != nullptr);
+    REQUIRE(loadedTrack->chainElements.size() == 1);
+    REQUIRE(isDevice(loadedTrack->chainElements[0]));
+    const auto& loaded = getDevice(loadedTrack->chainElements[0]);
+    REQUIRE(loaded.modPanelOpen);
+    REQUIRE(loaded.gainPanelOpen);
+    REQUIRE(loaded.paramPanelOpen);
+    REQUIRE(loaded.aiPanelOpen);
+    REQUIRE(loaded.aiPanelOutput.isEmpty());
+}
+
+TEST_CASE("ParameterInfo display metadata roundtrip", "[project][serialization][parameter]") {
+    ProjectTestFixture fixture;
+
+    auto& trackManager = TrackManager::getInstance();
+    auto trackId = trackManager.createTrack("Parameter Track", TrackType::Audio);
+
+    ParameterInfo param;
+    param.paramIndex = 12;
+    param.name = "FB Bank";
+    param.unit = "dB";
+    param.minValue = -48.0f;
+    param.maxValue = 12.0f;
+    param.defaultValue = -6.0f;
+    param.currentValue = -12.0f;
+    param.teMinValue = 0.0f;
+    param.teMaxValue = 1.0f;
+    param.scale = ParameterScale::Logarithmic;
+    param.skewFactor = 0.75f;
+    param.scaleAnchor = -6.0f;
+    param.displayFormat = DisplayFormat::Decibels;
+    param.modulatable = false;
+    param.bipolarModulation = true;
+    param.choices = {"Off", "Low", "High"};
+    param.labelTicks = {{0.0f, "Off"}, {2.0f, "High"}};
+    param.valueTable = {"Off", "A", "B", "C"};
+    param.gateSlotIndex = 7;
+    param.gateNegated = true;
+    param.hidden = true;
+    param.displayText = std::make_shared<ParameterInfo::DisplayTextProvider>();
+
+    DeviceInfo device;
+    device.id = 52;
+    device.name = "Feedback";
+    device.pluginId = "internal.feedback";
+    device.format = PluginFormat::Internal;
+    device.parameters.push_back(param);
+    REQUIRE(trackManager.addDeviceToTrack(trackId, device) != INVALID_DEVICE_ID);
+
+    ProjectInfo info;
+    auto json = ProjectSerializer::serializeProject(info);
+
+    auto* rootObj = json.getDynamicObject();
+    REQUIRE(rootObj != nullptr);
+    auto* tracks = rootObj->getProperty("tracks").getArray();
+    REQUIRE(tracks != nullptr);
+    REQUIRE(tracks->size() == 1);
+    auto* trackObj = tracks->getReference(0).getDynamicObject();
+    REQUIRE(trackObj != nullptr);
+    auto* elements = trackObj->getProperty("chainElements").getArray();
+    REQUIRE(elements != nullptr);
+    REQUIRE(elements->size() == 1);
+    auto* elementObj = elements->getReference(0).getDynamicObject();
+    REQUIRE(elementObj != nullptr);
+    auto* deviceObj = elementObj->getProperty("device").getDynamicObject();
+    REQUIRE(deviceObj != nullptr);
+    auto* params = deviceObj->getProperty("parameters").getArray();
+    REQUIRE(params != nullptr);
+    REQUIRE(params->size() == 1);
+    auto* paramObj = params->getReference(0).getDynamicObject();
+    REQUIRE(paramObj != nullptr);
+    REQUIRE(paramObj->hasProperty("teMinValue"));
+    REQUIRE(paramObj->hasProperty("teMaxValue"));
+    REQUIRE(paramObj->hasProperty("scaleAnchor"));
+    REQUIRE(paramObj->hasProperty("displayFormat"));
+    REQUIRE(paramObj->hasProperty("labelTicks"));
+    REQUIRE(paramObj->hasProperty("valueTable"));
+    REQUIRE(paramObj->hasProperty("gateSlotIndex"));
+    REQUIRE(paramObj->hasProperty("gateNegated"));
+    REQUIRE(paramObj->hasProperty("hidden"));
+
+    ProjectInfo loadedInfo;
+    REQUIRE(ProjectSerializer::deserializeProject(json, loadedInfo));
+    auto* loadedTrack = trackManager.getTrack(trackId);
+    REQUIRE(loadedTrack != nullptr);
+    REQUIRE(loadedTrack->chainElements.size() == 1);
+    REQUIRE(isDevice(loadedTrack->chainElements[0]));
+    const auto& loadedDevice = getDevice(loadedTrack->chainElements[0]);
+    REQUIRE(loadedDevice.parameters.size() == 1);
+    const auto& loaded = loadedDevice.parameters[0];
+    REQUIRE(loaded.paramIndex == 12);
+    REQUIRE(loaded.name == "FB Bank");
+    REQUIRE(loaded.unit == "dB");
+    REQUIRE(loaded.minValue == Approx(-48.0f));
+    REQUIRE(loaded.maxValue == Approx(12.0f));
+    REQUIRE(loaded.defaultValue == Approx(-6.0f));
+    REQUIRE(loaded.currentValue == Approx(-12.0f));
+    REQUIRE(loaded.teMinValue == Approx(0.0f));
+    REQUIRE(loaded.teMaxValue == Approx(1.0f));
+    REQUIRE(loaded.scale == ParameterScale::Logarithmic);
+    REQUIRE(loaded.skewFactor == Approx(0.75f));
+    REQUIRE(loaded.scaleAnchor == Approx(-6.0f));
+    REQUIRE(loaded.displayFormat == DisplayFormat::Decibels);
+    REQUIRE_FALSE(loaded.modulatable);
+    REQUIRE(loaded.bipolarModulation);
+    REQUIRE(loaded.choices.size() == 3);
+    REQUIRE(loaded.choices[1] == "Low");
+    REQUIRE(loaded.labelTicks.size() == 2);
+    REQUIRE(loaded.labelTicks[1].first == Approx(2.0f));
+    REQUIRE(loaded.labelTicks[1].second == "High");
+    REQUIRE(loaded.valueTable.size() == 4);
+    REQUIRE(loaded.valueTable[2] == "B");
+    REQUIRE(loaded.gateSlotIndex == 7);
+    REQUIRE(loaded.gateNegated);
+    REQUIRE(loaded.hidden);
+    REQUIRE_FALSE(static_cast<bool>(loaded.displayText));
+}
+
+TEST_CASE("MIDI controller curve metadata roundtrip", "[project][serialization][midi]") {
+    ProjectTestFixture fixture;
+
+    auto trackId = TrackManager::getInstance().createTrack("MIDI", TrackType::Audio);
+
+    ClipInfo clip;
+    clip.id = 51;
+    clip.trackId = trackId;
+    clip.name = "Curves";
+    clip.setMidiContent();
+    clip.setPlacementBeats(0.0, 4.0);
+
+    MidiCCData cc;
+    cc.controller = 74;
+    cc.value = 96;
+    cc.beatPosition = 1.5;
+    cc.curveType = MidiCurveType::Bezier;
+    cc.tension = 0.25;
+    cc.inHandle = {-0.25, -0.1, false};
+    cc.outHandle = {0.5, 0.2, false};
+    clip.midiCCData.push_back(cc);
+
+    MidiPitchBendData pb;
+    pb.value = 9000;
+    pb.beatPosition = 2.0;
+    pb.curveType = MidiCurveType::Linear;
+    pb.tension = -0.5;
+    pb.inHandle = {-0.1, 0.3, true};
+    pb.outHandle = {0.4, -0.2, false};
+    clip.midiPitchBendData.push_back(pb);
+
+    ClipManager::getInstance().restoreClip(clip);
+
+    ProjectInfo info;
+    info.tempo = 120.0;
+    auto json = ProjectSerializer::serializeProject(info);
+
+    ProjectInfo loadedInfo;
+    REQUIRE(ProjectSerializer::deserializeProject(json, loadedInfo));
+    auto* loaded = ClipManager::getInstance().getClip(clip.id);
+    REQUIRE(loaded != nullptr);
+    REQUIRE(loaded->midiCCData.size() == 1);
+    REQUIRE(loaded->midiCCData[0].curveType == MidiCurveType::Bezier);
+    REQUIRE(loaded->midiCCData[0].tension == Approx(0.25));
+    REQUIRE(loaded->midiCCData[0].inHandle.dx == Approx(-0.25));
+    REQUIRE(loaded->midiCCData[0].inHandle.dy == Approx(-0.1));
+    REQUIRE_FALSE(loaded->midiCCData[0].inHandle.linked);
+    REQUIRE(loaded->midiCCData[0].outHandle.dx == Approx(0.5));
+    REQUIRE(loaded->midiCCData[0].outHandle.dy == Approx(0.2));
+    REQUIRE_FALSE(loaded->midiCCData[0].outHandle.linked);
+
+    REQUIRE(loaded->midiPitchBendData.size() == 1);
+    REQUIRE(loaded->midiPitchBendData[0].curveType == MidiCurveType::Linear);
+    REQUIRE(loaded->midiPitchBendData[0].tension == Approx(-0.5));
+    REQUIRE(loaded->midiPitchBendData[0].inHandle.dx == Approx(-0.1));
+    REQUIRE(loaded->midiPitchBendData[0].inHandle.dy == Approx(0.3));
+    REQUIRE(loaded->midiPitchBendData[0].inHandle.linked);
+    REQUIRE(loaded->midiPitchBendData[0].outHandle.dx == Approx(0.4));
+    REQUIRE(loaded->midiPitchBendData[0].outHandle.dy == Approx(-0.2));
+    REQUIRE_FALSE(loaded->midiPitchBendData[0].outHandle.linked);
 }
 
 TEST_CASE("RackInfo panel UI state roundtrip", "[project][serialization][rack][ui_state]") {

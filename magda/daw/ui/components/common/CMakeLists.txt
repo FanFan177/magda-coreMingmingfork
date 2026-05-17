@@ -1,5 +1,6 @@
 target_sources(magda_daw_app PRIVATE
     RampCurveDisplay.cpp
+    NoteSlicePopup.cpp
     TimeBendPopup.cpp
     SvgButton.cpp
     QwertyKeyboardPopup.cpp
@@ -10,8 +11,10 @@ target_sources(magda_daw_app PRIVATE
     GridOverlayComponent.cpp
     LinkableTextSlider.cpp
     Toast.cpp
+    ValueLabelControl.cpp
     DraggableValueLabel.cpp
     BarsBeatsTicksLabel.cpp
+    NoteSlicePopup.hpp
     SvgButton.hpp
     IconSelector.hpp
     ZoomControls.hpp
@@ -20,6 +23,7 @@ target_sources(magda_daw_app PRIVATE
     MixerDebugPanel.hpp
     GridOverlayComponent.hpp
     LinkableTextSlider.hpp
+    ValueLabelControl.hpp
     DraggableValueLabel.hpp
     BarsBeatsTicksLabel.hpp
 )

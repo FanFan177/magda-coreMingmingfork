@@ -229,15 +229,11 @@
   },
 
   "about": {
-    "version_prefix": "Version ",
-    "credits.powered_by": "powered by",
-    "credits.made_with": "made with"
+    "version_prefix": "Version "
   },
 
   "splash": {
-    "version_prefix": "Version ",
-    "credits.powered_by": "powered by",
-    "credits.made_with": "made with"
+    "version_prefix": "Version "
   },
 
   "chain_tree": {
@@ -372,6 +368,7 @@
 
     "scale.label": "UI Scale",
     "scale.auto": "Auto (from display DPI)",
+    "font_scale.label": "Font Size",
 
     "tab.general": "General",
     "tab.ui": "UI",

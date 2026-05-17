@@ -1,5 +1,7 @@
 #include "InternalPluginAliases.hpp"
 
+#include "audio/plugins/compiled/CompiledPluginRegistry.hpp"
+
 namespace magda {
 
 namespace {
@@ -13,8 +15,8 @@ struct AliasSpec {
 };
 
 struct PluginSpec {
-    const char* pluginKey;     // "eq", "compressor", ...
-    const AliasSpec* aliases;  // Null-terminated by zero-init sentinel
+    const char* pluginKey;  // "eq", "compressor", ...
+    const AliasSpec* aliases;
     int aliasCount;
 };
 
@@ -103,15 +105,6 @@ constexpr AliasSpec kPitchShiftAliases[] = {
     {"semitones", 0, "Semitones"},
 };
 
-// ------------------------------------------------------------------
-// Utility ("utility") — UtilityProcessor: volume, pan, polarity.
-// ------------------------------------------------------------------
-constexpr AliasSpec kUtilityAliases[] = {
-    {"volume", 0, "Volume"},
-    {"pan", 1, "Pan"},
-    {"polarity", 2, "Polarity"},
-};
-
 // Plugins not curated yet (4OSC, Sampler, DrumGrid, Arpeggiator,
 // StepSequencer, IR Reverb, Tone Generator). Their AutoGen names are
 // already user-readable so the chained @plugin.param popup works without
@@ -126,24 +119,40 @@ constexpr PluginSpec kPluginSpecs[] = {
     {"phaser", kPhaserAliases, (int)std::size(kPhaserAliases)},
     {"filter", kFilterAliases, (int)std::size(kFilterAliases)},
     {"pitchshift", kPitchShiftAliases, (int)std::size(kPitchShiftAliases)},
-    {"utility", kUtilityAliases, (int)std::size(kUtilityAliases)},
 };
 
 }  // namespace
 
 std::map<juce::String, StoredAlias> collectInternalPluginCuratedAliases() {
     std::map<juce::String, StoredAlias> out;
+    auto addAlias = [&out](const juce::String& pluginKey, const char* aliasName, int paramIndex,
+                           const char* paramNameAtSetTime) {
+        StoredAlias alias;
+        alias.pluginTypeKey = pluginKey;
+        alias.paramIndex = paramIndex;
+        alias.paramNameAtSetTime = paramNameAtSetTime;
+        alias.path = std::nullopt;  // Resolved at runtime.
+
+        const juce::String canonicalName = pluginKey + "." + aliasName;
+        out[canonicalName] = alias;
+    };
+
     for (const auto& plugin : kPluginSpecs) {
         for (int i = 0; i < plugin.aliasCount; ++i) {
             const auto& spec = plugin.aliases[i];
-            StoredAlias alias;
-            alias.pluginTypeKey = plugin.pluginKey;
-            alias.paramIndex = spec.paramIndex;
-            alias.paramNameAtSetTime = spec.paramName;
-            alias.path = std::nullopt;  // Resolved at runtime.
+            addAlias(plugin.pluginKey, spec.alias, spec.paramIndex, spec.paramName);
+        }
+    }
 
-            const juce::String canonicalName = juce::String(plugin.pluginKey) + "." + spec.alias;
-            out[canonicalName] = alias;
+    for (const auto* plugin : daw::audio::compiled::getAllCompiledPluginSpecs()) {
+        if (plugin == nullptr || plugin->aliases == nullptr)
+            continue;
+
+        const juce::String pluginKey =
+            plugin->aliasKey != nullptr ? plugin->aliasKey : plugin->pluginId;
+        for (int i = 0; i < plugin->aliasCount; ++i) {
+            const auto& spec = plugin->aliases[i];
+            addAlias(pluginKey, spec.alias, spec.paramIndex, spec.paramName);
         }
     }
     return out;
