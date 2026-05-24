@@ -42,6 +42,17 @@ double timelineEndSeconds(const ClipInfo& clip, double bpm) {
     return clip.getTimelineEnd(bpm);
 }
 
+void showMidiClipLibrarySaveFailedAlert() {
+    juce::AlertWindow::showMessageBoxAsync(
+        juce::AlertWindow::WarningIcon, "Save MIDI Clip Failed",
+        "Could not write the MIDI clip file or add it to the media library.");
+}
+
+void showExternalEditorFailedAlert(const juce::String& message) {
+    juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::WarningIcon,
+                                           "Edit in External Editor Failed", message);
+}
+
 constexpr int MIDI_PREVIEW_MIN_NOTE = 21;   // A0
 constexpr int MIDI_PREVIEW_MAX_NOTE = 108;  // C8
 
@@ -2488,6 +2499,8 @@ void ClipComponent::showContextMenu() {
 
     // Duplicate
     menu.addItem(4, "Duplicate", canEdit);
+    menu.addItem(18, "Duplicate With Automation", canEdit);
+    menu.addItem(19, "Duplicate Without Automation", canEdit);
     menu.addItem(17, "Duplicate Time Selection", !isFrozen && hasTimeSelection);
     menu.addSeparator();
 
@@ -2525,6 +2538,15 @@ void ClipComponent::showContextMenu() {
     menu.addItem(16, "Slice at Grid to Drum Grid", canSliceAtGrid);
     menu.addSeparator();
 
+    bool canEditExternally = false;
+    if (!isMultiSelection && canEdit) {
+        const auto* singleClip = getClipInfo();
+        canEditExternally = singleClip && singleClip->isAudio() &&
+                            juce::File(singleClip->audio().source.filePath).existsAsFile();
+    }
+    menu.addItem(21, "Edit in External Editor", canEditExternally);
+    menu.addSeparator();
+
     // Join Clips (need 2+ adjacent clips on same track)
     bool canJoin = false;
     if (selectionManager.getSelectedClipCount() >= 2) {
@@ -2554,6 +2576,7 @@ void ClipComponent::showContextMenu() {
     // Quantize (MIDI clips only)
     {
         bool hasMidi = false;
+        bool canSaveSingleMidi = false;
         if (isMultiSelection) {
             for (auto cid : selectionManager.getSelectedClips()) {
                 auto* c = clipManager.getClip(cid);
@@ -2565,9 +2588,13 @@ void ClipComponent::showContextMenu() {
         } else {
             const auto* ci = getClipInfo();
             hasMidi = ci && ci->isMidi() && !ci->midiNotes.empty();
+            canSaveSingleMidi = ci && ci->isMidi() && clipManager.canSaveClipToLibrary(ci->id);
         }
 
         if (hasMidi) {
+            menu.addItem(20, "Save MIDI Clip to Library", canSaveSingleMidi);
+            menu.addSeparator();
+
             juce::PopupMenu quantizeMenu;
 
             // "Current Grid" option (IDs 97-99)
@@ -2732,33 +2759,34 @@ void ClipComponent::showContextMenu() {
             }
 
             case 4: {  // Duplicate
-                auto selectedClips = selectionManager.getSelectedClips();
-                if (!selectedClips.empty()) {
-                    double tempo = 120.0;
-                    if (parentPanel_ && parentPanel_->getTimelineController())
-                        tempo = parentPanel_->getTimelineController()->getState().tempo.bpm;
+                if (parentPanel_)
+                    parentPanel_->duplicateSelectedArrangementClips(false);
+                break;
+            }
 
-                    auto commands = createArrangementBlockDuplicateCommands(selectedClips, tempo);
-                    if (commands.empty())
-                        break;
+            case 18: {  // Duplicate With Automation
+                if (parentPanel_)
+                    parentPanel_->duplicateSelectedArrangementClips(true);
+                break;
+            }
 
-                    if (commands.size() > 1)
-                        UndoManager::getInstance().beginCompoundOperation("Duplicate Clips");
+            case 19: {  // Duplicate Without Automation
+                if (parentPanel_)
+                    parentPanel_->duplicateSelectedArrangementClips(false);
+                break;
+            }
 
-                    std::unordered_set<ClipId> newClipIds;
-                    for (auto& cmd : commands) {
-                        auto* cmdPtr = cmd.get();
-                        UndoManager::getInstance().executeCommand(std::move(cmd));
-                        ClipId newId = cmdPtr->getDuplicatedClipId();
-                        if (newId != INVALID_CLIP_ID)
-                            newClipIds.insert(newId);
-                    }
+            case 20: {  // Save MIDI Clip to Library
+                if (!clipManager.saveClipToLibrary(clipId_)) {
+                    showMidiClipLibrarySaveFailedAlert();
+                }
+                break;
+            }
 
-                    if (commands.size() > 1)
-                        UndoManager::getInstance().endCompoundOperation();
-
-                    if (!newClipIds.empty())
-                        selectionManager.selectClips(newClipIds);
+            case 21: {  // Edit in External Editor
+                juce::String error;
+                if (!clipManager.editAudioClipSourceInExternalEditor(clipId_, error)) {
+                    showExternalEditorFailedAlert(error);
                 }
                 break;
             }

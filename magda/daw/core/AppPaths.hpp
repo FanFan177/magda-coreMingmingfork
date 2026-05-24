@@ -45,6 +45,7 @@ juce::File logsDir();                // dataDir() / "Logs"
 juce::File controllerScriptsDir();   // dataDir() / "Scripts" / "Controllers"
 juce::File controllerProfilesDir();  // dataDir() / "controllers"
 juce::File pluginConfigsDir();       // dataDir() / "PluginConfigs"
+juce::File drumkitsDir();            // presetsDir() / "Drumkits"
 
 juce::File configFile();                                      // alwaysOSDefault() / "config.json"
 juce::File pluginListFile();                                  // dataDir() / "PluginList.xml"
@@ -54,7 +55,8 @@ juce::File pluginScanMarkerFile(const juce::String& format);  // dataDir() / "sc
 juce::File lastScanReportFile();                              // dataDir() / "last_scan_report.txt"
 juce::File pluginFavoritesFile();                             // dataDir() / "plugin_favorites.xml"
 juce::File pluginAliasesFile();                               // dataDir() / "plugin_aliases.xml"
-juce::File parameterDetectorLog();                            // dataDir() / "param_detector.log"
+juce::File pluginPreferencesFile();  // dataDir() / "plugin_preferences.json"
+juce::File parameterDetectorLog();   // dataDir() / "param_detector.log"
 
 // ---------------------------------------------------------------------------
 // Resolution

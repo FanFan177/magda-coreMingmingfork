@@ -156,6 +156,11 @@ class ClipManager {
     void forceNotifyMultipleClipPropertiesChanged(const std::vector<ClipId>& clipIds);
 
     /**
+     * @brief Copy an audio clip source into the project external-edits folder and open it.
+     */
+    bool editAudioClipSourceInExternalEditor(ClipId clipId, juce::String& errorMessage);
+
+    /**
      * @brief Duplicate a clip (places copy right after original)
      * @return The ID of the new clip
      */
@@ -258,6 +263,12 @@ class ClipManager {
      *         touch offset / phase / loop start. */
     void setLoopLength(ClipId clipId, double loopLength, double bpm = 120.0);
 
+    /** @brief Set MIDI loop region start in beats. Does NOT touch offset / phase. */
+    void setMidiLoopStartBeats(ClipId clipId, double loopStartBeats, double bpm = 120.0);
+
+    /** @brief Set MIDI loop region length in beats. Does NOT touch offset / phase / loop start. */
+    void setMidiLoopLengthBeats(ClipId clipId, double loopLengthBeats, double bpm = 120.0);
+
     /** @brief Composite operation: relocate the loop region (start + length)
      *         AND snap phase to 0 by setting offset = loopStart whenever
      *         loopStart actually moved.
@@ -303,6 +314,21 @@ class ClipManager {
      *         BPM-detection callbacks. No-op for non-autoTempo / non-audio
      *         clips. */
     void applyAudioClipBeats(ClipId clipId, const AudioClipBeatsUpdate& update, double projectBPM);
+
+    /** @brief Persist a user-asserted BPM for the clip's source file back
+     *         to the media DB. Prefer saveClipToLibrary for UI entry points
+     *         so all library-editable properties commit atomically. */
+    void recordUserBpm(ClipId clipId, double bpm);
+
+    /** @brief Persist a user-asserted key root for the clip's source file
+     *         back to the media DB. Prefer saveClipToLibrary for UI entry
+     *         points so all library-editable properties commit atomically. */
+    void recordUserKey(ClipId clipId, const std::string& root);
+
+    [[nodiscard]] bool canSaveClipToLibrary(ClipId clipId) const;
+
+    [[nodiscard]] bool saveClipToLibrary(
+        ClipId clipId, std::optional<std::vector<ClipInfo::WarpMarker>> warpMarkers = std::nullopt);
 
     /** @brief Refresh the seconds-domain cache (length, startTime, offset,
      *         loopStart, loopLength) on a beat-authoritative clip from its
@@ -361,6 +387,7 @@ class ClipManager {
     // Per-clip grid settings (MIDI editor)
     void setClipGridSettings(ClipId clipId, bool autoGrid, int numerator, int denominator);
     void setClipSnapEnabled(ClipId clipId, bool enabled);
+    void setClipMidiEditorRowHeight(ClipId clipId, int rowHeight);
 
     // ========================================================================
     // Content-Level Operations (Editor Operations)

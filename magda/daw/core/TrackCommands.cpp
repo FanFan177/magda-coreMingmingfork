@@ -167,6 +167,12 @@ juce::String CreateTrackCommand::getDescription() const {
 DeleteTrackCommand::DeleteTrackCommand(TrackId trackId) : trackId_(trackId) {}
 
 void DeleteTrackCommand::execute() {
+    // The master track is permanent. Bail before touching clips or storing undo
+    // state so the command is a clean no-op (undo() is gated on executed_).
+    if (trackId_ == MASTER_TRACK_ID) {
+        return;
+    }
+
     auto& trackManager = TrackManager::getInstance();
     const auto* track = trackManager.getTrack(trackId_);
 
@@ -679,6 +685,68 @@ void WrapChainElementsInRackCommand::undo() {
 }
 
 // ============================================================================
+// SetMacroNameCommand / SetModNameCommand
+// ============================================================================
+
+SetMacroNameCommand::SetMacroNameCommand(const ChainNodePath& path, int macroIndex,
+                                         const juce::String& newName)
+    : path_(path), macroIndex_(macroIndex), newName_(newName) {
+    const auto& trackManager = TrackManager::getInstance();
+    auto node = trackManager.resolveChainNode(path_);
+    if (!node.valid() || node.macros == nullptr || macroIndex_ < 0 ||
+        macroIndex_ >= static_cast<int>(node.macros->size()))
+        return;
+
+    oldName_ = (*node.macros)[static_cast<size_t>(macroIndex_)].name;
+    valid_ = true;
+}
+
+void SetMacroNameCommand::execute() {
+    applyName(newName_);
+}
+
+void SetMacroNameCommand::undo() {
+    applyName(oldName_);
+}
+
+void SetMacroNameCommand::applyName(const juce::String& name) {
+    if (!valid_)
+        return;
+
+    TrackManager::getInstance().setMacroName(path_, macroIndex_, name);
+    TrackManager::getInstance().notifyModulationNamesChanged(path_.trackId);
+}
+
+SetModNameCommand::SetModNameCommand(const ChainNodePath& path, int modIndex,
+                                     const juce::String& newName)
+    : path_(path), modIndex_(modIndex), newName_(newName) {
+    const auto& trackManager = TrackManager::getInstance();
+    auto node = trackManager.resolveChainNode(path_);
+    if (!node.valid() || node.mods == nullptr || modIndex_ < 0 ||
+        modIndex_ >= static_cast<int>(node.mods->size()))
+        return;
+
+    oldName_ = (*node.mods)[static_cast<size_t>(modIndex_)].name;
+    valid_ = true;
+}
+
+void SetModNameCommand::execute() {
+    applyName(newName_);
+}
+
+void SetModNameCommand::undo() {
+    applyName(oldName_);
+}
+
+void SetModNameCommand::applyName(const juce::String& name) {
+    if (!valid_)
+        return;
+
+    TrackManager::getInstance().setModName(path_, modIndex_, name);
+    TrackManager::getInstance().notifyModulationNamesChanged(path_.trackId);
+}
+
+// ============================================================================
 // CreateTrackWithDeviceCommand
 // ============================================================================
 
@@ -696,6 +764,12 @@ void CreateTrackWithDeviceCommand::execute() {
 
     createdDeviceId_ = trackManager.addDeviceToTrack(createdTrackId_, device_);
     trackManager.setSelectedTrack(createdTrackId_);
+
+    // createTrack() built the header before the device existed, and adding the
+    // device only fires trackDevicesChanged (which does not re-run the
+    // type/routing-dependent header setup). Rebuild now so the new track's
+    // header is correct immediately instead of only after a view switch.
+    trackManager.notifyTracksChanged();
 
     executed_ = true;
     DBG("UNDO: Created track " << createdTrackId_ << " with device " << createdDeviceId_);

@@ -1258,6 +1258,8 @@ void DeviceSlotComponent::updateParamModulation() {
             selectedModIndex = modSel.modIndex;
         }
     }
+    if (selectedModIndex_ >= 0)
+        selectedModIndex = selectedModIndex_;
 
     if (selMgr.hasMacroSelection()) {
         const auto& macroSel = selMgr.getMacroSelection();
@@ -1266,6 +1268,8 @@ void DeviceSlotComponent::updateParamModulation() {
             selectedMacroIndex = macroSel.macroIndex;
         }
     }
+    if (selectedMacroIndex_ >= 0)
+        selectedMacroIndex = selectedMacroIndex_;
 
     // Update each param slot with current mod/macro data
     paramGrid_->updateParamModulation(mods, macros, rackMods, rackMacros, trackMods, trackMacros,
@@ -1291,7 +1295,8 @@ void DeviceSlotComponent::updateParamModulation() {
     setupCustomUILinking();
 
     drum_grid_slot::setPadChainLinkContext(customUI_.getDrumGridUI(), nodePath_, macros, mods,
-                                           trackMacros, trackMods);
+                                           trackMacros, trackMods, selectedModIndex,
+                                           selectedMacroIndex);
 }
 
 void DeviceSlotComponent::paint(juce::Graphics& g) {
@@ -1486,7 +1491,8 @@ void DeviceSlotComponent::onModTargetChangedInternal(int modIndex, magda::Contro
 }
 
 void DeviceSlotComponent::onModNameChangedInternal(int modIndex, const juce::String& name) {
-    magda::TrackManager::getInstance().setModName(nodePath_, modIndex, name);
+    magda::UndoManager::getInstance().executeCommand(
+        std::make_unique<magda::SetModNameCommand>(nodePath_, modIndex, name));
 }
 
 void DeviceSlotComponent::onModTypeChangedInternal(int modIndex, magda::ModType type) {
@@ -1554,7 +1560,8 @@ void DeviceSlotComponent::onMacroTargetChangedInternal(int macroIndex,
 }
 
 void DeviceSlotComponent::onMacroNameChangedInternal(int macroIndex, const juce::String& name) {
-    magda::TrackManager::getInstance().setMacroName(nodePath_, macroIndex, name);
+    magda::UndoManager::getInstance().executeCommand(
+        std::make_unique<magda::SetMacroNameCommand>(nodePath_, macroIndex, name));
 }
 
 void DeviceSlotComponent::onMacroAllLinksClearedInternal(int macroIndex) {
@@ -1608,6 +1615,12 @@ void DeviceSlotComponent::onModLinkAmountChangedInternal(int modIndex, magda::Co
     updateParamModulation();
 }
 
+void DeviceSlotComponent::onModLinkEnabledChangedInternal(int modIndex, magda::ControlTarget target,
+                                                          bool enabled) {
+    magda::TrackManager::getInstance().setModLinkEnabled(nodePath_, modIndex, target, enabled);
+    updateParamModulation();
+}
+
 void DeviceSlotComponent::onModNewLinkCreatedInternal(int modIndex, magda::ControlTarget target,
                                                       float amount) {
     magda::TrackManager::getInstance().setModTarget(nodePath_, modIndex, target);
@@ -1622,6 +1635,12 @@ void DeviceSlotComponent::onModNewLinkCreatedInternal(int modIndex, magda::Contr
 
 void DeviceSlotComponent::onModLinkRemovedInternal(int modIndex, magda::ControlTarget target) {
     magda::TrackManager::getInstance().removeModLink(nodePath_, modIndex, target);
+    updateModsPanel();
+    updateParamModulation();
+}
+
+void DeviceSlotComponent::onModAllLinksClearedInternal(int modIndex) {
+    magda::TrackManager::getInstance().clearAllModLinks(nodePath_, modIndex);
     updateModsPanel();
     updateParamModulation();
 }
@@ -1912,80 +1931,39 @@ void DeviceSlotComponent::showContextMenu() {
         selection.isChainNodeSelected(nodePath_) && selection.getSelectedChainNodes().size() > 1;
     menu.addItem(1, hasMultiSelection ? "Add Selection to New Rack" : "Add to New Rack");
 
-    // Classification override — let user correct mis-classified plugins
-    // Read fresh device info (device_ may be stale)
-    auto& tm = magda::TrackManager::getInstance();
-    auto* freshDevice = tm.getDevice(nodePath_.trackId, device_.id);
-    const auto& menuDevice = freshDevice != nullptr ? *freshDevice : device_;
-
-    if (menuDevice.format != magda::PluginFormat::Internal) {
-        menu.addSeparator();
-        juce::PopupMenu classMenu;
-        classMenu.addItem(200, "Instrument", menuDevice.deviceType != magda::DeviceType::Instrument,
-                          menuDevice.deviceType == magda::DeviceType::Instrument);
-        classMenu.addItem(201, "Effect", menuDevice.deviceType != magda::DeviceType::Effect,
-                          menuDevice.deviceType == magda::DeviceType::Effect);
-        classMenu.addItem(202, "MIDI Effect", menuDevice.deviceType != magda::DeviceType::MIDI,
-                          menuDevice.deviceType == magda::DeviceType::MIDI);
-        menu.addSubMenu("Classify as...", classMenu);
-    }
-
     menu.addSeparator();
     menu.addItem(100, "Delete");
 
     auto safeThis = juce::Component::SafePointer<DeviceSlotComponent>(this);
     auto path = nodePath_;
-    auto deviceId = device_.id;
     auto callback = onDeviceDeleted;
     auto selectedPaths = hasMultiSelection ? selection.getSelectedChainNodes()
                                            : std::vector<magda::ChainNodePath>{path};
 
-    menu.showMenuAsync(juce::PopupMenu::Options(), [safeThis, path, deviceId, callback,
-                                                    selectedPaths](int result) {
-        if (safeThis == nullptr || result == 0)
-            return;
-
-        if (result == 1) {
-            // Add to New Rack
-            magda::UndoManager::getInstance().executeCommand(
-                std::make_unique<magda::WrapChainElementsInRackCommand>(selectedPaths));
-        } else if (result >= 200 && result <= 202) {
-            // Classification override
-            auto& tm = magda::TrackManager::getInstance();
-            auto* device = tm.getDevice(path.trackId, deviceId);
-            if (!device)
+    menu.showMenuAsync(
+        juce::PopupMenu::Options(), [safeThis, path, callback, selectedPaths](int result) {
+            if (safeThis == nullptr || result == 0)
                 return;
 
-            switch (result) {
-                case 200:
-                    device->deviceType = magda::DeviceType::Instrument;
-                    device->isInstrument = true;
-                    break;
-                case 201:
-                    device->deviceType = magda::DeviceType::Effect;
-                    device->isInstrument = false;
-                    break;
-                case 202:
-                    device->deviceType = magda::DeviceType::MIDI;
-                    device->isInstrument = false;
-                    break;
+            if (result == 1) {
+                // Add to New Rack
+                magda::UndoManager::getInstance().executeCommand(
+                    std::make_unique<magda::WrapChainElementsInRackCommand>(selectedPaths));
+            } else if (result == 100) {
+                // Delete — same deferred logic as onDeleteClicked
+                juce::MessageManager::callAsync([path, callback]() {
+                    if (path.topLevelDeviceId != magda::INVALID_DEVICE_ID) {
+                        magda::UndoManager::getInstance().executeCommand(
+                            std::make_unique<magda::RemoveDeviceFromTrackCommand>(
+                                path.trackId, path.topLevelDeviceId));
+                    } else {
+                        magda::TrackManager::getInstance().removeDeviceFromChainByPath(path);
+                    }
+                    if (callback)
+                        callback();
+                });
             }
-            tm.notifyTrackDevicesChanged(path.trackId);
-        } else if (result == 100) {
-            // Delete — same deferred logic as onDeleteClicked
-            juce::MessageManager::callAsync([path, callback]() {
-                if (path.topLevelDeviceId != magda::INVALID_DEVICE_ID) {
-                    magda::UndoManager::getInstance().executeCommand(
-                        std::make_unique<magda::RemoveDeviceFromTrackCommand>(
-                            path.trackId, path.topLevelDeviceId));
-                } else {
-                    magda::TrackManager::getInstance().removeDeviceFromChainByPath(path);
-                }
-                if (callback)
-                    callback();
-            });
-        }
-    });
+        });
 }
 
 // =============================================================================
@@ -2149,8 +2127,28 @@ void DeviceSlotComponent::wirePadChainLinkCallbacks() {
             trackMacros = &trackInfo->macros;
         }
     }
+
+    auto& selMgr = magda::SelectionManager::getInstance();
+    int selectedModIndex = -1;
+    int selectedMacroIndex = -1;
+    if (selMgr.hasModSelection()) {
+        const auto& modSel = selMgr.getModSelection();
+        if (modSel.parentPath == nodePath_)
+            selectedModIndex = modSel.modIndex;
+    }
+    if (selectedModIndex_ >= 0)
+        selectedModIndex = selectedModIndex_;
+    if (selMgr.hasMacroSelection()) {
+        const auto& macroSel = selMgr.getMacroSelection();
+        if (macroSel.parentPath == nodePath_)
+            selectedMacroIndex = macroSel.macroIndex;
+    }
+    if (selectedMacroIndex_ >= 0)
+        selectedMacroIndex = selectedMacroIndex_;
+
     drum_grid_slot::setPadChainLinkContext(customUI_.getDrumGridUI(), nodePath_, macros, mods,
-                                           trackMacros, trackMods);
+                                           trackMacros, trackMods, selectedModIndex,
+                                           selectedMacroIndex);
 
     juce::Component::SafePointer<DeviceSlotComponent> safeThis(this);
     drum_grid_slot::PadChainLinkCallbacks callbacks;
@@ -2224,11 +2222,15 @@ void DeviceSlotComponent::setupCustomUILinking() {
         if (modSel.parentPath == nodePath_)
             selectedModIndex = modSel.modIndex;
     }
+    if (selectedModIndex_ >= 0)
+        selectedModIndex = selectedModIndex_;
     if (selMgr.hasMacroSelection()) {
         const auto& macroSel = selMgr.getMacroSelection();
         if (macroSel.parentPath == nodePath_)
             selectedMacroIndex = macroSel.macroIndex;
     }
+    if (selectedMacroIndex_ >= 0)
+        selectedMacroIndex = selectedMacroIndex_;
 
     for (int i = 0; i < static_cast<int>(sliders.size()); ++i) {
         auto* slider = sliders[static_cast<size_t>(i)];

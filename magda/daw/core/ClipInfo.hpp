@@ -3,6 +3,8 @@
 #include <juce_core/juce_core.h>
 #include <juce_graphics/juce_graphics.h>
 
+#include <map>
+#include <string>
 #include <variant>
 #include <vector>
 
@@ -101,6 +103,12 @@ struct AudioSourceInterpretation {
     double bpm = 0.0;
     double totalBeats = 0.0;
     bool totalBeatsLocked = false;
+    // Musical key the source is interpreted in. Optional — empty = unknown.
+    // Inspector/editor edits live on the clip until the user explicitly saves
+    // them to the media library. keyScale is "major" / "minor" / "" when
+    // unknown; keyRoot is "C" / "C#" / ... / "B" or empty.
+    std::string keyRoot;
+    std::string keyScale;
 };
 
 struct AudioClipModel {
@@ -108,7 +116,9 @@ struct AudioClipModel {
     AudioSourceInterpretation interpretation;
 };
 
-struct MidiClipModel {};
+struct MidiClipModel {
+    juce::String sourceFilePath;
+};
 
 using ClipContent = std::variant<MidiClipModel, AudioClipModel>;
 
@@ -320,10 +330,15 @@ struct ClipInfo {
     int sceneIndex = -1;  // -1 = not in session view (arrangement only)
 
     // Per-clip grid settings (MIDI editor)
+    static constexpr int DEFAULT_MIDI_EDITOR_ROW_HEIGHT = 12;
+    static constexpr int MIN_MIDI_EDITOR_ROW_HEIGHT = 6;
+    static constexpr int MAX_MIDI_EDITOR_ROW_HEIGHT = 40;
+
     bool gridAutoGrid = true;
     int gridNumerator = 1;
     int gridDenominator = 4;
     bool gridSnapEnabled = true;
+    int midiEditorRowHeight = 0;  // 0 = editor default
 
     // Session launch properties
     LaunchMode launchMode = LaunchMode::Trigger;

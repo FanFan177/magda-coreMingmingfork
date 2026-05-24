@@ -3,6 +3,7 @@
 #include <juce_audio_formats/juce_audio_formats.h>
 #include <tracktion_engine/tracktion_engine.h>
 
+#include <cmath>
 #include <functional>
 
 #include "../../panels/state/PanelController.hpp"
@@ -13,6 +14,7 @@
 #include "../automation/AutomationLaneComponent.hpp"
 #include "../clips/ClipComponent.hpp"
 #include "Config.hpp"
+#include "core/AutomationCommands.hpp"
 #include "core/ClipCommands.hpp"
 #include "core/SelectionManager.hpp"
 #include "core/TempoUtils.hpp"
@@ -21,6 +23,69 @@
 #include "project/ProjectManager.hpp"
 
 namespace magda {
+
+namespace {
+
+bool isDraggedAudioFile(const juce::String& path) {
+    return path.endsWithIgnoreCase(".wav") || path.endsWithIgnoreCase(".aiff") ||
+           path.endsWithIgnoreCase(".aif") || path.endsWithIgnoreCase(".mp3") ||
+           path.endsWithIgnoreCase(".ogg") || path.endsWithIgnoreCase(".flac");
+}
+
+bool isDraggedMidiFile(const juce::String& path) {
+    return path.endsWithIgnoreCase(".mid") || path.endsWithIgnoreCase(".midi");
+}
+
+std::vector<FileDropGhost> makeMidiDropGhosts(const juce::File& midiFile, double tempoBPM) {
+    std::vector<FileDropGhost> ghosts;
+
+    juce::OwnedArray<tracktion::MidiList> lists;
+    juce::Array<tracktion::BeatPosition> tempoChangeBeatNumbers;
+    juce::Array<double> bpms;
+    juce::Array<int> numerators, denominators;
+    tracktion::BeatDuration songLength;
+
+    const bool ok = tracktion::MidiList::readSeparateTracksFromFile(
+        midiFile, lists, tempoChangeBeatNumbers, bpms, numerators, denominators, songLength, false);
+    if (!ok || lists.isEmpty()) {
+        ghosts.push_back({midiFile.getFileNameWithoutExtension(), 4.0});
+        return ghosts;
+    }
+
+    const double tempo = isValidBpm(tempoBPM) ? tempoBPM : DEFAULT_BPM;
+    int beatsPerBar = 4;
+    if (!numerators.isEmpty() && numerators[0] > 0)
+        beatsPerBar = numerators[0];
+
+    for (int listIdx = 0; listIdx < lists.size(); ++listIdx) {
+        auto* list = lists[listIdx];
+        if (list == nullptr || (list->getNumNotes() == 0 && list->getNumControllerEvents() == 0))
+            continue;
+
+        double lengthBeats = songLength.inBeats();
+        if (lengthBeats <= 0.0)
+            lengthBeats = list->getLastBeatNumber().inBeats();
+        if (lengthBeats <= 0.0)
+            lengthBeats = 4.0;
+
+        lengthBeats = std::ceil(lengthBeats / beatsPerBar) * beatsPerBar;
+
+        juce::String name = list->getImportedFileName();
+        if (name.isEmpty())
+            name = midiFile.getFileNameWithoutExtension();
+        if (lists.size() > 1)
+            name += " " + juce::String(listIdx + 1);
+
+        ghosts.push_back({name, lengthBeats * 60.0 / tempo});
+    }
+
+    if (ghosts.empty())
+        ghosts.push_back({midiFile.getFileNameWithoutExtension(), 4.0});
+
+    return ghosts;
+}
+
+}  // namespace
 
 TrackContentPanel::TrackContentPanel() {
     // Load configuration values, converting bars → seconds at default tempo
@@ -342,12 +407,12 @@ void TrackContentPanel::paintOverChildren(juce::Graphics& g) {
             g.setColour(juce::Colours::yellow.withAlpha(0.8f));
             g.drawLine(static_cast<float>(dropX), static_cast<float>(trackY),
                        static_cast<float>(dropX), static_cast<float>(trackY + trackHeight), 2.0f);
-        } else if (!draggedAudioFiles_.isEmpty()) {
-            // Dropping audio on empty area — ghost one clip preview per audio
-            // file, each on its own phantom track row below the existing tracks.
+        } else if (!fileDropGhosts_.empty()) {
+            // Dropping files on empty area: ghost one clip preview per imported
+            // clip, each on its own phantom track row below the existing tracks.
             // The ghost starts at the drop insertion time (never before it) and
-            // its width matches the sample duration so the user can judge layout.
-            const int numGhosts = draggedAudioFiles_.size();
+            // its width matches the file duration so the user can judge layout.
+            const int numGhosts = static_cast<int>(fileDropGhosts_.size());
             const int topY = getTotalTracksHeight();
             const int ghostHeight = DEFAULT_TRACK_HEIGHT;
             const int baseIndex = TrackManager::getInstance().getNumTracks();
@@ -358,10 +423,8 @@ void TrackContentPanel::paintOverChildren(juce::Graphics& g) {
 
                 const auto tint = juce::Colour(Config::getDefaultColour(baseIndex + i));
 
-                // Ghost clip: starts at dropX, width derived from sample duration.
-                double duration = (i < static_cast<int>(draggedAudioDurations_.size()))
-                                      ? draggedAudioDurations_[i]
-                                      : 4.0;
+                // Ghost clip: starts at dropX, width derived from file duration.
+                double duration = fileDropGhosts_[static_cast<size_t>(i)].durationSeconds;
                 int clipEndX = timeToPixel(dropInsertTime_ + duration);
                 int clipW = juce::jmax(4, clipEndX - dropX);
 
@@ -371,7 +434,7 @@ void TrackContentPanel::paintOverChildren(juce::Graphics& g) {
                 g.setColour(tint.withAlpha(0.9f));
                 g.drawRect(clipRect, 1);
 
-                auto name = juce::File(draggedAudioFiles_[i]).getFileNameWithoutExtension();
+                const auto name = fileDropGhosts_[static_cast<size_t>(i)].name;
                 g.setColour(tint.brighter(0.3f));
                 g.setFont(juce::Font(juce::FontOptions(12.0f).withStyle("Bold")));
                 g.drawFittedText(name, clipRect.reduced(6, 4), juce::Justification::centredLeft, 1);
@@ -1291,8 +1354,18 @@ void TrackContentPanel::mouseDrag(const juce::MouseEvent& event) {
             selectionEndTime = snapTimeToGrid(selectionEndTime);
         }
 
-        // Track the current track under the mouse for multi-track selection
+        // Track the current track under the mouse for multi-track selection.
+        // If the drag crosses into an automation lane header strip, keep the
+        // clip-row selection and add that lane as an explicit automation scope.
         selectionEndTrackIndex = getTrackIndexAtY(event.y);
+        std::set<AutomationLaneId> automationLaneIds;
+        int automationTrackIndex = -1;
+        AutomationLaneId automationLaneId = INVALID_AUTOMATION_LANE_ID;
+        if (selectionEndTrackIndex < 0 &&
+            getAutomationLaneStripAtY(event.y, automationTrackIndex, automationLaneId)) {
+            selectionEndTrackIndex = automationTrackIndex;
+            automationLaneIds.insert(automationLaneId);
+        }
 
         // Clamp to valid track range (handle dragging above/below track area)
         if (selectionEndTrackIndex < 0) {
@@ -1321,7 +1394,11 @@ void TrackContentPanel::mouseDrag(const juce::MouseEvent& event) {
         if (onTimeSelectionChanged) {
             double start = juce::jmin(selectionStartTime, selectionEndTime);
             double end = juce::jmax(selectionStartTime, selectionEndTime);
-            onTimeSelectionChanged(start, end, trackIndices);
+            if (!automationLaneIds.empty() && onMixedTimeSelectionChanged) {
+                onMixedTimeSelectionChanged(start, end, trackIndices, automationLaneIds);
+            } else {
+                onTimeSelectionChanged(start, end, trackIndices);
+            }
         }
     }
 }
@@ -1574,6 +1651,15 @@ void TrackContentPanel::mouseUp(const juce::MouseEvent& event) {
 
             // Get final track index from mouse position
             selectionEndTrackIndex = getTrackIndexAtY(event.y);
+            std::set<AutomationLaneId> automationLaneIds;
+            int automationTrackIndex = -1;
+            AutomationLaneId automationLaneId = INVALID_AUTOMATION_LANE_ID;
+            if (selectionEndTrackIndex < 0 &&
+                getAutomationLaneStripAtY(event.y, automationTrackIndex, automationLaneId)) {
+                selectionEndTrackIndex = automationTrackIndex;
+                automationLaneIds.insert(automationLaneId);
+            }
+
             if (selectionEndTrackIndex < 0) {
                 if (event.y < 0) {
                     selectionEndTrackIndex = 0;
@@ -1601,7 +1687,9 @@ void TrackContentPanel::mouseUp(const juce::MouseEvent& event) {
                     }
                 }
 
-                if (onTimeSelectionChanged) {
+                if (!automationLaneIds.empty() && onMixedTimeSelectionChanged) {
+                    onMixedTimeSelectionChanged(start, end, trackIndices, automationLaneIds);
+                } else if (onTimeSelectionChanged) {
                     onTimeSelectionChanged(start, end, trackIndices);
                 }
 
@@ -1735,20 +1823,25 @@ void TrackContentPanel::showEmptySpaceContextMenu(const juce::MouseEvent& event)
     bool isFrozen = trackInfo && trackInfo->frozen;
 
     auto& clipManager = ClipManager::getInstance();
+    auto& selectionManager = SelectionManager::getInstance();
     bool hasClipboard = clipManager.hasClipsInClipboard();
+    bool hasSelectedClips = !selectionManager.getSelectedClips().empty();
 
     // "Duplicate Time Selection" only makes sense when an active, visible
     // time selection exists. Same gate Cmd+D uses in MainWindowCommands.
     bool hasTimeSelection = false;
     if (timelineController) {
         const auto& sel = timelineController->getState().selection;
-        hasTimeSelection = sel.isVisuallyActive();
+        hasTimeSelection = sel.isVisuallyActive() && !sel.automationOnly;
     }
 
     juce::PopupMenu menu;
     menu.addItem(1, "Create MIDI Clip", !isFrozen);
     menu.addSeparator();
     menu.addItem(2, "Paste", !isFrozen && hasClipboard);
+    menu.addItem(5, "Duplicate Selected Clips", !isFrozen && hasSelectedClips);
+    menu.addItem(6, "Duplicate Selected Clips With Automation", !isFrozen && hasSelectedClips);
+    menu.addItem(7, "Duplicate Selected Clips Without Automation", !isFrozen && hasSelectedClips);
     menu.addItem(4, "Duplicate Time Selection", !isFrozen && hasTimeSelection);
     menu.addItem(3, "Select All");
 
@@ -1826,8 +1919,70 @@ void TrackContentPanel::showEmptySpaceContextMenu(const juce::MouseEvent& event)
                     SetTimeSelectionEvent{sel.endTime, sel.endTime + duration, sel.trackIndices});
                 break;
             }
+            case 5:  // Duplicate Selected Clips
+            case 7:  // Duplicate Selected Clips Without Automation
+                if (safeThis)
+                    safeThis->duplicateSelectedArrangementClips(false);
+                break;
+            case 6:  // Duplicate Selected Clips With Automation
+                if (safeThis)
+                    safeThis->duplicateSelectedArrangementClips(true);
+                break;
         }
     });
+}
+
+bool TrackContentPanel::duplicateSelectedArrangementClips(bool includeAutomation) {
+    auto& selectionManager = SelectionManager::getInstance();
+    auto& clipManager = ClipManager::getInstance();
+    const auto selectedClips = selectionManager.getSelectedClips();
+    if (selectedClips.empty())
+        return false;
+
+    auto commands = createArrangementBlockDuplicateCommands(selectedClips, tempoBPM);
+    if (commands.empty())
+        return false;
+
+    const bool compoundOperation = commands.size() > 1 || includeAutomation;
+    if (compoundOperation) {
+        UndoManager::getInstance().beginCompoundOperation(
+            includeAutomation ? "Duplicate Clips With Automation" : "Duplicate Clips");
+    }
+
+    std::unordered_set<ClipId> newClipIds;
+    for (auto& cmd : commands) {
+        const auto sourceClipId = cmd->getSourceClipId();
+        auto* cmdPtr = cmd.get();
+        UndoManager::getInstance().executeCommand(std::move(cmd));
+        const ClipId newId = cmdPtr->getDuplicatedClipId();
+        if (newId != INVALID_CLIP_ID)
+            newClipIds.insert(newId);
+
+        if (!includeAutomation || newId == INVALID_CLIP_ID)
+            continue;
+
+        const auto* sourceClip = clipManager.getClip(sourceClipId);
+        const auto* duplicatedClip = clipManager.getClip(newId);
+        if (!sourceClip || !duplicatedClip)
+            continue;
+
+        const double sourceStartBeat = sourceClip->getStartBeats(tempoBPM);
+        const double sourceEndBeat = sourceClip->getEndBeats(tempoBPM);
+        const double destinationStartBeat = duplicatedClip->getStartBeats(tempoBPM);
+        auto automationCmd = std::make_unique<DuplicateAutomationTimeSelectionCommand>(
+            sourceStartBeat, sourceEndBeat, std::vector<TrackId>{sourceClip->trackId},
+            destinationStartBeat);
+        if (automationCmd->canDuplicatePoints())
+            UndoManager::getInstance().executeCommand(std::move(automationCmd));
+    }
+
+    if (compoundOperation)
+        UndoManager::getInstance().endCompoundOperation();
+
+    if (!newClipIds.empty())
+        selectionManager.selectClips(newClipIds);
+
+    return true;
 }
 
 void TrackContentPanel::timerCallback() {
@@ -2333,6 +2488,15 @@ bool TrackContentPanel::checkIfMarqueeNeeded(const juce::Point<int>& currentPoin
 
 bool TrackContentPanel::keyPressed(const juce::KeyPress& key) {
     auto& selectionManager = SelectionManager::getInstance();
+    auto forwardToParent = [this, &key]() {
+        auto* parent = getParentComponent();
+        while (parent != nullptr) {
+            if (parent->keyPressed(key))
+                return true;
+            parent = parent->getParentComponent();
+        }
+        return false;
+    };
 
     // Note: Cmd+Z / Cmd+Shift+Z (undo/redo) are handled globally by
     // MainComponent's ApplicationCommandManager key mappings.
@@ -2366,7 +2530,8 @@ bool TrackContentPanel::keyPressed(const juce::KeyPress& key) {
 
     // Delete/Backspace: time-selection delete takes priority, then selected clips
     if (key == juce::KeyPress::deleteKey || key == juce::KeyPress::backspaceKey) {
-        if (timelineController && timelineController->getState().selection.isVisuallyActive()) {
+        if (timelineController && timelineController->getState().selection.isVisuallyActive() &&
+            !timelineController->getState().selection.automationOnly) {
             const auto& state = timelineController->getState();
             const auto& sel = state.selection;
 
@@ -2419,36 +2584,11 @@ bool TrackContentPanel::keyPressed(const juce::KeyPress& key) {
 
     // Cmd/Ctrl+D: Duplicate selected clips
     if (key == juce::KeyPress('d', juce::ModifierKeys::commandModifier, 0)) {
-        const auto& selectedClips = selectionManager.getSelectedClips();
-        if (!selectedClips.empty()) {
-            auto commands = createArrangementBlockDuplicateCommands(selectedClips, tempoBPM);
-            if (commands.empty())
-                return false;
+        if (timelineController && timelineController->getState().selection.isVisuallyActive()) {
+            return forwardToParent();
+        }
 
-            // Use compound operation to group all duplicates into single undo step
-            if (commands.size() > 1) {
-                UndoManager::getInstance().beginCompoundOperation("Duplicate Clips");
-            }
-
-            // Execute commands and collect new IDs
-            std::unordered_set<ClipId> newClipIds;
-            for (auto& cmd : commands) {
-                DuplicateClipCommand* cmdPtr = cmd.get();
-                UndoManager::getInstance().executeCommand(std::move(cmd));
-                ClipId newId = cmdPtr->getDuplicatedClipId();
-                if (newId != INVALID_CLIP_ID) {
-                    newClipIds.insert(newId);
-                }
-            }
-
-            if (commands.size() > 1) {
-                UndoManager::getInstance().endCompoundOperation();
-            }
-
-            // Select the new duplicates
-            if (!newClipIds.empty()) {
-                selectionManager.selectClips(newClipIds);
-            }
+        if (duplicateSelectedArrangementClips(false)) {
             grabKeyboardFocus();  // Keep focus for subsequent operations
             return true;
         }
@@ -2526,15 +2666,7 @@ bool TrackContentPanel::keyPressed(const juce::KeyPress& key) {
     // Forward unhandled keys up the parent chain for command manager processing
     // Walk up past the Viewport to reach MainView/MainComponent where ApplicationCommandManager
     // lives
-    auto* parent = getParentComponent();
-    while (parent != nullptr) {
-        if (parent->keyPressed(key)) {
-            return true;
-        }
-        parent = parent->getParentComponent();
-    }
-
-    return false;  // Key not handled
+    return forwardToParent();
 }
 
 // ============================================================================
@@ -2620,6 +2752,38 @@ bool TrackContentPanel::isAutomationLaneVisible(TrackId trackId, AutomationLaneI
     return false;
 }
 
+bool TrackContentPanel::getAutomationLaneBounds(AutomationLaneId laneId,
+                                                juce::Rectangle<int>& bounds) const {
+    for (const auto& entry : automationLaneComponents_) {
+        if (entry.laneId == laneId && entry.component) {
+            bounds = entry.component->getBounds();
+            return true;
+        }
+    }
+    return false;
+}
+
+bool TrackContentPanel::getAutomationLaneStripAtY(int y, int& trackIndex,
+                                                  AutomationLaneId& laneId) const {
+    for (const auto& entry : automationLaneComponents_) {
+        if (!entry.component)
+            continue;
+
+        const auto bounds = entry.component->getBounds();
+        if (y < bounds.getY() || y >= bounds.getY() + AutomationLaneComponent::HEADER_HEIGHT)
+            continue;
+
+        auto trackIt = std::find(visibleTrackIds_.begin(), visibleTrackIds_.end(), entry.trackId);
+        if (trackIt == visibleTrackIds_.end())
+            return false;
+
+        trackIndex = static_cast<int>(std::distance(visibleTrackIds_.begin(), trackIt));
+        laneId = entry.laneId;
+        return true;
+    }
+    return false;
+}
+
 int TrackContentPanel::getTrackTotalHeight(int trackIndex) const {
     if (trackIndex < 0 || trackIndex >= static_cast<int>(trackLanes.size())) {
         return 0;
@@ -2694,6 +2858,23 @@ void TrackContentPanel::rebuildAutomationLaneComponents() {
                 resized();
                 repaintVisible();
             };
+            entry.component->onTimeSelectionChanged = [this, trackId, laneId](AutomationLaneId,
+                                                                              double startBeat,
+                                                                              double endBeat) {
+                if (!onAutomationTimeSelectionChanged || tempoBPM <= 0.0)
+                    return;
+
+                auto trackIt = std::find(visibleTrackIds_.begin(), visibleTrackIds_.end(), trackId);
+                if (trackIt == visibleTrackIds_.end())
+                    return;
+
+                const int trackIndex =
+                    static_cast<int>(std::distance(visibleTrackIds_.begin(), trackIt));
+                std::set<int> trackIndices{trackIndex};
+                std::set<AutomationLaneId> laneIds{laneId};
+                onAutomationTimeSelectionChanged(startBeat * 60.0 / tempoBPM,
+                                                 endBeat * 60.0 / tempoBPM, trackIndices, laneIds);
+            };
 
             addAndMakeVisible(*entry.component);
             automationLaneComponents_.push_back(std::move(entry));
@@ -2747,10 +2928,7 @@ void TrackContentPanel::updateAutomationLanePositions() {
 
 bool TrackContentPanel::isInterestedInFileDrag(const juce::StringArray& files) {
     for (const auto& file : files) {
-        if (file.endsWithIgnoreCase(".wav") || file.endsWithIgnoreCase(".aiff") ||
-            file.endsWithIgnoreCase(".aif") || file.endsWithIgnoreCase(".mp3") ||
-            file.endsWithIgnoreCase(".ogg") || file.endsWithIgnoreCase(".flac") ||
-            file.endsWithIgnoreCase(".mid") || file.endsWithIgnoreCase(".midi")) {
+        if (isDraggedAudioFile(file) || isDraggedMidiFile(file)) {
             return true;
         }
     }
@@ -2781,16 +2959,11 @@ void TrackContentPanel::beginFilesDropFeedback(const juce::StringArray& files, i
     }
     dropTargetTrackIndex_ = getTrackIndexAtY(y);
 
-    draggedAudioFiles_.clear();
-    draggedAudioDurations_.clear();
+    fileDropGhosts_.clear();
     juce::AudioFormatManager formatMgr;
     formatMgr.registerBasicFormats();
     for (const auto& f : files) {
-        if (f.endsWithIgnoreCase(".wav") || f.endsWithIgnoreCase(".aiff") ||
-            f.endsWithIgnoreCase(".aif") || f.endsWithIgnoreCase(".mp3") ||
-            f.endsWithIgnoreCase(".ogg") || f.endsWithIgnoreCase(".flac")) {
-            draggedAudioFiles_.add(f);
-
+        if (isDraggedAudioFile(f)) {
             double duration = 4.0;
             juce::File audioFile(f);
             if (auto reader = std::unique_ptr<juce::AudioFormatReader>(
@@ -2798,19 +2971,22 @@ void TrackContentPanel::beginFilesDropFeedback(const juce::StringArray& files, i
                 if (reader->sampleRate > 0.0)
                     duration = static_cast<double>(reader->lengthInSamples) / reader->sampleRate;
             }
-            draggedAudioDurations_.push_back(duration);
+            fileDropGhosts_.push_back({audioFile.getFileNameWithoutExtension(), duration});
+        } else if (isDraggedMidiFile(f)) {
+            auto midiGhosts = makeMidiDropGhosts(juce::File(f), tempoBPM);
+            fileDropGhosts_.insert(fileDropGhosts_.end(), midiGhosts.begin(), midiGhosts.end());
         }
     }
 
     showDropIndicator_ = true;
 
-    // Fire ghost-header callback: one phantom header per audio file when the
+    // Fire ghost-header callback: one phantom header per imported clip when the
     // drop would spawn new tracks (i.e. empty area).
     if (onGhostHeadersChanged) {
         juce::StringArray labels;
         if (dropTargetTrackIndex_ < 0) {
-            for (const auto& f : draggedAudioFiles_)
-                labels.add(juce::File(f).getFileNameWithoutExtension());
+            for (const auto& ghost : fileDropGhosts_)
+                labels.add(ghost.name);
         }
         onGhostHeadersChanged(labels);
     }
@@ -2829,8 +3005,8 @@ void TrackContentPanel::updateFilesDropFeedback(int x, int y) {
     if (onGhostHeadersChanged && (prevTarget < 0) != (dropTargetTrackIndex_ < 0)) {
         juce::StringArray labels;
         if (dropTargetTrackIndex_ < 0) {
-            for (const auto& f : draggedAudioFiles_)
-                labels.add(juce::File(f).getFileNameWithoutExtension());
+            for (const auto& ghost : fileDropGhosts_)
+                labels.add(ghost.name);
         }
         onGhostHeadersChanged(labels);
     }
@@ -2840,8 +3016,7 @@ void TrackContentPanel::updateFilesDropFeedback(int x, int y) {
 
 void TrackContentPanel::endFilesDropFeedback() {
     showDropIndicator_ = false;
-    draggedAudioFiles_.clear();
-    draggedAudioDurations_.clear();
+    fileDropGhosts_.clear();
     if (onGhostHeadersChanged)
         onGhostHeadersChanged({});
     repaintVisible();
@@ -3070,6 +3245,7 @@ void TrackContentPanel::importFilesAtPosition(const juce::StringArray& files, in
                 auto* clip = ClipManager::getInstance().getClip(clipId);
                 if (!clip)
                     continue;
+                clip->midi().sourceFilePath = midiFile.getFullPathName();
 
                 // Populate MIDI notes
                 for (auto* note : list->getNotes()) {

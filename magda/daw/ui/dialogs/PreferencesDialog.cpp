@@ -1,7 +1,12 @@
 #include "PreferencesDialog.hpp"
 
 #include <cmath>
+#include <filesystem>
 
+#include "../../media_db/MediaDatabase.hpp"
+#include "../../media_db/MediaDbContext.hpp"
+#include "../../media_db/MediaDbQuery.hpp"
+#include "../../media_db/PresetDbIndexer.hpp"
 #include "../../project/ProjectManager.hpp"
 #include "../components/common/TextSlider.hpp"
 #include "../state/TimelineController.hpp"
@@ -62,6 +67,28 @@ void setupSectionHeader(juce::Component& owner, juce::Label& header, const juce:
     header.setFont(magda::FontManager::getInstance().getUIFontBold(14.0f));
     header.setJustificationType(juce::Justification::centredLeft);
     owner.addAndMakeVisible(header);
+}
+
+void setupPathRowLabel(juce::Component& owner, juce::Label& label, const juce::String& text,
+                       float size = 12.0f) {
+    label.setText(text, juce::dontSendNotification);
+    label.setFont(magda::FontManager::getInstance().getUIFont(size));
+    label.setColour(juce::Label::textColourId,
+                    magda::DarkTheme::getColour(magda::DarkTheme::TEXT_PRIMARY));
+    label.setJustificationType(juce::Justification::centredLeft);
+    owner.addAndMakeVisible(label);
+}
+
+void setupPathTextEditor(juce::Component& owner, juce::TextEditor& editor) {
+    editor.setReadOnly(true);
+    editor.setFont(magda::FontManager::getInstance().getUIFont(12.0f));
+    editor.setColour(juce::TextEditor::backgroundColourId,
+                     magda::DarkTheme::getColour(magda::DarkTheme::SURFACE));
+    editor.setColour(juce::TextEditor::textColourId,
+                     magda::DarkTheme::getColour(magda::DarkTheme::TEXT_PRIMARY));
+    editor.setColour(juce::TextEditor::outlineColourId,
+                     magda::DarkTheme::getColour(magda::DarkTheme::BORDER));
+    owner.addAndMakeVisible(editor);
 }
 
 juce::Rectangle<int> getPreferencesDialogContentSize() {
@@ -1216,6 +1243,54 @@ class PathsPage : public juce::Component {
         renderHint_.setJustificationType(juce::Justification::centredLeft);
         renderHint_.setText(tr("preferences.paths.note.render_hint"), juce::dontSendNotification);
         addAndMakeVisible(renderHint_);
+
+        // --- Media Library ---
+        setupSectionHeader(*this, editorHeader_, "External Audio Editor");
+        setupPathRowLabel(*this, editorLocationCaption_, "Editor");
+        setupPathTextEditor(*this, editorLocationField_);
+
+        editorBrowse_.setButtonText("Browse...");
+        editorBrowse_.onClick = [this]() { browseForExternalEditor(); };
+        addAndMakeVisible(editorBrowse_);
+
+        editorReset_.setButtonText("Reset");
+        editorReset_.onClick = [this]() {
+            magda::Config::getInstance().setExternalAudioEditorPath(std::string{});
+            magda::Config::getInstance().save();
+            refreshMediaLibrarySettings();
+        };
+        addAndMakeVisible(editorReset_);
+
+        setupSectionHeader(*this, dbHeader_, "Media Database");
+        setupPathRowLabel(*this, dbLocationCaption_, "Database location");
+        setupPathTextEditor(*this, dbLocationField_);
+
+        dbBrowse_.setButtonText("Browse...");
+        dbBrowse_.onClick = [this]() { browseForDbLocation(); };
+        addAndMakeVisible(dbBrowse_);
+
+        dbReset_.setButtonText("Reset");
+        dbReset_.onClick = [this]() {
+            magda::Config::getInstance().setMediaDbDir(std::string{});
+            magda::Config::getInstance().save();
+            magda::media::MediaDbContext::getInstance().resetForReopen();
+            refreshMediaLibrarySettings();
+        };
+        addAndMakeVisible(dbReset_);
+
+        dbStats_.setFont(magda::FontManager::getInstance().getUIFont(11.0f));
+        dbStats_.setColour(juce::Label::textColourId,
+                           magda::DarkTheme::getColour(magda::DarkTheme::TEXT_SECONDARY));
+        dbStats_.setJustificationType(juce::Justification::centredLeft);
+        addAndMakeVisible(dbStats_);
+
+        wipeButton_.setButtonText("Wipe database...");
+        wipeButton_.onClick = [this]() { confirmAndWipe(); };
+        addAndMakeVisible(wipeButton_);
+
+        indexPresetsButton_.setButtonText("Index presets");
+        indexPresetsButton_.onClick = [this]() { runPresetIndex(); };
+        addAndMakeVisible(indexPresetsButton_);
     }
 
     int getPreferredHeight(int) const {
@@ -1225,7 +1300,8 @@ class PathsPage : public juce::Component {
         constexpr int sectionGap = 18;
 
         return padding + rowH + gap + rowH + gap + rowH + gap + rowH + sectionGap + rowH + gap +
-               rowH + gap + rowH + gap + rowH + sectionGap + rowH + padding;
+               rowH + gap + rowH + gap + rowH + sectionGap + rowH + gap + rowH + sectionGap + rowH +
+               gap + rowH + gap + rowH + gap + rowH + sectionGap + rowH + padding;
     }
 
     void resized() override {
@@ -1236,6 +1312,7 @@ class PathsPage : public juce::Component {
         const int revealW = 130;
         const int browseW = 100;
         const int resetW = 80;
+        const int labelW = 120;
 
         // Data section: header → button row (Reveal + Browse + Reset, left-
         // aligned) → path row (Folder: <value>) → note.
@@ -1274,6 +1351,41 @@ class PathsPage : public juce::Component {
 
         bounds.removeFromTop(sectionGap);
 
+        // External editor section
+        editorHeader_.setBounds(bounds.removeFromTop(rowH));
+        bounds.removeFromTop(gap);
+        auto editorRow = bounds.removeFromTop(rowH);
+        editorLocationCaption_.setBounds(editorRow.removeFromLeft(labelW));
+        editorReset_.setBounds(editorRow.removeFromRight(70).reduced(0, 1));
+        editorRow.removeFromRight(4);
+        editorBrowse_.setBounds(editorRow.removeFromRight(90).reduced(0, 1));
+        editorRow.removeFromRight(4);
+        editorLocationField_.setBounds(editorRow.reduced(0, 1));
+
+        bounds.removeFromTop(sectionGap);
+
+        // Media database section
+        dbHeader_.setBounds(bounds.removeFromTop(rowH));
+        bounds.removeFromTop(gap);
+        auto dbLocRow = bounds.removeFromTop(rowH);
+        dbLocationCaption_.setBounds(dbLocRow.removeFromLeft(labelW));
+        dbReset_.setBounds(dbLocRow.removeFromRight(70).reduced(0, 1));
+        dbLocRow.removeFromRight(4);
+        dbBrowse_.setBounds(dbLocRow.removeFromRight(90).reduced(0, 1));
+        dbLocRow.removeFromRight(4);
+        dbLocationField_.setBounds(dbLocRow.reduced(0, 1));
+        bounds.removeFromTop(gap);
+
+        dbStats_.setBounds(bounds.removeFromTop(20));
+        bounds.removeFromTop(gap);
+
+        auto dbActionRow = bounds.removeFromTop(rowH);
+        wipeButton_.setBounds(dbActionRow.removeFromLeft(180));
+        dbActionRow.removeFromLeft(gap);
+        indexPresetsButton_.setBounds(dbActionRow.removeFromLeft(160));
+
+        bounds.removeFromTop(sectionGap);
+
         renderHint_.setBounds(bounds.removeFromTop(rowH));
     }
 
@@ -1287,6 +1399,7 @@ class PathsPage : public juce::Component {
         pendingCopyData_ = false;
         pendingCopyPresets_ = false;
         updateDisplay();
+        refreshMediaLibrarySettings();
     }
 
     void applySettings(Config& /*config*/) {
@@ -1454,6 +1567,146 @@ class PathsPage : public juce::Component {
         }
     }
 
+    void refreshMediaLibrarySettings() {
+        auto& ctx = magda::media::MediaDbContext::getInstance();
+
+        const auto editorPath =
+            juce::String(magda::Config::getInstance().getExternalAudioEditorPath());
+        editorLocationField_.setText(editorPath.isEmpty() ? juce::String("Not configured")
+                                                          : editorPath,
+                                     juce::dontSendNotification);
+
+        dbLocationField_.setText(juce::String(ctx.dbPath().parent_path().string()),
+                                 juce::dontSendNotification);
+
+        int files = 0;
+        int embeddings = 0;
+        if (ctx.ensureInitialized()) {
+            magda::media::MediaDbQuery probe(ctx.db(), nullptr, nullptr);
+            files = probe.totalFiles();
+            embeddings = probe.totalEmbeddings();
+        }
+        dbStats_.setText(juce::String(files) + " indexed files, " + juce::String(embeddings) +
+                             " audio embeddings",
+                         juce::dontSendNotification);
+        wipeButton_.setEnabled(files > 0);
+    }
+
+    void browseForDbLocation() {
+        const auto currentDir = juce::File(juce::String(
+            magda::media::MediaDbContext::getInstance().dbPath().parent_path().string()));
+        fileChooser_ = std::make_unique<juce::FileChooser>(
+            "Choose a folder for the media database",
+            currentDir.exists() ? currentDir
+                                : juce::File::getSpecialLocation(juce::File::userHomeDirectory));
+
+        juce::Component::SafePointer<PathsPage> self(this);
+        fileChooser_->launchAsync(
+            juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectDirectories,
+            [self](const juce::FileChooser& fc) {
+                const auto picked = fc.getResult();
+                if (picked.isDirectory()) {
+                    magda::Config::getInstance().setMediaDbDir(
+                        picked.getFullPathName().toStdString());
+                    magda::Config::getInstance().save();
+                    magda::media::MediaDbContext::getInstance().resetForReopen();
+                    if (auto* page = self.getComponent())
+                        page->refreshMediaLibrarySettings();
+                }
+            });
+    }
+
+    void browseForExternalEditor() {
+        const auto configured =
+            juce::String(magda::Config::getInstance().getExternalAudioEditorPath());
+        juce::File initial = configured.isNotEmpty()
+                                 ? juce::File(configured)
+                                 : juce::File::getSpecialLocation(juce::File::userHomeDirectory);
+        if (!initial.exists()) {
+            initial = juce::File::getSpecialLocation(juce::File::userHomeDirectory);
+        }
+
+        fileChooser_ =
+            std::make_unique<juce::FileChooser>("Choose an external audio editor", initial);
+        auto chooserFlags =
+            juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles;
+#if JUCE_MAC
+        chooserFlags |= juce::FileBrowserComponent::canSelectDirectories;
+#endif
+
+        juce::Component::SafePointer<PathsPage> self(this);
+        fileChooser_->launchAsync(chooserFlags, [self](const juce::FileChooser& fc) {
+            const auto picked = fc.getResult();
+            if (!picked.exists()) {
+                return;
+            }
+#if JUCE_MAC
+            if (!picked.existsAsFile() && !picked.isBundle()) {
+                return;
+            }
+#else
+            if (!picked.existsAsFile()) {
+                return;
+            }
+#endif
+            magda::Config::getInstance().setExternalAudioEditorPath(
+                picked.getFullPathName().toStdString());
+            magda::Config::getInstance().save();
+            if (auto* page = self.getComponent())
+                page->refreshMediaLibrarySettings();
+        });
+    }
+
+    void runPresetIndex() {
+        auto& ctx = magda::media::MediaDbContext::getInstance();
+        if (!ctx.ensureInitialized()) {
+            return;
+        }
+        const auto presetsRoot =
+            std::filesystem::path(magda::paths::presetsDir().getFullPathName().toStdString());
+
+        indexPresetsButton_.setEnabled(false);
+        indexPresetsButton_.setButtonText("Indexing presets...");
+
+        const juce::Component::SafePointer<PathsPage> self(this);
+        juce::Thread::launch([self, presetsRoot]() {
+            auto& ctx = magda::media::MediaDbContext::getInstance();
+            magda::media::PresetDbIndexer indexer(ctx.db());
+            const auto stats = indexer.indexAll(presetsRoot);
+            ctx.bumpMediaRevision();
+            juce::MessageManager::callAsync([self, stats]() {
+                if (auto* page = self.getComponent()) {
+                    page->indexPresetsButton_.setEnabled(true);
+                    page->indexPresetsButton_.setButtonText("Index presets");
+                    page->refreshMediaLibrarySettings();
+                    juce::Logger::writeToLog(juce::String("[indexPresets] inserted=") +
+                                             juce::String(stats.inserted) +
+                                             " updated=" + juce::String(stats.updated) +
+                                             " skipped=" + juce::String(stats.skipped) +
+                                             " failed=" + juce::String(stats.failed));
+                }
+            });
+        });
+    }
+
+    void confirmAndWipe() {
+        const juce::Component::SafePointer<PathsPage> self(this);
+        juce::AlertWindow::showAsync(
+            juce::MessageBoxOptions{}
+                .withIconType(juce::MessageBoxIconType::WarningIcon)
+                .withTitle("Wipe media database")
+                .withMessage("This deletes every indexed file, embedding, and tag from the media "
+                             "database.\nYour audio files on disk are untouched.\n\nContinue?")
+                .withButton("Wipe")
+                .withButton("Cancel"),
+            [self](int result) {
+                if (auto* page = self.getComponent(); page != nullptr && result == 1) {
+                    magda::media::MediaDbContext::getInstance().wipeAll();
+                    page->refreshMediaLibrarySettings();
+                }
+            });
+    }
+
     juce::Label dataHeader_, dataLabel_, dataValue_, dataNote_;
     juce::TextButton dataBrowse_, dataReveal_, dataReset_;
     std::string dataPath_;
@@ -1467,6 +1720,21 @@ class PathsPage : public juce::Component {
     bool pendingCopyPresets_ = false;
 
     juce::Label renderHint_;
+
+    juce::Label editorHeader_;
+    juce::Label editorLocationCaption_;
+    juce::TextEditor editorLocationField_;
+    juce::TextButton editorBrowse_;
+    juce::TextButton editorReset_;
+
+    juce::Label dbHeader_;
+    juce::Label dbLocationCaption_;
+    juce::TextEditor dbLocationField_;
+    juce::TextButton dbBrowse_;
+    juce::TextButton dbReset_;
+    juce::Label dbStats_;
+    juce::TextButton wipeButton_;
+    juce::TextButton indexPresetsButton_;
 
     std::unique_ptr<juce::FileChooser> fileChooser_;
 };
@@ -1492,10 +1760,11 @@ class ShortcutsPage : public juce::Component {
         addShortcut("Cut", cmd("X"), "Clips");
         addShortcut("Copy", cmd("C"), "Clips");
         addShortcut("Paste", cmd("V"), "Clips");
-        addShortcut("Duplicate selected clip(s) or track(s)", cmd("D"), "Context");
-        addShortcut("Delete selected item or time selection", "Delete / Backspace", "Context");
-        addShortcut("Select All", cmd("A"), "Context");
-        addShortcut("Split / Trim", cmd("E"), "Clips");
+        addShortcut("Duplicate notes, clips, or time selection", cmd("D"), "Context");
+        addShortcut("Delete notes, clips, tracks, or time selection", "Delete / Backspace",
+                    "Context");
+        addShortcut("Select all notes or arrangement clips", cmd("A"), "Context");
+        addShortcut("Split / Trim arrangement clips", cmd("E"), "Arrange");
         addShortcut("Blade split at edit cursor", "B", "Arrange");
         addShortcut("Join Clips", cmd("J"), "Clips");
         addShortcut("Render Clip", cmd("B"), "Clips");
@@ -1506,14 +1775,16 @@ class ShortcutsPage : public juce::Component {
         addSection("Track");
         addShortcut("New Track", cmd("T"), "Global");
         addShortcut("New Group Track", shiftCmd("T"), "Global");
-        addShortcut("Duplicate Track without content", shiftCmd("D"), "Track selection");
-        addShortcut("Duplicate Track content only", altCmd("D"), "Track selection");
+        addShortcut("Duplicate selected track without clips", shiftCmd("D"), "Track selection");
+        addShortcut("Duplicate selected track clips only", altCmd("D"), "Track selection");
         addShortcut("Toggle Mute", "M", "Track selection");
-        addShortcut("Toggle Solo", "Shift+S", "Track selection");
+        addShortcut("Toggle Solo", shiftPrefix() + "S", "Track selection");
 
         addSection("Transport and View");
         addShortcut("Play / Stop", "Space", "Global");
         addShortcut("Exit link mode / clear selection", "Escape", "Context");
+        addShortcut("Cycle to next main view", "Tab", "Global");
+        addShortcut("Cycle to previous main view", shiftPrefix() + "Tab", "Global");
         addShortcut("Create loop from selection or clip", "L", "Arrange");
         addShortcut("Reset Zoom to Fit", cmd("0"), "Arrange");
         addShortcut("Toggle Arrangement Lock", "F4", "Arrange");
@@ -1526,9 +1797,6 @@ class ShortcutsPage : public juce::Component {
         addShortcut("Send AI message", "Return", "AI tab");
         addShortcut("New line in AI message", "Shift+Return", "AI tab");
         addShortcut("Accept autocomplete", "Tab / Return", "AI tab");
-
-        addSection("Development");
-        addShortcut("Open Debug Dialog", shiftAltCmd("D"), "Global");
     }
 
     void resized() override {
@@ -1587,10 +1855,6 @@ class ShortcutsPage : public juce::Component {
 
     static juce::String altCmd(const juce::String& key) {
         return altPrefix() + commandPrefix() + key;
-    }
-
-    static juce::String shiftAltCmd(const juce::String& key) {
-        return shiftPrefix() + altPrefix() + commandPrefix() + key;
     }
 
     void addSection(const juce::String& title) {

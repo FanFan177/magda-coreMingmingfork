@@ -1,5 +1,7 @@
 #include "ClipManager.hpp"
 
+#include <juce_events/juce_events.h>
+
 #include <algorithm>
 #include <cmath>
 #include <unordered_map>
@@ -7,9 +9,13 @@
 #include "../project/ProjectManager.hpp"
 #include "ClipOperations.hpp"
 #include "Config.hpp"
+#include "MidiFileWriter.hpp"
 #include "TempoUtils.hpp"
 #include "TrackManager.hpp"
 #include "audio/AudioThumbnailManager.hpp"
+#include "media_db/MediaDbContext.hpp"
+#include "media_db/MediaDbIndexer.hpp"
+#include "media_db/MediaDbMetadata.hpp"
 
 namespace magda {
 
@@ -62,6 +68,121 @@ bool seedSourceMetadataFromCachedDetection(ClipInfo& clip, double projectBPM) {
 
     return true;
 }
+
+juce::File midiLibraryFileForClip(const ClipInfo& clip, const juce::File& midiDir) {
+    const juce::File existing(clip.midi().sourceFilePath);
+    if (existing != juce::File() && existing.getParentDirectory() == midiDir &&
+        existing.hasFileExtension(".mid;.midi")) {
+        return existing;
+    }
+
+    auto safeName = juce::File::createLegalFileName(clip.name);
+    if (safeName.isEmpty()) {
+        safeName = "midi_clip";
+    }
+    return midiDir.getNonexistentChildFile(safeName + "_" + juce::String(clip.id), ".mid");
+}
+
+juce::File externalEditFileForClip(const ClipInfo& clip, const juce::File& editsDir,
+                                   const juce::File& sourceFile) {
+    auto safeName = juce::File::createLegalFileName(clip.name);
+    if (safeName.isEmpty()) {
+        safeName = sourceFile.getFileNameWithoutExtension();
+    }
+    if (safeName.isEmpty()) {
+        safeName = "audio_clip";
+    }
+    return editsDir.getNonexistentChildFile(safeName, sourceFile.getFileExtension(), false);
+}
+
+bool isLaunchableExternalAudioEditor(const juce::File& editor) {
+#if JUCE_MAC
+    if (editor.isBundle()) {
+        return true;
+    }
+#endif
+    return editor.existsAsFile();
+}
+
+bool launchExternalAudioEditor(const juce::File& editor, const juce::File& editFile) {
+    juce::StringArray args;
+
+#if JUCE_MAC
+    if (editor.isBundle()) {
+        args.add("/usr/bin/open");
+        args.add("-n");
+        args.add("-a");
+        args.add(editor.getFullPathName());
+        args.add(editFile.getFullPathName());
+    } else
+#endif
+    {
+        args.add(editor.getFullPathName());
+        args.add(editFile.getFullPathName());
+    }
+
+    juce::ChildProcess process;
+    return process.start(args, 0);
+}
+
+class ExternalEditPoller : private juce::Timer {
+  public:
+    static ExternalEditPoller& getInstance() {
+        static ExternalEditPoller poller;
+        return poller;
+    }
+
+    void watch(ClipId clipId, const juce::File& file) {
+        if (!file.existsAsFile()) {
+            return;
+        }
+
+        const auto path = file.getFullPathName();
+        const auto mtime = file.getLastModificationTime();
+        for (auto& item : watched_) {
+            if (item.path == path) {
+                item.clipId = clipId;
+                item.lastModified = mtime;
+                return;
+            }
+        }
+
+        watched_.push_back({clipId, path, mtime});
+        startTimer(1000);
+    }
+
+  private:
+    struct WatchedFile {
+        ClipId clipId = INVALID_CLIP_ID;
+        juce::String path;
+        juce::Time lastModified;
+    };
+
+    void timerCallback() override {
+        for (auto it = watched_.begin(); it != watched_.end();) {
+            juce::File file(it->path);
+            if (!file.existsAsFile()) {
+                it = watched_.erase(it);
+                continue;
+            }
+
+            const auto currentModified = file.getLastModificationTime();
+            if (currentModified != it->lastModified) {
+                it->lastModified = currentModified;
+                AudioThumbnailManager::getInstance().invalidateFile(it->path);
+                ClipManager::getInstance().forceNotifyClipPropertyChanged(it->clipId);
+                ProjectManager::getInstance().markDirty();
+            }
+            ++it;
+        }
+
+        if (watched_.empty()) {
+            stopTimer();
+        }
+    }
+
+    std::vector<WatchedFile> watched_;
+};
 
 }  // namespace
 
@@ -154,6 +275,40 @@ ClipId ClipManager::createAudioClipBeats(TrackId trackId, double startBeats, dou
     clip.loopStart = 0.0;
     clip.setLoopLengthFromTimeline(clip.getTimelineLength(bpm));
 
+    // Scanner output in the media DB is a hint, but user-saved source
+    // interpretation is explicit library metadata and should restore when the
+    // same file is imported again.
+    std::optional<magda::media::EffectiveMetadata> savedMetadata;
+    if (audioFilePath.isNotEmpty() && juce::File(audioFilePath).existsAsFile()) {
+        savedMetadata = magda::media::getUserMetadataForFile(
+            std::filesystem::path(audioFilePath.toStdString()));
+        if (savedMetadata) {
+            if (savedMetadata->bpm && isValidBpm(*savedMetadata->bpm)) {
+                clip.audio().interpretation.bpm = *savedMetadata->bpm;
+            }
+            if (savedMetadata->totalBeats && *savedMetadata->totalBeats > 0.0) {
+                clip.audio().interpretation.totalBeats = *savedMetadata->totalBeats;
+                clip.audio().interpretation.totalBeatsLocked = true;
+            }
+            if (savedMetadata->keyRoot && !savedMetadata->keyRoot->empty()) {
+                clip.audio().interpretation.keyRoot = *savedMetadata->keyRoot;
+            }
+            if (savedMetadata->keyScale && !savedMetadata->keyScale->empty()) {
+                clip.audio().interpretation.keyScale = *savedMetadata->keyScale;
+            }
+        }
+        const auto savedMarkers = magda::media::getUserWarpMarkersForFile(
+            std::filesystem::path(audioFilePath.toStdString()));
+        if (savedMarkers) {
+            clip.warpMarkers.clear();
+            clip.warpMarkers.reserve(savedMarkers->size());
+            for (const auto& marker : *savedMarkers) {
+                clip.warpMarkers.push_back({marker.sourceSec, marker.beat});
+            }
+            clip.warpEnabled = true;
+        }
+    }
+
     if (view == ClipView::Arrangement) {
         clips_[clip.id] = clip;
     } else {
@@ -166,6 +321,21 @@ ClipId ClipManager::createAudioClipBeats(TrackId trackId, double startBeats, dou
         clips_[clip.id] = clip;
     }
 
+    if (savedMetadata && savedMetadata->beatMode) {
+        auto& savedClip = clips_[clip.id];
+        savedClip.autoTempo = *savedMetadata->beatMode;
+        if (savedClip.autoTempo) {
+            savedClip.loopEnabled = true;
+            savedClip.analogPitch = false;
+            savedClip.speedRatio = 1.0;
+            if (savedClip.audio().interpretation.totalBeats > 0.0 &&
+                savedClip.loopLengthBeats <= 0.0) {
+                savedClip.loopLengthBeats = savedClip.audio().interpretation.totalBeats;
+            }
+            savedClip.deriveTimesFromBeats(bpm);
+        }
+    }
+
     addToSessionSlotIndex(clips_[clip.id]);
     if (view == ClipView::Arrangement && overlapPolicy == ClipOverlapPolicy::ResolveOverlaps)
         resolveOverlaps(clip.id);
@@ -174,7 +344,7 @@ ClipId ClipManager::createAudioClipBeats(TrackId trackId, double startBeats, dou
     // Tracktion loopInfo is authoritative when it carries real file metadata,
     // but it can also report project-default values for freshly inserted clips.
     // Run audio analysis as a fallback and let it replace only unset/defaulted
-    // source interpretation values.
+    // source interpretation values. Session-only.
     if (view == ClipView::Session && audioFilePath.isNotEmpty() &&
         juce::File(audioFilePath).existsAsFile()) {
         ClipId cid = clip.id;
@@ -194,12 +364,6 @@ ClipId ClipManager::createAudioClipBeats(TrackId trackId, double startBeats, dou
                 if (thumb->getTotalLength() > 0.0)
                     fileDuration = thumb->getTotalLength();
             }
-            // Fall back to the clip's own source extent (loopLength, set by
-            // createAudioClip from the user-passed length parameter, or the
-            // timeline-derived length for non-looped clips). This mirrors
-            // seedSourceMetadataFromCachedDetection's behaviour for the
-            // arrangement path and matches the contract createAudioClip used
-            // to satisfy by writing source.durationSeconds = length directly.
             if (fileDuration <= 0.0)
                 fileDuration = c->getSourceLength(creationProjectBPM);
 
@@ -350,6 +514,63 @@ void ClipManager::forceNotifyMultipleClipPropertiesChanged(const std::vector<Cli
             listener->clipPropertiesChanged(clipIds);
         }
     }
+}
+
+bool ClipManager::editAudioClipSourceInExternalEditor(ClipId clipId, juce::String& errorMessage) {
+    auto* clip = getClip(clipId);
+    if (clip == nullptr || !clip->isAudio()) {
+        errorMessage = "Select an audio clip first.";
+        return false;
+    }
+
+    const auto editorPath = juce::String(Config::getInstance().getExternalAudioEditorPath());
+    if (editorPath.isEmpty()) {
+        errorMessage = "Choose an external audio editor in Preferences > Media Library first.";
+        return false;
+    }
+
+    juce::File editor(editorPath);
+    if (!editor.exists()) {
+        errorMessage = "The configured external audio editor could not be found.";
+        return false;
+    }
+    if (!isLaunchableExternalAudioEditor(editor)) {
+        errorMessage = "Choose the editor application or executable, not its containing folder.";
+        return false;
+    }
+
+    const juce::File sourceFile(clip->audio().source.filePath);
+    if (!sourceFile.existsAsFile()) {
+        errorMessage = "The clip source file could not be found.";
+        return false;
+    }
+
+    auto editsDir = ProjectManager::getInstance().getExternalEditsDirectory();
+    if (editsDir == juce::File() || !editsDir.createDirectory()) {
+        errorMessage = "Could not create the project external-edits folder.";
+        return false;
+    }
+
+    const auto editFile = externalEditFileForClip(*clip, editsDir, sourceFile);
+    if (!sourceFile.copyFileTo(editFile) || !editFile.existsAsFile()) {
+        errorMessage = "Could not copy the clip source into the project external-edits folder.";
+        return false;
+    }
+
+    if (!launchExternalAudioEditor(editor, editFile)) {
+        editFile.deleteFile();
+        errorMessage = "Could not launch the configured external audio editor.";
+        return false;
+    }
+
+    const auto oldPath = clip->audio().source.filePath;
+    clip->audio().source.filePath = editFile.getFullPathName();
+    AudioThumbnailManager::getInstance().invalidateFile(oldPath);
+    AudioThumbnailManager::getInstance().invalidateFile(clip->audio().source.filePath);
+    notifyClipPropertyChanged(clipId);
+    ProjectManager::getInstance().markDirty();
+    ExternalEditPoller::getInstance().watch(clipId, editFile);
+    return true;
 }
 
 ClipId ClipManager::duplicateClip(ClipId clipId) {
@@ -964,6 +1185,11 @@ void ClipManager::setLoopStart(ClipId clipId, double loopStart, double bpm) {
             sanitizeAudioClip(*clip);
         } else {
             clip->loopStart = juce::jmax(0.0, loopStart);
+            if (clip->isMidi()) {
+                const double projectBpm = isValidBpm(bpm) ? bpm : currentProjectTempoOrDefault();
+                clip->loopStartBeats =
+                    projectBpm > 0.0 ? (clip->loopStart * projectBpm) / 60.0 : 0.0;
+            }
             if (clip->isAudio())
                 sanitizeAudioClip(*clip);
         }
@@ -989,6 +1215,30 @@ void ClipManager::setLoopLength(ClipId clipId, double loopLength, double bpm) {
             }
             sanitizeAudioClip(*clip);
         }
+        notifyClipPropertyChanged(clipId);
+    }
+}
+
+void ClipManager::setMidiLoopStartBeats(ClipId clipId, double loopStartBeats, double bpm) {
+    if (auto* clip = getClip(clipId)) {
+        if (!clip->isMidi())
+            return;
+
+        const double projectBpm = isValidBpm(bpm) ? bpm : currentProjectTempoOrDefault();
+        clip->loopStartBeats = juce::jmax(0.0, loopStartBeats);
+        clip->loopStart = projectBpm > 0.0 ? (clip->loopStartBeats * 60.0) / projectBpm : 0.0;
+        notifyClipPropertyChanged(clipId);
+    }
+}
+
+void ClipManager::setMidiLoopLengthBeats(ClipId clipId, double loopLengthBeats, double bpm) {
+    if (auto* clip = getClip(clipId)) {
+        if (!clip->isMidi())
+            return;
+
+        const double projectBpm = isValidBpm(bpm) ? bpm : currentProjectTempoOrDefault();
+        clip->loopLengthBeats = juce::jmax(0.0, loopLengthBeats);
+        clip->loopLength = projectBpm > 0.0 ? (clip->loopLengthBeats * 60.0) / projectBpm : 0.0;
         notifyClipPropertyChanged(clipId);
     }
 }
@@ -1046,6 +1296,148 @@ void ClipManager::setLengthBeats(ClipId clipId, double newBeats, double bpm) {
     u.lengthBeats = newBeats;
 
     applyAudioClipBeats(clipId, u, bpm);
+}
+
+void ClipManager::recordUserBpm(ClipId clipId, double bpm) {
+    if (!isValidBpm(bpm)) {
+        return;
+    }
+    const auto* clip = getClip(clipId);
+    if (!clip || !clip->isAudio()) {
+        return;
+    }
+    const auto& filePath = clip->audio().source.filePath;
+    if (filePath.isEmpty()) {
+        return;
+    }
+    magda::media::setUserBpmForFile(std::filesystem::path(filePath.toStdString()), bpm);
+}
+
+void ClipManager::recordUserKey(ClipId clipId, const std::string& root) {
+    const auto* clip = getClip(clipId);
+    if (clip == nullptr || !clip->isAudio()) {
+        return;
+    }
+    const auto& filePath = clip->audio().source.filePath;
+    if (filePath.isEmpty()) {
+        return;
+    }
+    std::optional<std::string> rootOpt;
+    if (!root.empty()) {
+        rootOpt = root;
+    }
+    magda::media::setUserKeyRootForFile(std::filesystem::path(filePath.toStdString()), rootOpt);
+}
+
+bool ClipManager::canSaveClipToLibrary(ClipId clipId) const {
+    const auto* clip = getClip(clipId);
+    if (clip == nullptr) {
+        return false;
+    }
+    if (clip->isMidi()) {
+        return !clip->midiNotes.empty() || !clip->midiCCData.empty() ||
+               !clip->midiPitchBendData.empty();
+    }
+    if (!clip->isAudio()) {
+        return false;
+    }
+    const auto& filePath = clip->audio().source.filePath;
+    if (filePath.isEmpty()) {
+        return false;
+    }
+    return juce::File(filePath).existsAsFile();
+}
+
+bool ClipManager::saveClipToLibrary(ClipId clipId,
+                                    std::optional<std::vector<ClipInfo::WarpMarker>> warpMarkers) {
+    auto* clip = getClip(clipId);
+    if (clip == nullptr) {
+        return false;
+    }
+    if (clip->isMidi()) {
+        if (!canSaveClipToLibrary(clipId)) {
+            return false;
+        }
+
+        auto& ctx = magda::media::MediaDbContext::getInstance();
+        if (!ctx.ensureInitialized()) {
+            return false;
+        }
+
+        const juce::File midiDir(juce::String(ctx.midiClipsDir().string()));
+        if (!midiDir.createDirectory()) {
+            return false;
+        }
+
+        const auto outFile = midiLibraryFileForClip(*clip, midiDir);
+        const double tempo = currentProjectTempoOrDefault();
+        if (!magda::daw::MidiFileWriter::writeToFile(outFile, clip->midiNotes, clip->midiCCData,
+                                                     clip->midiPitchBendData, tempo, clip->name)) {
+            return false;
+        }
+
+        magda::media::MediaDbIndexer indexer(ctx.db(), nullptr);
+        const auto stats =
+            indexer.indexFile(std::filesystem::path(outFile.getFullPathName().toStdString()),
+                              magda::media::MediaDbIndexer::Mode::ForceAll);
+        if (stats.inserted + stats.updated + stats.skipped <= 0) {
+            return false;
+        }
+
+        clip->midi().sourceFilePath = outFile.getFullPathName();
+        notifyClipPropertyChanged(clipId);
+        ctx.bumpMediaRevision();
+        return true;
+    }
+
+    if (!clip->isAudio()) {
+        return false;
+    }
+    const auto& filePath = clip->audio().source.filePath;
+    if (filePath.isEmpty()) {
+        return false;
+    }
+    const auto path = std::filesystem::path(filePath.toStdString());
+    if (!magda::media::isFileIndexed(path)) {
+        auto& ctx = magda::media::MediaDbContext::getInstance();
+        if (!ctx.ensureInitialized()) {
+            return false;
+        }
+        magda::media::MediaDbIndexer indexer(ctx.db(), nullptr);
+        const auto stats = indexer.indexFile(path, magda::media::MediaDbIndexer::Mode::ForceAll);
+        if (stats.inserted + stats.updated + stats.skipped <= 0) {
+            return false;
+        }
+    }
+
+    std::optional<double> bpm;
+    if (isValidBpm(clip->audio().interpretation.bpm)) {
+        bpm = clip->audio().interpretation.bpm;
+    }
+    std::optional<double> totalBeats;
+    if (clip->audio().interpretation.totalBeats > 0.0) {
+        totalBeats = clip->audio().interpretation.totalBeats;
+    }
+    const std::optional<bool> beatMode = clip->autoTempo;
+
+    std::optional<std::string> keyRoot;
+    if (!clip->audio().interpretation.keyRoot.empty()) {
+        keyRoot = clip->audio().interpretation.keyRoot;
+    }
+
+    std::optional<std::vector<magda::media::WarpMarkerMetadata>> mediaMarkers;
+    if (clip->warpEnabled) {
+        const auto& sourceMarkers = warpMarkers ? *warpMarkers : clip->warpMarkers;
+        std::vector<magda::media::WarpMarkerMetadata> converted;
+        converted.reserve(sourceMarkers.size());
+        for (const auto& marker : sourceMarkers) {
+            converted.push_back({marker.sourceTime, marker.warpTime});
+        }
+        mediaMarkers = std::move(converted);
+    }
+
+    return magda::media::saveUserMetadataForFile(path, bpm, std::move(keyRoot), totalBeats,
+                                                 beatMode, std::move(mediaMarkers));
 }
 
 void ClipManager::applyAudioClipBeats(ClipId clipId, const AudioClipBeatsUpdate& update,
@@ -1449,6 +1841,17 @@ void ClipManager::setClipSnapEnabled(ClipId clipId, bool enabled) {
     if (auto* clip = getClip(clipId)) {
         clip->gridSnapEnabled = enabled;
         notifyClipPropertyChanged(clipId);
+    }
+}
+
+void ClipManager::setClipMidiEditorRowHeight(ClipId clipId, int rowHeight) {
+    if (auto* clip = getClip(clipId)) {
+        const int clampedHeight = juce::jlimit(ClipInfo::MIN_MIDI_EDITOR_ROW_HEIGHT,
+                                               ClipInfo::MAX_MIDI_EDITOR_ROW_HEIGHT, rowHeight);
+        if (clip->midiEditorRowHeight != clampedHeight) {
+            clip->midiEditorRowHeight = clampedHeight;
+            notifyClipPropertyChanged(clipId);
+        }
     }
 }
 
@@ -2182,6 +2585,7 @@ std::vector<ClipId> ClipManager::pasteFromClipboard(double pasteTime, TrackId ta
 
                 // Copy MIDI data
                 if (clipData.isMidi()) {
+                    newClip->midi().sourceFilePath = clipData.midi().sourceFilePath;
                     newClip->midiNotes = clipData.midiNotes;
                     newClip->midiOffset = clipData.midiOffset;
                     newClip->midiCCData = clipData.midiCCData;
@@ -2253,6 +2657,7 @@ std::vector<ClipId> ClipManager::pasteFromClipboard(double pasteTime, TrackId ta
                 newClip->gridNumerator = clipData.gridNumerator;
                 newClip->gridDenominator = clipData.gridDenominator;
                 newClip->gridSnapEnabled = clipData.gridSnapEnabled;
+                newClip->midiEditorRowHeight = clipData.midiEditorRowHeight;
 
                 // Cross-view translation: pasting into session view
                 if (targetView == ClipView::Session && targetSceneIndex >= 0) {

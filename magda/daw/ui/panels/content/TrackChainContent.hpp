@@ -77,6 +77,8 @@ class TrackChainContent : public PanelContent,
     void trackPropertyChanged(int trackId) override;
     void trackSelectionChanged(magda::TrackId trackId) override;
     void trackDevicesChanged(magda::TrackId trackId) override;
+    void deviceModifiersChanged(magda::TrackId trackId) override;
+    void modulationNamesChanged(magda::TrackId trackId) override;
     void macroValueChanged(magda::TrackId trackId, magda::ChainScope scope, int ownerId,
                            int macroIndex, float value) override;
 
@@ -129,6 +131,8 @@ class TrackChainContent : public PanelContent,
     // Header bar controls - RIGHT side (track info)
     juce::Label trackNameLabel_;
     juce::TextButton muteButton_;  // Track mute
+    // Master uses a speaker toggle (matching the inspector/mixer) instead of "M".
+    juce::DrawableButton masterMuteButton_{"masterMute", juce::DrawableButton::ImageFitted};
     juce::TextButton soloButton_;  // Track solo
     magda::DraggableValueLabel volumeLabel_{magda::DraggableValueLabel::Format::Decibels};
     magda::DraggableValueLabel panLabel_{magda::DraggableValueLabel::Format::Pan};
@@ -154,6 +158,7 @@ class TrackChainContent : public PanelContent,
     void initGlobalMacrosPanel();
     void updateGlobalModsPanel();
     void updateGlobalMacrosPanel();
+    void refreshVisibleModulationPanels();
     void showGlobalModEditor(int modIndex);
     void hideGlobalModEditor();
     void showGlobalMacroEditor(int macroIndex);

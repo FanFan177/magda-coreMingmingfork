@@ -45,6 +45,7 @@ set(TEST_SOURCES
     test_velocity_lane_utils.cpp
     test_grid_constants.cpp
     test_ui_scale.cpp
+    test_media_explorer_preview_state.cpp
     test_timeline_loop_activation.cpp
     test_multi_out_tracks.cpp
     test_freeze_track.cpp
@@ -102,6 +103,25 @@ set(TEST_SOURCES
     test_selection_manager_listeners.cpp
     # Configurable user data paths
     test_app_paths.cpp
+    # Media database (issue #768) — Phase A: SQLite skeleton
+    test_media_database.cpp
+    # Media database (issue #768) — Phase B: scanner + path rules
+    test_media_db_scan.cpp
+    test_media_db_path_rules.cpp
+    # Media database (issue #768) — Phase C: audio features
+    test_media_db_audio_features.cpp
+    # Media database (issue #768) — Phase D: CLAP audio encoder + mel
+    test_media_db_clap_encoder.cpp
+    # Media database (issue #768) — Phase D2: CLAP text encoder
+    test_media_db_clap_text_encoder.cpp
+    # Media database (issue #768) — Phase D3: RoBERTa tokenizer
+    test_media_db_roberta_tokenizer.cpp
+    # Media database (issue #768) — Phase E1: MediaDbIndexer
+    test_media_db_indexer.cpp
+    # Media database (issue #768) — Phase E2: MediaDbQuery (hybrid search)
+    test_media_db_query.cpp
+    # Media database (issue #1319) — CLAP zero-shot tagging
+    test_media_db_zero_shot_tags.cpp
 )
 
 # Create test executable

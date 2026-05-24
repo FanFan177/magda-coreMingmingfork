@@ -50,6 +50,14 @@ class BottomPanel : public daw::ui::TabbedPanel,
     // Callback for double-click on header — requests optimal panel height
     std::function<void()> onHeaderDoubleClick;
 
+    // Callback when the piano roll's fullscreen toggle is clicked (issue #1282).
+    // MainComponent assigns this to actually flip layout state.
+    std::function<void()> onFullscreenToggleRequested;
+
+    // Reflect the current fullscreen state on the piano roll's toggle icon.
+    // Called by MainComponent after togglePianoRollFullscreen() flips state.
+    void setPianoRollFullscreenActive(bool active);
+
     // ClipManagerListener
     void clipsChanged() override;
     void clipSelectionChanged(ClipId clipId) override;
@@ -81,6 +89,10 @@ class BottomPanel : public daw::ui::TabbedPanel,
     std::unique_ptr<SvgButton> pianoRollTab_;
     std::unique_ptr<SvgButton> drumGridTab_;
 
+    // Fullscreen toggle for MIDI editor views (issue #1282).
+    // Visible whenever the active content is PianoRoll or DrumGridClipView.
+    std::unique_ptr<SvgButton> fullscreenToggle_;
+
     // Centralised header bar — content types populate it via populateHeader()
     class HeaderBar;
     std::unique_ptr<HeaderBar> headerBar_;
@@ -99,6 +111,11 @@ class BottomPanel : public daw::ui::TabbedPanel,
     ClipId lastEditorClipId_ = INVALID_CLIP_ID;  // Track which clip we auto-defaulted for
 
     void onEditorTabChanged(int tabIndex);
+    void showDrumGridTabContextMenu(juce::Point<int> screenPos);
+
+    // Mouse listener attached to drumGridTab_ to forward right-clicks to the
+    // context-menu handler. SvgButton's onClick is left-click only.
+    std::unique_ptr<juce::MouseListener> drumGridTabRightClick_;
 
     // Header controls (visible when showEditorTabs_ is true)
     std::unique_ptr<juce::TextButton> timeModeButton_;
@@ -121,6 +138,9 @@ class BottomPanel : public daw::ui::TabbedPanel,
     ScopedListener<TimelineController, TimelineStateListener> timelineListenerGuard_{this};
 
     bool showPluginDropOverlay_ = false;
+
+    // Cached so a piano roll instance created later picks up the right icon.
+    bool pianoRollFullscreenActive_ = false;
 
     // Audio clip properties side panel (right side, resizable)
     std::unique_ptr<daw::ui::AudioClipPropertiesContent> audioPropsPanel_;

@@ -8,6 +8,7 @@
 #include "../../profiling/PerformanceProfiler.hpp"
 #include "../debug/DebugDialog.hpp"
 #include "../debug/DebugSettings.hpp"
+#include "../dialogs/AISettingsDialog.hpp"
 #include "../dialogs/AudioSettingsDialog.hpp"
 #include "../dialogs/ControllersDialog.hpp"
 #include "../dialogs/ExportAudioDialog.hpp"
@@ -479,6 +480,7 @@ MainWindow::MainComponent::MainComponent(AudioEngine* externalEngine) {
             footerBar->setBottomPanelCollapsed(collapsed);
         resized();
     };
+    bottomPanel->onFullscreenToggleRequested = [this]() { toggleEditorFullscreen(); };
     bottomPanel->onHeaderDoubleClick = [this]() {
         auto& layout = LayoutConfig::getInstance();
         // Ask the active content for its preferred height. Falls back to
@@ -511,6 +513,7 @@ MainWindow::MainComponent::MainComponent(AudioEngine* externalEngine) {
         resized();
     };
     footerBar->onControllersClicked = [this]() { ControllersDialog::showDialog(this); };
+    footerBar->onLocalModelsClicked = [this]() { AISettingsDialog::showDialog(this); };
     addAndMakeVisible(*footerBar);
 
     // Create views (now audioEngine is valid - use externalEngine which points to either external
@@ -751,6 +754,10 @@ void MainWindow::MainComponent::setupResizeHandles() {
     // Bottom panel resizer
     bottomResizer = std::make_unique<ResizeHandle>(ResizeHandle::Vertical);
     bottomResizer->onResize = [this, &layout](int delta) {
+        // Manual drag exits piano-roll fullscreen so the toggle doesn't
+        // jump back to a stale saved height (issue #1282).
+        editorFullscreen_ = false;
+
         int newHeight = bottomPanelHeight - delta;
         if (newHeight < layout.panelCollapseThreshold) {
             bottomPanelCollapsed = true;
@@ -1109,7 +1116,12 @@ void MainWindow::MainComponent::resized() {
     // Re-clamp panel sizes to current window dimensions
     const int maxLeftWidth = static_cast<int>(getWidth() * layout.maxLeftPanelRatio);
     const int maxRightWidth = static_cast<int>(getWidth() * layout.maxRightPanelRatio);
-    const int maxBottomHeight = static_cast<int>(getHeight() * layout.maxBottomPanelRatio);
+    // Fullscreen mode lets the bottom panel exceed the normal 60% cap.
+    // The final clamp lives in layoutBottomPanel(), which also reserves the
+    // resize-handle row.
+    const int maxBottomHeight = editorFullscreen_
+                                    ? getHeight()
+                                    : static_cast<int>(getHeight() * layout.maxBottomPanelRatio);
 
     // Enforce both minimum and maximum so non-collapsed panels stay within valid range
     const int minLeftWidth = leftPanelCollapsed ? 0 : layout.minPanelWidth;
@@ -1162,23 +1174,61 @@ void MainWindow::MainComponent::layoutFooterArea(juce::Rectangle<int>& bounds) {
 void MainWindow::MainComponent::layoutBottomPanel(juce::Rectangle<int>& bounds) {
     auto& layout = LayoutConfig::getInstance();
 
-    if (bottomPanelVisible) {
-        if (bottomPanelCollapsed) {
-            bottomPanel->setBounds(bounds.removeFromBottom(layout.collapsedPanelSize));
-            bottomPanel->setCollapsed(true);
-            bottomPanel->setVisible(true);
-            bottomResizer->setVisible(false);
-        } else {
-            bottomPanel->setBounds(bounds.removeFromBottom(bottomPanelHeight));
-            bottomResizer->setBounds(bounds.removeFromBottom(layout.resizeHandleSize));
-            bottomPanel->setCollapsed(false);
-            bottomPanel->setVisible(true);
-            bottomResizer->setVisible(true);
-        }
-    } else {
+    if (!bottomPanelVisible) {
         bottomPanel->setVisible(false);
         bottomResizer->setVisible(false);
+        return;
     }
+
+    if (bottomPanelCollapsed) {
+        bottomPanel->setBounds(bounds.removeFromBottom(layout.collapsedPanelSize));
+        bottomPanel->setCollapsed(true);
+        bottomPanel->setVisible(true);
+        bottomResizer->setVisible(false);
+        return;
+    }
+
+    // Always reserve a row for the resize handle above the panel.
+    // Without this, dragging (or fullscreen) up to the very top makes the
+    // handle 0px tall and unreachable, leaving the panel stuck (issue #1282).
+    const int reserved = layout.resizeHandleSize;
+    const int maxAllowed = std::max(layout.minBottomPanelHeight, bounds.getHeight() - reserved);
+    bottomPanelHeight = std::min(bottomPanelHeight, maxAllowed);
+
+    bottomPanel->setBounds(bounds.removeFromBottom(bottomPanelHeight));
+    bottomResizer->setBounds(bounds.removeFromBottom(layout.resizeHandleSize));
+    bottomPanel->setCollapsed(false);
+    bottomPanel->setVisible(true);
+    bottomResizer->setVisible(true);
+}
+
+void MainWindow::MainComponent::toggleEditorFullscreen() {
+    if (!bottomPanel)
+        return;
+
+    if (!editorFullscreen_) {
+        prevBottomPanelHeight_ = bottomPanelHeight;
+        prevBottomPanelVisible_ = bottomPanelVisible;
+        prevBottomPanelCollapsed_ = bottomPanelCollapsed;
+
+        bottomPanelVisible = true;
+        bottomPanelCollapsed = false;
+        // Request the maximum height; layoutBottomPanel() clamps it to the
+        // available space minus the resize handle row.
+        bottomPanelHeight = getHeight();
+        editorFullscreen_ = true;
+    } else {
+        bottomPanelHeight = prevBottomPanelHeight_;
+        bottomPanelVisible = prevBottomPanelVisible_;
+        bottomPanelCollapsed = prevBottomPanelCollapsed_;
+        editorFullscreen_ = false;
+    }
+
+    if (footerBar)
+        footerBar->setBottomPanelCollapsed(bottomPanelCollapsed);
+    if (bottomPanel)
+        bottomPanel->setPianoRollFullscreenActive(editorFullscreen_);
+    resized();
 }
 
 void MainWindow::MainComponent::layoutSidePanels(juce::Rectangle<int>& bounds) {

@@ -19,6 +19,7 @@
 #include "content/PianoRollContent.hpp"
 #include "content/WaveformEditorContent.hpp"
 #include "core/MidiNoteCommands.hpp"
+#include "core/PluginPreferences.hpp"
 #include "core/SelectionManager.hpp"
 #include "core/TrackCommands.hpp"
 #include "core/UndoManager.hpp"
@@ -31,7 +32,51 @@ namespace magda {
 namespace {
 namespace te = tracktion::engine;
 
-bool trackHasDrumGrid(TrackId trackId) {
+// MouseListener wrapper that fires a callback on right-click only. Used to
+// extend SvgButton-based tab buttons with a context menu — their onClick is
+// left-click only.
+class RightClickForwarder : public juce::MouseListener {
+  public:
+    std::function<void(juce::Point<int>)> onRightClick;
+    void mouseDown(const juce::MouseEvent& e) override {
+        if (e.mods.isPopupMenu() && onRightClick)
+            onRightClick(e.getScreenPosition());
+    }
+};
+
+// First synth (instrument) plugin on `trackId`, walking into racks. Returns
+// nullptr if the track has none.
+te::Plugin* findPrimaryInstrumentForTrack(TrackId trackId) {
+    auto* audioEngine = TrackManager::getInstance().getAudioEngine();
+    if (!audioEngine)
+        return nullptr;
+    auto* bridge = audioEngine->getAudioBridge();
+    if (!bridge)
+        return nullptr;
+    auto* teTrack = bridge->getAudioTrack(trackId);
+    if (!teTrack)
+        return nullptr;
+
+    for (auto* plugin : teTrack->pluginList) {
+        if (plugin != nullptr && plugin->isSynth())
+            return plugin;
+        if (auto* rackInstance = dynamic_cast<te::RackInstance*>(plugin)) {
+            if (rackInstance->type != nullptr) {
+                for (auto* innerPlugin : rackInstance->type->getPlugins()) {
+                    if (innerPlugin != nullptr && innerPlugin->isSynth())
+                        return innerPlugin;
+                }
+            }
+        }
+    }
+    return nullptr;
+}
+
+// True if any instrument plugin on `trackId` has its preferred clip editor set
+// to Drum Grid (via magda::PluginPreferences). Walks the track's plugin list
+// and into any racks. The DrumGrid plugin has an implicit DrumGrid preference
+// in PluginPreferences so existing behaviour is preserved without user setup.
+bool trackPrefersDrumGrid(TrackId trackId) {
     auto* audioEngine = TrackManager::getInstance().getAudioEngine();
     if (!audioEngine)
         return false;
@@ -42,13 +87,21 @@ bool trackHasDrumGrid(TrackId trackId) {
     if (!teTrack)
         return false;
 
+    auto& prefs = magda::PluginPreferences::getInstance();
+
+    auto pluginPrefersDrumGrid = [&](te::Plugin* plugin) {
+        if (plugin == nullptr || !plugin->isSynth())
+            return false;
+        return prefs.prefersDrumGrid(plugin->getIdentifierString());
+    };
+
     for (auto* plugin : teTrack->pluginList) {
-        if (dynamic_cast<daw::audio::DrumGridPlugin*>(plugin))
+        if (pluginPrefersDrumGrid(plugin))
             return true;
         if (auto* rackInstance = dynamic_cast<te::RackInstance*>(plugin)) {
             if (rackInstance->type != nullptr) {
                 for (auto* innerPlugin : rackInstance->type->getPlugins()) {
-                    if (dynamic_cast<daw::audio::DrumGridPlugin*>(innerPlugin))
+                    if (pluginPrefersDrumGrid(innerPlugin))
                         return true;
                 }
             }
@@ -180,7 +233,26 @@ BottomPanel::BottomPanel() : TabbedPanel(daw::ui::PanelLocation::Bottom) {
         if (!updatingTabs_)
             onEditorTabChanged(1);
     };
+    {
+        auto forwarder = std::make_unique<RightClickForwarder>();
+        forwarder->onRightClick = [this](juce::Point<int> screenPos) {
+            showDrumGridTabContextMenu(screenPos);
+        };
+        drumGridTab_->addMouseListener(forwarder.get(), false);
+        drumGridTabRightClick_ = std::move(forwarder);
+    }
     addChildComponent(drumGridTab_.get());
+
+    // Fullscreen toggle (issue #1282) — applies to piano roll and drum grid.
+    fullscreenToggle_ = std::make_unique<SvgButton>("EditorFullscreen", BinaryData::enter_fs_svg,
+                                                    BinaryData::enter_fs_svgSize);
+    fullscreenToggle_->setTooltip("Toggle MIDI editor fullscreen");
+    fullscreenToggle_->setOriginalColor(juce::Colour(0xFFB3B3B3));
+    fullscreenToggle_->onClick = [this]() {
+        if (onFullscreenToggleRequested)
+            onFullscreenToggleRequested();
+    };
+    addChildComponent(fullscreenToggle_.get());
 
     // Create audio clip properties side panel (hidden by default)
     audioPropsPanel_ = std::make_unique<daw::ui::AudioClipPropertiesContent>();
@@ -263,6 +335,7 @@ BottomPanel::~BottomPanel() {
     headerBar_.reset();
     pianoRollTab_.reset();
     drumGridTab_.reset();
+    fullscreenToggle_.reset();
     propsResizer_.reset();
     audioPropsPanel_.reset();
     chordResizer_.reset();
@@ -803,7 +876,7 @@ void BottomPanel::updateContentBasedOnSelection() {
                 // Auto-default to Drum Grid for DrumGrid tracks (on first selection)
                 if (selectedClip != lastEditorClipId_) {
                     lastEditorClipId_ = selectedClip;
-                    if (trackHasDrumGrid(clip->trackId))
+                    if (trackPrefersDrumGrid(clip->trackId))
                         lastEditorTabChoice_ = 1;  // Drum Grid
                     else
                         lastEditorTabChoice_ = 0;  // Piano Roll
@@ -887,6 +960,16 @@ void BottomPanel::updateContentBasedOnSelection() {
     }
 }
 
+void BottomPanel::setPianoRollFullscreenActive(bool active) {
+    pianoRollFullscreenActive_ = active;
+    if (fullscreenToggle_) {
+        fullscreenToggle_->updateSvgData(
+            active ? BinaryData::exit_fs_svg : BinaryData::enter_fs_svg,
+            active ? BinaryData::exit_fs_svgSize : BinaryData::enter_fs_svgSize);
+        fullscreenToggle_->setActive(active);
+    }
+}
+
 void BottomPanel::onContentWillSwitch(daw::ui::PanelContent* outgoing,
                                       daw::ui::PanelContent* incoming) {
     // Depopulate outgoing content's header controls
@@ -898,14 +981,26 @@ void BottomPanel::onContentWillSwitch(daw::ui::PanelContent* outgoing,
     // Populate incoming content's header controls
     if (incoming)
         incoming->populateHeader(*headerBar_);
+
     // Add MIDI controls if incoming is a MIDI editor
-    if (incoming && (incoming->getContentType() == daw::ui::PanelContentType::PianoRoll ||
-                     incoming->getContentType() == daw::ui::PanelContentType::DrumGridClipView)) {
-        addMidiControlsToHeader();
-    }
-    // Also add grid controls for waveform editor
-    if (incoming && incoming->getContentType() == daw::ui::PanelContentType::WaveformEditor) {
+    const bool isMidiEditor =
+        incoming && (incoming->getContentType() == daw::ui::PanelContentType::PianoRoll ||
+                     incoming->getContentType() == daw::ui::PanelContentType::DrumGridClipView);
+    const bool isWaveformEditor =
+        incoming && incoming->getContentType() == daw::ui::PanelContentType::WaveformEditor;
+    if (isMidiEditor || isWaveformEditor)
         addMidiControlsToHeader();  // Grid controls are shared between MIDI and audio
+
+    // Fullscreen toggle: enabled for any clip editor (piano roll, drum grid,
+    // waveform). Hidden for track chain and empty content (issue #1282).
+    if (fullscreenToggle_) {
+        if (isMidiEditor || isWaveformEditor) {
+            headerBar_->addAndMakeVisible(fullscreenToggle_.get());
+            // Sync icon to the cached fullscreen state.
+            setPianoRollFullscreenActive(pianoRollFullscreenActive_);
+        } else {
+            fullscreenToggle_->setVisible(false);
+        }
     }
 
     headerBar_->setVisible(incoming != nullptr && incoming->wantsHeader());
@@ -938,11 +1033,25 @@ void BottomPanel::removeMidiControlsFromHeader() {
     addChildComponent(drumGridTab_.get());
     addChildComponent(sliceButton_.get());
     addChildComponent(bendButton_.get());
+    if (fullscreenToggle_)
+        addChildComponent(fullscreenToggle_.get());
 }
 
 void BottomPanel::layoutMidiHeaderControls(juce::Rectangle<int> headerBounds) {
     auto controlsArea = headerBounds;
-    controlsArea.removeFromRight(30);
+    controlsArea.removeFromRight(8);
+
+    // Fullscreen toggle pinned to the far right (issue #1282). Only sized
+    // here; visibility is managed in onContentWillSwitch so we don't show
+    // it for waveform editor or track chain.
+    if (fullscreenToggle_ && fullscreenToggle_->isVisible()) {
+        const int btn = controlsArea.getHeight() - 8;
+        const int btnX = controlsArea.getRight() - btn;
+        const int btnY = controlsArea.getY() + (controlsArea.getHeight() - btn) / 2;
+        fullscreenToggle_->setBounds(btnX, btnY, btn, btn);
+        controlsArea.removeFromRight(btn + 6);
+    }
+    controlsArea.removeFromRight(22);
 
     int x = controlsArea.getRight();
     int y = controlsArea.getY();
@@ -1013,6 +1122,36 @@ juce::Rectangle<int> BottomPanel::getContentBounds() {
         bounds.removeFromRight(28);
     }
     return bounds;
+}
+
+void BottomPanel::showDrumGridTabContextMenu(juce::Point<int> screenPos) {
+    auto& clipManager = ClipManager::getInstance();
+    auto selectedClip = clipManager.getSelectedClip();
+    const auto* clip =
+        (selectedClip != INVALID_CLIP_ID) ? clipManager.getClip(selectedClip) : nullptr;
+
+    juce::PopupMenu menu;
+    auto* plugin = (clip != nullptr) ? findPrimaryInstrumentForTrack(clip->trackId) : nullptr;
+
+    if (plugin == nullptr) {
+        menu.addItem(0, "No instrument plugin on this track", false, false);
+    } else {
+        auto& prefs = magda::PluginPreferences::getInstance();
+        const auto identifier = plugin->getIdentifierString();
+        const bool prefersGrid = prefs.prefersDrumGrid(identifier);
+        menu.addItem(1, "Use Drum Grid by default for " + plugin->getName(), true, prefersGrid);
+    }
+
+    const juce::String identifier =
+        (plugin != nullptr) ? plugin->getIdentifierString() : juce::String();
+    auto rect = juce::Rectangle<int>(screenPos.x, screenPos.y, 1, 1);
+    menu.showMenuAsync(juce::PopupMenu::Options().withTargetScreenArea(rect),
+                       [identifier](int result) {
+                           if (result != 1 || identifier.isEmpty())
+                               return;
+                           auto& prefs = magda::PluginPreferences::getInstance();
+                           prefs.setPrefersDrumGrid(identifier, !prefs.prefersDrumGrid(identifier));
+                       });
 }
 
 void BottomPanel::onEditorTabChanged(int tabIndex) {

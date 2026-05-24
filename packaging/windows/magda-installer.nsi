@@ -31,7 +31,15 @@ Section "Install"
     ; ${__FILEDIR__} resolves to the directory of this .nsi at compile time, so
     ; the installer builds correctly regardless of makensis's working directory.
     File "${__FILEDIR__}\MAGDA.exe"
+    File "${__FILEDIR__}\mgd_doc_icon.ico"
     File /nonfatal "${__FILEDIR__}\magda_plugin_scanner.exe"
+
+    ; ONNX Runtime DLLs - delay-loaded by the media DB sample tagger.
+    ; Windows only searches the exe's directory, so these must sit next to
+    ; MAGDA.exe or the first inference call faults. Required (not /nonfatal):
+    ; a missing DLL here means a broken release, so fail the build loudly.
+    File "${__FILEDIR__}\onnxruntime.dll"
+    File "${__FILEDIR__}\onnxruntime_providers_shared.dll"
 
     ; Localization JSON files - StringTable looks for them next to MAGDA.exe
     SetOutPath "$INSTDIR\lang"
@@ -43,6 +51,19 @@ Section "Install"
     ; <exe>/controllers/scripts. File /r preserves both subdirs.
     SetOutPath "$INSTDIR\controllers"
     File /r "${__FILEDIR__}\controllers\*.*"
+    SetOutPath $INSTDIR
+
+    ; Faust standard libraries - FaustResources passes <exe>/faustlibraries to
+    ; libfaust as the -I include path, so import("stdfaust.lib") resolves. Uses
+    ; \* (not \*.*) because the tree carries extensionless files (Makefile etc).
+    SetOutPath "$INSTDIR\faustlibraries"
+    File /r "${__FILEDIR__}\faustlibraries\*"
+    SetOutPath $INSTDIR
+
+    ; Stock drumkit templates - DrumkitManager reads <exe>/drumkits to seed the
+    ; user's Drumkits folder on first launch.
+    SetOutPath "$INSTDIR\drumkits"
+    File /r "${__FILEDIR__}\drumkits\*"
     SetOutPath $INSTDIR
 
     ; Create uninstaller
@@ -71,6 +92,7 @@ Section "Install"
     WriteRegStr HKCR ".mgd" "" "MAGDA.Project"
     WriteRegStr HKCR "MAGDA.Project" "" "MAGDA Project"
     WriteRegStr HKCR "MAGDA.Project\shell\open\command" "" '"$INSTDIR\MAGDA.exe" "%1"'
+    WriteRegStr HKCR "MAGDA.Project\DefaultIcon" "" "$INSTDIR\mgd_doc_icon.ico"
 
     ; Notify shell of file association change
     System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0, i 0, i 0)'
@@ -78,10 +100,15 @@ SectionEnd
 
 Section "Uninstall"
     Delete "$INSTDIR\MAGDA.exe"
+    Delete "$INSTDIR\mgd_doc_icon.ico"
     Delete "$INSTDIR\magda_plugin_scanner.exe"
+    Delete "$INSTDIR\onnxruntime.dll"
+    Delete "$INSTDIR\onnxruntime_providers_shared.dll"
     Delete "$INSTDIR\Uninstall.exe"
     RMDir /r "$INSTDIR\lang"
     RMDir /r "$INSTDIR\controllers"
+    RMDir /r "$INSTDIR\faustlibraries"
+    RMDir /r "$INSTDIR\drumkits"
     RMDir "$INSTDIR"
 
     Delete "$SMPROGRAMS\MAGDA\*.*"

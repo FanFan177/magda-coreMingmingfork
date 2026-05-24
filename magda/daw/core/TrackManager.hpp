@@ -67,6 +67,12 @@ class TrackManagerListener {
         juce::ignoreUnused(trackId);
     }
 
+    // Called when macro/mod display names change. This affects UI labels but
+    // should not rebuild device-chain components.
+    virtual void modulationNamesChanged(TrackId trackId) {
+        juce::ignoreUnused(trackId);
+    }
+
     // Called when an audio-triggered mod fires (gate opens) — sourceTrackId is the sidechain source
     virtual void audioSidechainTriggered(TrackId sourceTrackId) {
         juce::ignoreUnused(sourceTrackId);
@@ -268,6 +274,33 @@ class TrackManager {
     void setDeviceBypassed(TrackId trackId, DeviceId deviceId, bool bypassed);
     void setChainBypassed(TrackId trackId, bool bypassed);
     DeviceInfo* getDevice(TrackId trackId, DeviceId deviceId);
+
+    // Drum-kit row metadata lives on the device instance — it's a physical
+    // property of the plugin (note N triggers a specific sound), not of any
+    // individual clip. The drum grid reads from these on every clip routed
+    // through this device.
+    //
+    // Each mutator finds the device, updates DeviceInfo::kitRows, and fires
+    // devicePropertyChanged. Empty label/role on a row removes that row.
+    void setDeviceKitRowLabel(TrackId trackId, DeviceId deviceId, int noteNumber,
+                              const juce::String& label);
+    void setDeviceKitRowRole(TrackId trackId, DeviceId deviceId, int noteNumber,
+                             const juce::String& role);
+    void clearDeviceKitRow(TrackId trackId, DeviceId deviceId, int noteNumber);
+    void setDeviceKitRows(TrackId trackId, DeviceId deviceId, const std::vector<KitRow>& rows);
+
+    // First instrument plugin on `trackId`, walking into racks. Returns nullptr
+    // if the track has none. Used by the drum grid and the drummer agent to
+    // find which device owns the kit.
+    const DeviceInfo* getPrimaryInstrument(TrackId trackId) const;
+    DeviceInfo* getPrimaryInstrument(TrackId trackId);
+
+    // Stamp the user-global default kit onto a freshly-added instrument
+    // instance when the caller hasn't provided rows. Public-but-internal —
+    // every addDevice* path on TrackManager calls this so new instances start
+    // with the right mapping. Project deserialization doesn't go through
+    // addDevice* and isn't affected.
+    static void stampDefaultKitIfMissing(DeviceInfo& dev);
 
     // Wrap a device in a new rack (device moves into the rack's first chain)
     RackId wrapDeviceInRack(TrackId trackId, DeviceId deviceId,
@@ -477,6 +510,8 @@ class TrackManager {
                           float amount);
     void setModLinkBipolar(const ChainNodePath& path, int modIndex, ControlTarget target,
                            bool bipolar);
+    void setModLinkEnabled(const ChainNodePath& path, int modIndex, ControlTarget target,
+                           bool enabled);
     void setModName(const ChainNodePath& path, int modIndex, const juce::String& name);
     void setModType(const ChainNodePath& path, int modIndex, ModType type);
     void setModWaveform(const ChainNodePath& path, int modIndex, LFOWaveform waveform);
@@ -490,6 +525,7 @@ class TrackManager {
     void setModAudioAttack(const ChainNodePath& path, int modIndex, float ms);
     void setModAudioRelease(const ChainNodePath& path, int modIndex, float ms);
     void removeModLink(const ChainNodePath& path, int modIndex, ControlTarget target);
+    void clearAllModLinks(const ChainNodePath& path, int modIndex);
     void setModEnabled(const ChainNodePath& path, int modIndex, bool enabled);
     void addModPage(const ChainNodePath& path);
     void removeModPage(const ChainNodePath& path);
@@ -631,6 +667,11 @@ class TrackManager {
      * update UI components).
      */
     void notifyTrackDevicesChanged(TrackId trackId);
+    void notifyModulationNamesChanged(TrackId trackId);
+    // Full header/track-list rebuild. Public so commands that change track
+    // structure (e.g. creating a track together with a device) can force the
+    // UI to rebuild once the final state is in place.
+    void notifyTracksChanged();
 
   private:
     TrackManager();
@@ -700,7 +741,6 @@ class TrackManager {
     std::array<uint64_t, kMaxBusTracks> lastBusNoteOn_{};
     std::array<uint64_t, kMaxBusTracks> lastBusNoteOff_{};
 
-    void notifyTracksChanged();
     void notifyTrackPropertyChanged(int trackId);
     void notifyMasterChannelChanged();
     void notifyTrackSelectionChanged(TrackId trackId);

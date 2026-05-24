@@ -78,6 +78,9 @@ juce_add_binary_data(MagdaAssets
     ../../assets/icons/general/script.svg
     ../../assets/icons/general/volume_up.svg
     ../../assets/icons/general/volume_off.svg
+    ../../assets/icons/general/speaker_on.svg
+    ../../assets/icons/general/speaker_off.svg
+    ../../assets/BoldMGlyph.svg
     ../../assets/icons/general/headphones.svg
     ../../assets/icons/general/metronome.svg
     ../../assets/icons/general/project_home.svg
@@ -173,6 +176,13 @@ juce_add_binary_data(MagdaAssets
     ../../assets/midi.svg
     ../../assets/icons/browser/AUDIO.svg
     ../../assets/icons/browser/MIDI.svg
+    # Media-explorer filter icons (issue #768) — three coloured backdrops
+    ../../assets/icons/media_db/audio_db_off.svg
+    ../../assets/icons/media_db/audio_db_on.svg
+    ../../assets/icons/media_db/midi_db_off.svg
+    ../../assets/icons/media_db/midi_db_on.svg
+    ../../assets/icons/media_db/presets_db_off.svg
+    ../../assets/icons/media_db/presets_db_on.svg
     # Mixer fader icons
     ../../assets/icons/fader/fader_thumb.svg
     ../../assets/icons/fader/fader_track.svg
@@ -191,6 +201,9 @@ juce_add_binary_data(MagdaAssets
     ../../assets/icons/panels/right_close.svg
     ../../assets/icons/panels/bottom_open.svg
     ../../assets/icons/panels/bottom_close.svg
+    ../../assets/icons/panels/enter_fs.svg
+    ../../assets/icons/panels/exit_fs.svg
+
     # Fontaudio waveform icons
     ../../assets/icons/fontaudio/fad-modsine.svg
     ../../assets/icons/fontaudio/fad-modtri.svg
@@ -283,6 +296,8 @@ juce_add_gui_app(magda_daw_app
                 <array>
                     <string>mgd</string>
                 </array>
+                <key>CFBundleTypeIconFile</key>
+                <string>mgd_doc_icon</string>
             </dict>
         </array>
     </dict></plist>"
@@ -291,6 +306,16 @@ juce_add_gui_app(magda_daw_app
 target_sources(magda_daw_app PRIVATE
     magda_daw_main.cpp
 )
+
+# Bundle the .mgd document icon into the app's Resources so Finder shows it for
+# project files (referenced by CFBundleTypeIconFile in the plist above).
+if(APPLE)
+    set_source_files_properties(
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../assets/mgd_doc_icon.icns"
+        PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
+    target_sources(magda_daw_app PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../assets/mgd_doc_icon.icns")
+endif()
 
 # Out-of-process plugin scanner.
 juce_add_console_app(magda_plugin_scanner
@@ -316,6 +341,7 @@ add_subdirectory(api)
 add_subdirectory(interfaces)
 add_subdirectory(profiling)
 add_subdirectory(ui)
+add_subdirectory(media_db)
 
 # =============================================================================
 # Linking, compile defs, includes
@@ -344,6 +370,7 @@ endif()
 target_link_libraries(magda_daw
     PUBLIC
     juce::juce_core
+    juce::juce_cryptography  # SHA-256 verification of downloaded model files
     juce::juce_data_structures
     juce::juce_audio_basics
     juce::juce_audio_devices
@@ -554,6 +581,25 @@ else()
     )
 endif()
 
+# Copy resources/drumkits/ (stock .mdgk drumkit templates) into the app so
+# DrumkitManager can seed the user's Drumkits folder on first launch.
+set(MAGDA_DRUMKITS_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../../resources/drumkits")
+if(APPLE)
+    add_custom_command(TARGET magda_daw_app POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${MAGDA_DRUMKITS_SRC}"
+            "$<TARGET_BUNDLE_CONTENT_DIR:magda_daw_app>/Resources/drumkits"
+        COMMENT "Copying stock drumkits to app bundle Resources"
+    )
+else()
+    add_custom_command(TARGET magda_daw_app POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${MAGDA_DRUMKITS_SRC}"
+            "$<TARGET_FILE_DIR:magda_daw_app>/drumkits"
+        COMMENT "Copying stock drumkits alongside app executable"
+    )
+endif()
+
 # Copy faustlibraries (stdfaust.lib + dependencies) into the app so libfaust's
 # `import("stdfaust.lib")` resolves at runtime. FaustPlugin passes this dir as
 # `-I` argv to the interpreter compiler. Submodule path: third_party/faust/libraries.
@@ -571,5 +617,39 @@ else()
             "${MAGDA_FAUST_LIBS_SRC}"
             "$<TARGET_FILE_DIR:magda_daw_app>/faustlibraries"
         COMMENT "Copying Faust standard libraries alongside app executable"
+    )
+endif()
+
+# Bundle the ONNX Runtime shared library with the app. The linker only bakes
+# the FetchContent `_deps/onnxruntime-src/lib/` build-dir path into the binary's
+# rpath, which does not exist on an end-user machine, so the distributed app
+# must carry the runtime library itself or it aborts at launch ("Library not
+# loaded: @rpath/libonnxruntime.1.dylib").
+if(APPLE)
+    # Place the dylib in the bundle's Frameworks/ — the release codesign step
+    # already signs everything there — and add an rpath so the loader finds it.
+    # The executable references @rpath/libonnxruntime.1.dylib (the lib's own
+    # install name), so the bundled file must use that exact name.
+    add_custom_command(TARGET magda_daw_app POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+            "$<TARGET_BUNDLE_CONTENT_DIR:magda_daw_app>/Frameworks"
+        COMMAND ${CMAKE_COMMAND} -E copy
+            "${ONNXRUNTIME_LIB_DIR}/libonnxruntime.dylib"
+            "$<TARGET_BUNDLE_CONTENT_DIR:magda_daw_app>/Frameworks/libonnxruntime.1.dylib"
+        COMMENT "Bundling ONNX Runtime dylib into app Frameworks"
+    )
+    set_property(TARGET magda_daw_app APPEND PROPERTY
+        BUILD_RPATH "@executable_path/../Frameworks")
+elseif(WIN32)
+    # Windows only searches the exe's directory, the cwd, and PATH — none of
+    # which include the FetchContent lib dir — so without this copy the first
+    # ORT call (Sample Tagger load) faults when the delay-loaded DLL fails to
+    # resolve.
+    add_custom_command(TARGET magda_daw_app POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${ONNXRUNTIME_LIB_DIR}/onnxruntime.dll"
+            "${ONNXRUNTIME_LIB_DIR}/onnxruntime_providers_shared.dll"
+            "$<TARGET_FILE_DIR:magda_daw_app>"
+        COMMENT "Copying ONNX Runtime DLLs alongside app executable"
     )
 endif()

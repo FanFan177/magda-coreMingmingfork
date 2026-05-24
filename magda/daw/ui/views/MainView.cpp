@@ -269,11 +269,10 @@ void MainView::setupComponents() {
     horizontalZoomScrollBar->onRangeChanged = [this](double start, double end) {
         // Convert range to zoom and scroll
         double rangeWidth = end - start;
-        if (rangeWidth > 0 && timelineLength > 0) {
+        const auto& st = timelineController->getState();
+        double totalBeats = st.timelineLengthBeats;
+        if (rangeWidth > 0 && totalBeats > 0) {
             // Calculate zoom: smaller range = higher zoom
-            // horizontalZoom is ppb: convert timelineLength to beats
-            const auto& st = timelineController->getState();
-            double totalBeats = st.secondsToBeats(timelineLength);
             int viewportWidth = trackContentViewport->getWidth();
             double newZoom = static_cast<double>(viewportWidth) / (rangeWidth * totalBeats);
 
@@ -360,7 +359,7 @@ void MainView::setupComponents() {
     zoomLoopButton->onClick = [this]() {
         const auto& loop = timelineController->getState().loop;
         if (loop.isValid()) {
-            timelineController->dispatch(ZoomToFitEvent{loop.startTime, loop.endTime, 0.05});
+            timelineController->dispatch(ZoomToFitBeatsEvent{loop.startBeats, loop.endBeats, 0.05});
         }
     };
     zoomLoopButton->setTooltip("Zoom to loop region");
@@ -912,10 +911,8 @@ void MainView::setVerticalZoom(double zoomFactor) {
 }
 
 void MainView::scrollToPosition(double timePosition) {
-    // horizontalZoom is ppb, convert time to beats
     const auto& state = timelineController->getState();
-    double beats = state.secondsToBeats(timePosition);
-    auto pixelPosition = static_cast<int>(beats * horizontalZoom);
+    auto pixelPosition = state.timeDurationToPixels(timePosition);
     timelineViewport->setViewPosition(pixelPosition, 0);
     trackContentViewport->setViewPosition(pixelPosition, trackContentViewport->getViewPositionY());
 }
@@ -1205,23 +1202,24 @@ void MainView::setupTrackSynchronization() {
 }
 
 void MainView::updateHorizontalZoomScrollBar() {
-    if (timelineLength <= 0 || horizontalZoom <= 0)
+    if (horizontalZoom <= 0)
         return;
 
     const auto& st = timelineController->getState();
+    double totalBeats = st.timelineLengthBeats;
+    if (totalBeats <= 0)
+        return;
+
     int viewportWidth = trackContentViewport->getWidth();
     int scrollX = trackContentViewport->getViewPositionX();
 
     // Calculate visible range as fraction of total timeline
-    // horizontalZoom is ppb, convert through beats
     double visibleBeats =
         (horizontalZoom > 0) ? static_cast<double>(viewportWidth) / horizontalZoom : 0;
     double scrollBeats = (horizontalZoom > 0) ? static_cast<double>(scrollX) / horizontalZoom : 0;
-    double visibleDuration = st.beatsToSeconds(visibleBeats);
-    double scrollTime = st.beatsToSeconds(scrollBeats);
 
-    double visibleStart = scrollTime / timelineLength;
-    double visibleEnd = (scrollTime + visibleDuration) / timelineLength;
+    double visibleStart = scrollBeats / totalBeats;
+    double visibleEnd = (scrollBeats + visibleBeats) / totalBeats;
 
     // Clamp to valid range
     visibleStart = juce::jlimit(0.0, 1.0, visibleStart);
@@ -1318,18 +1316,17 @@ void MainView::PlayheadComponent::paint(juce::Graphics& g) {
     // Get positions from state
     double editPos = state.playhead.editPosition;
     double playbackPos = state.playhead.playbackPosition;
+    double editBeats = state.playhead.editPositionBeats;
+    double playBeats = state.playhead.playbackPositionBeats;
     bool isPlaying = state.playhead.isPlaying;
 
     // Calculate edit cursor position in pixels (triangle position)
-    // horizontalZoom is ppb, convert time to beats
     // Use std::round to match TimeRuler so cursors align with the ruler ticks.
-    double editBeats = state.secondsToBeats(editPos);
     int editX = static_cast<int>(std::round(editBeats * owner.horizontalZoom)) +
                 LayoutConfig::TIMELINE_LEFT_PADDING;
     editX -= scrollOffset;
 
     // Calculate play cursor position in pixels (vertical line position)
-    double playBeats = state.secondsToBeats(playbackPos);
     int playX = static_cast<int>(std::round(playBeats * owner.horizontalZoom)) +
                 LayoutConfig::TIMELINE_LEFT_PADDING;
     playX -= scrollOffset;
@@ -1367,10 +1364,9 @@ void MainView::PlayheadComponent::mouseDown(const juce::MouseEvent& e) {
     // Get edit position from controller state
     const auto& state = owner.timelineController->getState();
     double editPos = state.playhead.editPosition;
+    double editBeats = state.playhead.editPositionBeats;
 
     // Calculate edit cursor (triangle) position in pixels
-    // horizontalZoom is ppb, convert time to beats
-    double editBeats = state.secondsToBeats(editPos);
     int editX = static_cast<int>(std::round(editBeats * owner.horizontalZoom)) +
                 LayoutConfig::TIMELINE_LEFT_PADDING;
 
@@ -1419,11 +1415,9 @@ void MainView::PlayheadComponent::mouseUp([[maybe_unused]] const juce::MouseEven
 void MainView::PlayheadComponent::mouseMove(const juce::MouseEvent& event) {
     // Get edit position from controller state
     const auto& state = owner.timelineController->getState();
-    double editPos = state.playhead.editPosition;
+    double editBeats = state.playhead.editPositionBeats;
 
     // Calculate edit cursor (triangle) position in pixels
-    // horizontalZoom is ppb, convert time to beats
-    double editBeats = state.secondsToBeats(editPos);
     int editX = static_cast<int>(std::round(editBeats * owner.horizontalZoom)) +
                 LayoutConfig::TIMELINE_LEFT_PADDING;
 
@@ -1617,7 +1611,7 @@ void MainView::resetZoomToFitTimeline() {
 void MainView::zoomToSelection() {
     const auto& sel = timelineController->getState().selection;
     if (sel.isActive()) {
-        timelineController->dispatch(ZoomToFitEvent{sel.startTime, sel.endTime, 0.05});
+        timelineController->dispatch(ZoomToFitBeatsEvent{sel.startBeats, sel.endBeats, 0.05});
     }
 }
 
@@ -1689,6 +1683,30 @@ void MainView::setupSelectionCallbacks() {
         }
     };
 
+    trackContentPanel->onMixedTimeSelectionChanged = [this](double start, double end,
+                                                            std::set<int> trackIndices,
+                                                            std::set<AutomationLaneId> laneIds) {
+        if (start < 0 || end < 0) {
+            timelineController->dispatch(ClearTimeSelectionEvent{});
+        } else {
+            timelineController->dispatch(
+                SetTimeSelectionEvent{start, end, trackIndices, false, std::move(laneIds)});
+            timelineController->dispatch(SetPlayheadPositionEvent{start});
+        }
+    };
+
+    trackContentPanel->onAutomationTimeSelectionChanged =
+        [this](double start, double end, std::set<int> trackIndices,
+               std::set<AutomationLaneId> laneIds) {
+            if (start < 0 || end < 0) {
+                timelineController->dispatch(ClearTimeSelectionEvent{});
+            } else {
+                timelineController->dispatch(
+                    SetTimeSelectionEvent{start, end, trackIndices, true, std::move(laneIds)});
+                timelineController->dispatch(SetPlayheadPositionEvent{start});
+            }
+        };
+
     // Set up playhead position callback from track content panel (click to set playhead)
     trackContentPanel->onPlayheadPositionChanged = [this](double position) {
         timelineController->dispatch(SetPlayheadPositionEvent{position});
@@ -1729,10 +1747,9 @@ void MainView::SelectionOverlayComponent::drawTimeSelection(juce::Graphics& g) {
         return;
     }
 
-    // Calculate pixel positions
-    // horizontalZoom is ppb, convert times to beats
-    double startBeats = state.secondsToBeats(state.selection.startTime);
-    double endBeats = state.secondsToBeats(state.selection.endTime);
+    // Calculate pixel positions from authoritative beat state.
+    double startBeats = state.selection.startBeats;
+    double endBeats = state.selection.endBeats;
     // Add LEFT_PADDING to align with timeline markers; round to match TimeRuler.
     int startX = static_cast<int>(std::round(startBeats * state.zoom.horizontalZoom)) +
                  LayoutConfig::TIMELINE_LEFT_PADDING;
@@ -1756,44 +1773,89 @@ void MainView::SelectionOverlayComponent::drawTimeSelection(juce::Graphics& g) {
     const int selectionWidth = endX - startX;
     const auto edgeColour = DarkTheme::getColour(DarkTheme::ACCENT_BLUE).withAlpha(0.8f);
 
-    // Keep the inversion visible across empty track space, clips, and grid lines.
-    if (state.selection.isAllTracks()) {
-        paintTimeSelectionBand(g, {startX, 0, selectionWidth, getHeight()});
+    if (state.selection.automationOnly && !state.selection.automationLaneIds.empty()) {
+        const int scrollY = owner.trackContentViewport->getViewPositionY();
+        for (auto laneId : state.selection.automationLaneIds) {
+            juce::Rectangle<int> laneBounds;
+            if (!owner.trackContentPanel->getAutomationLaneBounds(laneId, laneBounds))
+                continue;
 
-        g.setColour(edgeColour);
-        g.drawLine(static_cast<float>(startX), 0.0f, static_cast<float>(startX),
-                   static_cast<float>(getHeight()), 2.0f);
-        g.drawLine(static_cast<float>(endX), 0.0f, static_cast<float>(endX),
-                   static_cast<float>(getHeight()), 2.0f);
-    } else {
-        int scrollY = owner.trackContentViewport->getViewPositionY();
-        int numTracks = owner.trackContentPanel->getNumTracks();
+            const int drawY = laneBounds.getY() - scrollY;
+            const int drawBottom = drawY + laneBounds.getHeight();
+            if (drawBottom < 0 || drawY > getHeight())
+                continue;
 
-        for (int trackIndex = 0; trackIndex < numTracks; ++trackIndex) {
-            if (state.selection.includesTrack(trackIndex)) {
-                int trackY = owner.trackContentPanel->getTrackYPosition(trackIndex) - scrollY;
-                int trackHeight = owner.trackContentPanel->getTrackHeight(trackIndex);
-                trackHeight = static_cast<int>(trackHeight * owner.verticalZoom);
+            const int clippedY = juce::jmax(0, drawY);
+            const int clippedBottom = juce::jmin(getHeight(), drawBottom);
+            const int drawHeight = clippedBottom - clippedY;
+            if (drawHeight <= 0)
+                continue;
 
-                if (trackY + trackHeight < 0 || trackY > getHeight()) {
-                    continue;
-                }
+            paintTimeSelectionBand(g, {startX, clippedY, selectionWidth, drawHeight});
 
-                int drawY = juce::jmax(0, trackY);
-                int drawBottom = juce::jmin(getHeight(), trackY + trackHeight);
-                int drawHeight = drawBottom - drawY;
+            g.setColour(edgeColour);
+            g.drawLine(static_cast<float>(startX), static_cast<float>(clippedY),
+                       static_cast<float>(startX), static_cast<float>(clippedBottom), 2.0f);
+            g.drawLine(static_cast<float>(endX), static_cast<float>(clippedY),
+                       static_cast<float>(endX), static_cast<float>(clippedBottom), 2.0f);
+        }
+        return;
+    }
 
-                if (drawHeight > 0) {
-                    paintTimeSelectionBand(g, {startX, drawY, selectionWidth, drawHeight});
+    int scrollY = owner.trackContentViewport->getViewPositionY();
+    int numTracks = owner.trackContentPanel->getNumTracks();
 
-                    g.setColour(edgeColour);
-                    g.drawLine(static_cast<float>(startX), static_cast<float>(drawY),
-                               static_cast<float>(startX), static_cast<float>(drawBottom), 2.0f);
-                    g.drawLine(static_cast<float>(endX), static_cast<float>(drawY),
-                               static_cast<float>(endX), static_cast<float>(drawBottom), 2.0f);
-                }
+    // Clip time selections only paint clip rows. Automation-only selections
+    // have their own lane-scoped branch above.
+    for (int trackIndex = 0; trackIndex < numTracks; ++trackIndex) {
+        if (state.selection.includesTrack(trackIndex)) {
+            int trackY = owner.trackContentPanel->getTrackYPosition(trackIndex) - scrollY;
+            int trackHeight = owner.trackContentPanel->getTrackHeight(trackIndex);
+            trackHeight = static_cast<int>(trackHeight * owner.verticalZoom);
+
+            if (trackY + trackHeight < 0 || trackY > getHeight()) {
+                continue;
+            }
+
+            int drawY = juce::jmax(0, trackY);
+            int drawBottom = juce::jmin(getHeight(), trackY + trackHeight);
+            int drawHeight = drawBottom - drawY;
+
+            if (drawHeight > 0) {
+                paintTimeSelectionBand(g, {startX, drawY, selectionWidth, drawHeight});
+
+                g.setColour(edgeColour);
+                g.drawLine(static_cast<float>(startX), static_cast<float>(drawY),
+                           static_cast<float>(startX), static_cast<float>(drawBottom), 2.0f);
+                g.drawLine(static_cast<float>(endX), static_cast<float>(drawY),
+                           static_cast<float>(endX), static_cast<float>(drawBottom), 2.0f);
             }
         }
+    }
+
+    for (auto laneId : state.selection.automationLaneIds) {
+        juce::Rectangle<int> laneBounds;
+        if (!owner.trackContentPanel->getAutomationLaneBounds(laneId, laneBounds))
+            continue;
+
+        const int drawY = laneBounds.getY() - scrollY;
+        const int drawBottom = drawY + laneBounds.getHeight();
+        if (drawBottom < 0 || drawY > getHeight())
+            continue;
+
+        const int clippedY = juce::jmax(0, drawY);
+        const int clippedBottom = juce::jmin(getHeight(), drawBottom);
+        const int drawHeight = clippedBottom - clippedY;
+        if (drawHeight <= 0)
+            continue;
+
+        paintTimeSelectionBand(g, {startX, clippedY, selectionWidth, drawHeight});
+
+        g.setColour(edgeColour);
+        g.drawLine(static_cast<float>(startX), static_cast<float>(clippedY),
+                   static_cast<float>(startX), static_cast<float>(clippedBottom), 2.0f);
+        g.drawLine(static_cast<float>(endX), static_cast<float>(clippedY), static_cast<float>(endX),
+                   static_cast<float>(clippedBottom), 2.0f);
     }
 }
 
@@ -1871,10 +1933,9 @@ void MainView::SelectionOverlayComponent::drawLoopRegion(juce::Graphics& g) {
         return;
     }
 
-    // Calculate pixel positions
-    // horizontalZoom is ppb, convert times to beats
-    double loopStartBeats = state.secondsToBeats(state.loop.startTime);
-    double loopEndBeats = state.secondsToBeats(state.loop.endTime);
+    // Calculate pixel positions from authoritative beat state.
+    double loopStartBeats = state.loop.startBeats;
+    double loopEndBeats = state.loop.endBeats;
     // std::round so the loop edges sit on the same column as the ruler flags
     // and the bar/beat ticks; truncation here was the source of the visible
     // 1-pixel misalignment between the ruler loop strip and the overlay line.
@@ -1932,20 +1993,17 @@ void MainView::SelectionOverlayComponent::drawRecordingRegion(juce::Graphics& g)
         return;
     }
 
-    // Recording region: from editPosition (start) to playbackPosition (current)
-    double recordStartTime = state.playhead.editPosition;
-    double recordEndTime = state.playhead.playbackPosition;
+    // Recording region: from edit playhead beat to current playback beat.
+    double recordStartBeats = state.playhead.editPositionBeats;
+    double recordEndBeats = state.playhead.playbackPositionBeats;
 
-    if (recordEndTime <= recordStartTime) {
+    if (recordEndBeats <= recordStartBeats) {
         return;
     }
 
-    // Convert to pixels
-    double startBeats = state.secondsToBeats(recordStartTime);
-    double endBeats = state.secondsToBeats(recordEndTime);
-    int startX = static_cast<int>(std::round(startBeats * state.zoom.horizontalZoom)) +
+    int startX = static_cast<int>(std::round(recordStartBeats * state.zoom.horizontalZoom)) +
                  LayoutConfig::TIMELINE_LEFT_PADDING;
-    int endX = static_cast<int>(std::round(endBeats * state.zoom.horizontalZoom)) +
+    int endX = static_cast<int>(std::round(recordEndBeats * state.zoom.horizontalZoom)) +
                LayoutConfig::TIMELINE_LEFT_PADDING;
 
     // Adjust for scroll offset
@@ -2158,20 +2216,20 @@ MainView::MasterHeaderPanel::~MasterHeaderPanel() {
 
 void MainView::MasterHeaderPanel::setupControls() {
     // Speaker on/off button (toggles master mute)
-    auto speakerOnIcon = juce::Drawable::createFromImageData(BinaryData::volume_up_svg,
-                                                             BinaryData::volume_up_svgSize);
-    auto speakerOffIcon = juce::Drawable::createFromImageData(BinaryData::volume_off_svg,
-                                                              BinaryData::volume_off_svgSize);
+    auto speakerOnIcon = juce::Drawable::createFromImageData(BinaryData::speaker_on_svg,
+                                                             BinaryData::speaker_on_svgSize);
+    auto speakerOffIcon = juce::Drawable::createFromImageData(BinaryData::speaker_off_svg,
+                                                              BinaryData::speaker_off_svgSize);
 
     speakerButton =
         std::make_unique<juce::DrawableButton>("Speaker", juce::DrawableButton::ImageFitted);
     speakerButton->setImages(speakerOnIcon.get(), nullptr, nullptr, nullptr, speakerOffIcon.get());
     speakerButton->setClickingTogglesState(true);
     speakerButton->setColour(juce::DrawableButton::backgroundColourId,
-                             DarkTheme::getColour(DarkTheme::SURFACE));
+                             juce::Colours::transparentBlack);
     speakerButton->setColour(juce::DrawableButton::backgroundOnColourId,
-                             DarkTheme::getColour(DarkTheme::STATUS_ERROR).withAlpha(0.3f));
-    speakerButton->setEdgeIndent(2);
+                             juce::Colours::transparentBlack);
+    speakerButton->setEdgeIndent(0);
     speakerButton->onClick = [this]() {
         UndoManager::getInstance().executeCommand(
             std::make_unique<SetMasterMuteCommand>(speakerButton->getToggleState()));
@@ -2231,12 +2289,11 @@ void MainView::MasterHeaderPanel::resized() {
     int usableWidth = contentArea.getWidth() * 80 / 100;
     contentArea.setWidth(usableWidth);
 
-    // Both rows use same right-side width so volume and meter align
-    int rightColWidth = 22;  // speaker(18) + gap(4), or valueLabel(20) + gap(2)
-
     // Top row: volume + speaker
     auto topRow = contentArea.removeFromTop(18);
-    speakerButton->setBounds(topRow.removeFromRight(18).withSizeKeepingCentre(16, 16));
+    // Square to the row height; the icon carries its own border, so don't shrink it.
+    speakerButton->setBounds(
+        topRow.removeFromRight(topRow.getHeight()).withSizeKeepingCentre(16, 16));
     topRow.removeFromRight(4);
     volumeLabel->setBounds(topRow);
 
@@ -2244,7 +2301,8 @@ void MainView::MasterHeaderPanel::resized() {
 
     // Bottom row: peak meter + value
     auto peakRow = contentArea.removeFromTop(18);
-    peakValueLabel->setBounds(peakRow.removeFromRight(rightColWidth));
+    peakValueLabel->setBounds(peakRow.removeFromRight(40));
+    peakRow.removeFromRight(4);
     peakMeter->setBounds(peakRow);
 }
 

@@ -57,6 +57,8 @@ juce::var ProjectSerializer::serializeClipInfo(const ClipInfo& clip) {
     obj->setProperty("gridNumerator", clip.gridNumerator);
     obj->setProperty("gridDenominator", clip.gridDenominator);
     obj->setProperty("gridSnapEnabled", clip.gridSnapEnabled);
+    if (clip.midiEditorRowHeight > 0)
+        obj->setProperty("midiEditorRowHeight", clip.midiEditorRowHeight);
 
     // Per-clip mix
     obj->setProperty("volumeDB", clip.volumeDB);
@@ -103,6 +105,11 @@ juce::var ProjectSerializer::serializeClipInfo(const ClipInfo& clip) {
             obj->setProperty("loopStartBeats", clip.loopStartBeats);
         if (clip.loopLengthBeats > 0.0)
             obj->setProperty("loopLengthBeats", clip.loopLengthBeats);
+        if (clip.midi().sourceFilePath.isNotEmpty()) {
+            auto* midiObj = new juce::DynamicObject();
+            midiObj->setProperty("sourceFilePath", clip.midi().sourceFilePath);
+            obj->setProperty("midi", juce::var(midiObj));
+        }
     }
 
     // Groove/Shuffle/Swing
@@ -267,6 +274,15 @@ bool ProjectSerializer::deserializeClipInfo(const juce::var& json, ClipInfo& out
     outClip.gridNumerator = obj->getProperty("gridNumerator");
     outClip.gridDenominator = obj->getProperty("gridDenominator");
     outClip.gridSnapEnabled = static_cast<bool>(obj->getProperty("gridSnapEnabled"));
+    if (obj->hasProperty("midiEditorRowHeight")) {
+        outClip.midiEditorRowHeight =
+            juce::jlimit(ClipInfo::MIN_MIDI_EDITOR_ROW_HEIGHT, ClipInfo::MAX_MIDI_EDITOR_ROW_HEIGHT,
+                         static_cast<int>(obj->getProperty("midiEditorRowHeight")));
+    } else if (obj->hasProperty("pianoRollNoteHeight")) {
+        outClip.midiEditorRowHeight =
+            juce::jlimit(ClipInfo::MIN_MIDI_EDITOR_ROW_HEIGHT, ClipInfo::MAX_MIDI_EDITOR_ROW_HEIGHT,
+                         static_cast<int>(obj->getProperty("pianoRollNoteHeight")));
+    }
 
     // Per-clip mix
     outClip.volumeDB = static_cast<float>(static_cast<double>(obj->getProperty("volumeDB")));
@@ -315,6 +331,10 @@ bool ProjectSerializer::deserializeClipInfo(const juce::var& json, ClipInfo& out
 
         if (outClip.loopLength <= 0.0 && outClip.loopLengthBeats > 0.0 && projectTempo > 0.0)
             outClip.loopLength = outClip.loopLengthBeats * 60.0 / projectTempo;
+
+        if (auto* midiObj = obj->getProperty("midi").getDynamicObject()) {
+            outClip.midi().sourceFilePath = midiObj->getProperty("sourceFilePath").toString();
+        }
     }
 
     // Groove/Shuffle/Swing

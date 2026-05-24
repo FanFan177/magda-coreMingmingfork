@@ -237,6 +237,9 @@ class MockTrackApi : public TrackApi {
     DeviceId addDeviceToTrack(TrackId, const DeviceInfo&) override {
         return INVALID_DEVICE_ID;
     }
+    const DeviceInfo* getPrimaryInstrument(TrackId) const override {
+        return nullptr;
+    }
     AudioEngine* getAudioEngine() const override {
         return nullptr;
     }

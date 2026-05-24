@@ -137,6 +137,10 @@ juce::File pluginConfigsDir() {
     return dataDir().getChildFile("PluginConfigs");
 }
 
+juce::File drumkitsDir() {
+    return presetsDir().getChildFile("Drumkits");
+}
+
 juce::File configFile() {
     return alwaysOSDefault().getChildFile("config.json");
 }
@@ -167,6 +171,10 @@ juce::File pluginFavoritesFile() {
 
 juce::File pluginAliasesFile() {
     return dataDir().getChildFile("plugin_aliases.xml");
+}
+
+juce::File pluginPreferencesFile() {
+    return dataDir().getChildFile("plugin_preferences.json");
 }
 
 juce::File parameterDetectorLog() {

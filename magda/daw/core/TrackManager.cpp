@@ -11,6 +11,7 @@
 #include "ClipManager.hpp"
 #include "Config.hpp"
 #include "ModulatorEngine.hpp"
+#include "PluginPreferences.hpp"
 #include "RackInfo.hpp"
 #include "SelectionManager.hpp"
 
@@ -121,6 +122,32 @@ juce::String stripDuplicateRuntimePluginState(const juce::String& pluginState) {
         return strippedXml->toString();
 
     return pluginState;
+}
+
+void scanEmbeddedDeviceIds(const juce::ValueTree& tree, int& maxDeviceId) {
+    static const juce::Identifier embeddedDeviceIdProp("magdaDeviceId");
+
+    if (tree.hasProperty(embeddedDeviceIdProp)) {
+        const int embeddedDeviceId = static_cast<int>(tree.getProperty(embeddedDeviceIdProp));
+        if (embeddedDeviceId != INVALID_DEVICE_ID)
+            maxDeviceId = std::max(maxDeviceId, embeddedDeviceId);
+    }
+
+    for (int i = 0; i < tree.getNumChildren(); ++i)
+        scanEmbeddedDeviceIds(tree.getChild(i), maxDeviceId);
+}
+
+void scanEmbeddedDeviceIds(const juce::String& pluginState, int& maxDeviceId) {
+    if (pluginState.isEmpty())
+        return;
+
+    auto xml = juce::parseXML(pluginState);
+    if (!xml)
+        return;
+
+    auto state = juce::ValueTree::fromXml(*xml);
+    if (state.isValid())
+        scanEmbeddedDeviceIds(state, maxDeviceId);
 }
 
 void remapDuplicatedElements(std::vector<ChainElement>& elements, const ChainNodePath& parentPath,
@@ -273,6 +300,13 @@ TrackId TrackManager::createGroupTrack(const juce::String& name) {
 }
 
 void TrackManager::deleteTrack(TrackId trackId) {
+    // The master track is permanent and must never be deleted. getTrack()
+    // returns a valid pointer for MASTER_TRACK_ID, so the null check below
+    // would not catch it; guard explicitly here, the single choke point all
+    // delete entry points funnel through.
+    if (trackId == MASTER_TRACK_ID)
+        return;
+
     auto* track = getTrack(trackId);
     if (!track)
         return;
@@ -795,6 +829,12 @@ void TrackManager::setTrackColour(TrackId trackId, juce::Colour colour) {
 }
 
 void TrackManager::setTrackVolume(TrackId trackId, float volume, bool fromAutomation) {
+    // The master is authoritative in masterChannel_; route track-level writes to
+    // the master setter so every observer (inspector, mixer, headers) stays in sync.
+    if (trackId == MASTER_TRACK_ID) {
+        setMasterVolume(juce::jlimit(0.0f, 2.0f, volume));
+        return;
+    }
     if (auto* track = getTrack(trackId)) {
         // Allow up to +6dB gain (10^(6/20) ≈ 2.0)
         track->volume = juce::jlimit(0.0f, 2.0f, volume);
@@ -805,6 +845,10 @@ void TrackManager::setTrackVolume(TrackId trackId, float volume, bool fromAutoma
 }
 
 void TrackManager::setTrackPan(TrackId trackId, float pan, bool fromAutomation) {
+    if (trackId == MASTER_TRACK_ID) {
+        setMasterPan(juce::jlimit(-1.0f, 1.0f, pan));
+        return;
+    }
     if (auto* track = getTrack(trackId)) {
         track->pan = juce::jlimit(-1.0f, 1.0f, pan);
         if (!fromAutomation)
@@ -814,6 +858,10 @@ void TrackManager::setTrackPan(TrackId trackId, float pan, bool fromAutomation) 
 }
 
 void TrackManager::setTrackMuted(TrackId trackId, bool muted) {
+    if (trackId == MASTER_TRACK_ID) {
+        setMasterMuted(muted);
+        return;
+    }
     if (auto* track = getTrack(trackId)) {
         track->muted = muted;
         notifyTrackPropertyChanged(trackId);
@@ -821,6 +869,10 @@ void TrackManager::setTrackMuted(TrackId trackId, bool muted) {
 }
 
 void TrackManager::setTrackSoloed(TrackId trackId, bool soloed) {
+    if (trackId == MASTER_TRACK_ID) {
+        setMasterSoloed(soloed);
+        return;
+    }
     if (auto* track = getTrack(trackId)) {
         track->soloed = soloed;
         notifyTrackPropertyChanged(trackId);
@@ -1171,6 +1223,15 @@ void TrackManager::moveNode(TrackId trackId, int fromIndex, int toIndex) {
 // Device Management on Track
 // ============================================================================
 
+void TrackManager::stampDefaultKitIfMissing(DeviceInfo& dev) {
+    if (!dev.isInstrument || !dev.kitRows.empty())
+        return;
+    const auto identifier = dev.uniqueId.isNotEmpty() ? dev.uniqueId : dev.pluginId;
+    if (identifier.isEmpty())
+        return;
+    dev.kitRows = PluginPreferences::getInstance().defaultKitRows(identifier);
+}
+
 DeviceId TrackManager::addDeviceToTrack(TrackId trackId, const DeviceInfo& device) {
     if (auto* track = getTrack(trackId)) {
         if ((track->type == TrackType::Aux || track->type == TrackType::Group ||
@@ -1181,6 +1242,7 @@ DeviceId TrackManager::addDeviceToTrack(TrackId trackId, const DeviceInfo& devic
         }
         DeviceInfo newDevice = device;
         newDevice.id = nextDeviceId_++;
+        stampDefaultKitIfMissing(newDevice);
         track->chainElements.push_back(makeDeviceElement(newDevice));
         notifyTrackDevicesChanged(trackId);
         DBG("Added device: " << newDevice.name << " (id=" << newDevice.id << ") to track "
@@ -1201,6 +1263,7 @@ DeviceId TrackManager::addDeviceToTrack(TrackId trackId, const DeviceInfo& devic
         }
         DeviceInfo newDevice = device;
         newDevice.id = nextDeviceId_++;
+        stampDefaultKitIfMissing(newDevice);
 
         // Clamp insert index to valid range
         int maxIndex = static_cast<int>(track->chainElements.size());
@@ -1764,24 +1827,36 @@ void TrackManager::clearSelectedChain() {
 // Master Channel
 // ============================================================================
 
+// masterChannel_ is the source of truth for the master. masterTrack_ (the
+// TrackInfo that lets the master appear as a track header) is kept as a mirror
+// so track-API readers see the same values, and both observer paths are
+// notified so every master UI updates regardless of which it listens to.
 void TrackManager::setMasterVolume(float volume) {
     masterChannel_.volume = volume;
+    masterTrack_.volume = volume;
     notifyMasterChannelChanged();
+    notifyTrackPropertyChanged(MASTER_TRACK_ID);
 }
 
 void TrackManager::setMasterPan(float pan) {
     masterChannel_.pan = pan;
+    masterTrack_.pan = pan;
     notifyMasterChannelChanged();
+    notifyTrackPropertyChanged(MASTER_TRACK_ID);
 }
 
 void TrackManager::setMasterMuted(bool muted) {
     masterChannel_.muted = muted;
+    masterTrack_.muted = muted;
     notifyMasterChannelChanged();
+    notifyTrackPropertyChanged(MASTER_TRACK_ID);
 }
 
 void TrackManager::setMasterSoloed(bool soloed) {
     masterChannel_.soloed = soloed;
+    masterTrack_.soloed = soloed;
     notifyMasterChannelChanged();
+    notifyTrackPropertyChanged(MASTER_TRACK_ID);
 }
 
 void TrackManager::setMasterVisible(ViewMode mode, bool visible) {
@@ -1861,6 +1936,7 @@ void TrackManager::refreshIdCountersFromTracks() {
         if (std::holds_alternative<DeviceInfo>(element)) {
             const auto& device = std::get<DeviceInfo>(element);
             maxDeviceId = std::max(maxDeviceId, device.id);
+            scanEmbeddedDeviceIds(device.pluginState, maxDeviceId);
         } else if (std::holds_alternative<std::unique_ptr<RackInfo>>(element)) {
             const auto& rackPtr = std::get<std::unique_ptr<RackInfo>>(element);
             if (rackPtr) {
@@ -1952,6 +2028,14 @@ void TrackManager::notifyDeviceModifiersChanged(TrackId trackId) {
     for (size_t i = 0; i < listeners_.size(); ++i) {
         if (listeners_[i])
             listeners_[i]->deviceModifiersChanged(trackId);
+    }
+}
+
+void TrackManager::notifyModulationNamesChanged(TrackId trackId) {
+    ScopedNotifyGuard guard(*this);
+    for (size_t i = 0; i < listeners_.size(); ++i) {
+        if (listeners_[i])
+            listeners_[i]->modulationNamesChanged(trackId);
     }
 }
 

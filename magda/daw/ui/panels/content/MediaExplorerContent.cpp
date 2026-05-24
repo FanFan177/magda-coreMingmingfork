@@ -1,5 +1,8 @@
 #include "MediaExplorerContent.hpp"
 
+#include <filesystem>
+#include <system_error>
+
 #include "../../../core/Config.hpp"
 #include "../../../project/ProjectManager.hpp"
 #include "../../components/common/SvgButton.hpp"
@@ -8,6 +11,9 @@
 #include "../../themes/FontManager.hpp"
 #include "AudioThumbnailManager.hpp"
 #include "BinaryData.h"
+#include "MediaDbBrowserContent.hpp"
+#include "MediaExplorerPreviewState.hpp"
+#include "media_db/MediaDbMetadata.hpp"
 
 namespace magda::daw::ui {
 
@@ -88,34 +94,49 @@ class MediaExplorerContent::ThumbnailComponent : public juce::Component,
                                                  public juce::ChangeListener,
                                                  public juce::Timer {
   public:
-    ThumbnailComponent() = default;
+    ThumbnailComponent() {
+        stopIndexingButton_.setButtonText("Stop");
+        stopIndexingButton_.setTooltip("Stop scanning after the current file");
+        stopIndexingButton_.setColour(juce::TextButton::buttonColourId,
+                                      DarkTheme::getColour(DarkTheme::SURFACE));
+        stopIndexingButton_.setColour(juce::TextButton::textColourOffId,
+                                      DarkTheme::getColour(DarkTheme::TEXT_PRIMARY));
+        stopIndexingButton_.setColour(juce::TextButton::buttonOnColourId,
+                                      DarkTheme::getColour(DarkTheme::SURFACE_HOVER));
+        stopIndexingButton_.setVisible(false);
+        stopIndexingButton_.onClick = [this]() {
+            stopIndexingButton_.setEnabled(false);
+            if (onStopIndexing) {
+                onStopIndexing();
+            }
+        };
+        addChildComponent(stopIndexingButton_);
+    }
 
     ~ThumbnailComponent() override {
         stopTimer();
-        if (currentThumbnail_ != nullptr) {
-            currentThumbnail_->removeChangeListener(this);
-        }
+        detachThumbnailListener();
     }
 
     void setFile(const juce::File& file) {
-        // Remove listener from old thumbnail
-        if (currentThumbnail_ != nullptr) {
-            currentThumbnail_->removeChangeListener(this);
-            currentThumbnail_ = nullptr;
-        }
+        detachThumbnailListener();
 
         currentFile_ = file;
         playbackPosition_ = 0.0;
+        if (file.existsAsFile()) {
+            indexingStatus_.clear();
+        }
 
         // Get and listen to new thumbnail
         if (file.existsAsFile()) {
-            currentThumbnail_ =
-                magda::AudioThumbnailManager::getInstance().getThumbnail(file.getFullPathName());
-            if (currentThumbnail_ != nullptr) {
-                currentThumbnail_->addChangeListener(this);
+            currentThumbnailPath_ = file.getFullPathName();
+            if (auto* thumbnail = magda::AudioThumbnailManager::getInstance().getThumbnail(
+                    currentThumbnailPath_)) {
+                thumbnail->addChangeListener(this);
             }
         }
 
+        updateStopIndexingButtonVisibility();
         repaint();
     }
 
@@ -132,6 +153,31 @@ class MediaExplorerContent::ThumbnailComponent : public juce::Component,
             repaint();
         }
     }
+
+    // While the media DB indexer is running it pushes its progress string
+    // here so the preview area surfaces it even when the user is in the
+    // filesystem browser. Empty -> no indexing in progress; paint reverts
+    // to the normal waveform / "No file selected" behaviour.
+    void setIndexingStatus(const juce::String& text) {
+        if (text.isNotEmpty() && !indexingActive_ && currentFile_.existsAsFile()) {
+            return;
+        }
+        if (indexingStatus_ == text) {
+            return;
+        }
+        indexingStatus_ = text;
+        updateStopIndexingButtonVisibility();
+        repaint();
+    }
+
+    void setIndexingActive(bool active) {
+        indexingActive_ = active;
+        updateStopIndexingButtonVisibility();
+        resized();
+        repaint();
+    }
+
+    std::function<void()> onStopIndexing;
 
     // ChangeListener - called when thumbnail finishes loading
     void changeListenerCallback(juce::ChangeBroadcaster*) override {
@@ -158,6 +204,20 @@ class MediaExplorerContent::ThumbnailComponent : public juce::Component,
         // Border
         g.setColour(DarkTheme::getBorderColour());
         g.drawRect(bounds, 1);
+
+        // Indexing status preempts everything else — the user explicitly
+        // asked for scan progress to be visible whether they're on the
+        // filesystem browser or the DB browser, and this panel is the one
+        // shared place above the result lists.
+        if (indexingStatus_.isNotEmpty() && !currentFile_.existsAsFile()) {
+            g.setColour(DarkTheme::getColour(DarkTheme::TEXT_PRIMARY));
+            g.setFont(FontManager::getInstance().getUIFont(11.0F));
+            if (indexingActive_) {
+                bounds.removeFromRight(76);
+            }
+            g.drawFittedText(indexingStatus_, bounds.reduced(8), juce::Justification::centred, 3);
+            return;
+        }
 
         if (currentFile_.existsAsFile()) {
             auto* thumbnail = magda::AudioThumbnailManager::getInstance().getThumbnail(
@@ -193,11 +253,34 @@ class MediaExplorerContent::ThumbnailComponent : public juce::Component,
         }
     }
 
+    void resized() override {
+        auto bounds = getLocalBounds().reduced(8, 6);
+        stopIndexingButton_.setBounds(bounds.removeFromRight(64));
+    }
+
   private:
+    void updateStopIndexingButtonVisibility() {
+        const bool showStop =
+            indexingActive_ && indexingStatus_.isNotEmpty() && !currentFile_.existsAsFile();
+        stopIndexingButton_.setVisible(showStop);
+        stopIndexingButton_.setEnabled(showStop);
+    }
+
+    void detachThumbnailListener() {
+        if (currentThumbnailPath_.isNotEmpty()) {
+            magda::AudioThumbnailManager::getInstance().removeThumbnailChangeListener(
+                currentThumbnailPath_, this);
+            currentThumbnailPath_.clear();
+        }
+    }
+
     juce::File currentFile_;
-    juce::AudioThumbnail* currentThumbnail_ = nullptr;
+    juce::String currentThumbnailPath_;
     juce::AudioTransportSource* transportSource_ = nullptr;
     double playbackPosition_ = 0.0;
+    juce::String indexingStatus_;
+    bool indexingActive_ = false;
+    juce::TextButton stopIndexingButton_;
 };
 
 //==============================================================================
@@ -241,9 +324,10 @@ class MediaExplorerContent::SidebarComponent : public juce::Component {
                 projectDir = pm.getCurrentProjectFile().getParentDirectory();
             if (!projectDir.isDirectory())
                 return;
-            selectButton(projectButton_.get());
+            // Don't call selectButton here — applyView() in the parent is the
+            // single writer of sidebar visual selection. We just announce intent.
             if (onLocationSelected)
-                onLocationSelected(projectDir);
+                onLocationSelected(projectDir, SidebarTarget::Project);
         };
         addAndMakeVisible(*projectButton_);
 
@@ -256,36 +340,35 @@ class MediaExplorerContent::SidebarComponent : public juce::Component {
         diskButton_->setHoverColor(DarkTheme::getColour(DarkTheme::TEXT_PRIMARY));
         diskButton_->setActiveColor(DarkTheme::getColour(DarkTheme::ACCENT_BLUE));
         diskButton_->onClick = [this]() {
-            selectButton(diskButton_.get());
-            if (onLocationSelected) {
-                auto defaultDir = magda::Config::getInstance().getBrowserDefaultDirectory();
-                if (!defaultDir.empty()) {
-                    juce::File dir(defaultDir);
-                    if (dir.isDirectory()) {
-                        onLocationSelected(dir);
-                        return;
-                    }
-                }
-                onLocationSelected(juce::File::getSpecialLocation(juce::File::userHomeDirectory));
+            if (!onLocationSelected) {
+                return;
             }
+            // Disk target resolution lives in the parent (it knows how to pick
+            // a sensible startup root the same way). We just send a sentinel
+            // empty File — applyView() picks Music/Home/saved when needed.
+            onLocationSelected(juce::File(), SidebarTarget::Disk);
         };
         addAndMakeVisible(*diskButton_);
 
-        // TODO: Library/DB button — uncomment when database feature is implemented
-        // libraryButton_ = std::make_unique<magda::SvgButton>("Library", BinaryData::database_svg,
-        //                                                     BinaryData::database_svgSize);
-        // libraryButton_->setToggleable(true);
-        // libraryButton_->setClickingTogglesState(true);
-        // libraryButton_->setOriginalColor(juce::Colour(0xFFB3B3B3));
-        // libraryButton_->setNormalColor(DarkTheme::getColour(DarkTheme::TEXT_SECONDARY));
-        // libraryButton_->setHoverColor(DarkTheme::getColour(DarkTheme::TEXT_PRIMARY));
-        // libraryButton_->setActiveColor(DarkTheme::getColour(DarkTheme::ACCENT_BLUE));
-        // libraryButton_->onClick = [this]() {
-        //     selectButton(libraryButton_.get());
-        //     if (onLocationSelected)
-        //         onLocationSelected(juce::File());
-        // };
-        // addAndMakeVisible(*libraryButton_);
+        // Library/DB button — Phase F1 of media DB (issue #768). Switches the
+        // main content area into "library mode" (media DB) rather than
+        // navigating the filesystem. The DB-mode UI is the placeholder until
+        // F2 lands; the click here only fires the mode-switch callback.
+        libraryButton_ = std::make_unique<magda::SvgButton>("Library", BinaryData::database_svg,
+                                                            BinaryData::database_svgSize);
+        libraryButton_->setToggleable(true);
+        libraryButton_->setClickingTogglesState(true);
+        libraryButton_->setOriginalColor(juce::Colour(0xFFB3B3B3));
+        libraryButton_->setNormalColor(DarkTheme::getColour(DarkTheme::TEXT_SECONDARY));
+        libraryButton_->setHoverColor(DarkTheme::getColour(DarkTheme::TEXT_PRIMARY));
+        libraryButton_->setActiveColor(DarkTheme::getColour(DarkTheme::ACCENT_BLUE));
+        libraryButton_->setTooltip("Media database");
+        libraryButton_->onClick = [this]() {
+            if (onLibrarySelected) {
+                onLibrarySelected();
+            }
+        };
+        addAndMakeVisible(*libraryButton_);
 
         // Favorites viewport for scrolling
         favoritesContent_ = std::make_unique<juce::Component>();
@@ -297,8 +380,36 @@ class MediaExplorerContent::SidebarComponent : public juce::Component {
         // Load favorites from config
         rebuildFavoriteButtons();
 
-        // Set Disk as initially selected
-        selectButton(diskButton_.get());
+        // Note: initial selection is driven by the parent (MediaExplorerContent)
+        // via selectInitialDisk() at the end of its constructor — that way
+        // startup goes through the same code path as a user click, keeping
+        // sidebar state, browser visibility, and file-browser root in lock-step.
+    }
+
+    // Sidebar visual selection — single writer, called only from
+    // MediaExplorerContent::applyView. Button onClick handlers no longer set
+    // visual state themselves, so this method is the sole route to that
+    // state and it always agrees with the current ViewState.
+    void setSidebarVisual(SidebarTarget target, const juce::File& favoriteRoot = {}) {
+        switch (target) {
+            case SidebarTarget::Project:
+                selectButton(projectButton_.get());
+                break;
+            case SidebarTarget::Disk:
+                selectButton(diskButton_.get());
+                break;
+            case SidebarTarget::Library:
+                selectButton(libraryButton_.get());
+                break;
+            case SidebarTarget::Favorite:
+                // No persistent visual highlight on the favorite row — the
+                // disk icon stays neutral and the favorite's own toggle was
+                // already flipped by the click. For startup we just leave
+                // everything de-selected if a favorite is the initial view
+                // (very unlikely path).
+                juce::ignoreUnused(favoriteRoot);
+                break;
+        }
     }
 
     void paint(juce::Graphics& g) override {
@@ -329,9 +440,8 @@ class MediaExplorerContent::SidebarComponent : public juce::Component {
         diskButton_->setBounds(centerX, bounds.getY(), iconSize, iconSize);
         bounds.removeFromTop(iconSize + padding);
 
-        // TODO: Library/DB button layout — uncomment when database feature is implemented
-        // libraryButton_->setBounds(centerX, bounds.getY(), iconSize, iconSize);
-        // bounds.removeFromTop(iconSize + padding);
+        libraryButton_->setBounds(centerX, bounds.getY(), iconSize, iconSize);
+        bounds.removeFromTop(iconSize + padding);
 
         // Separator
         separatorY_ = bounds.getY();
@@ -358,7 +468,7 @@ class MediaExplorerContent::SidebarComponent : public juce::Component {
             auto pathCopy = path;
             btn->onClick = [this, pathCopy]() {
                 if (onLocationSelected)
-                    onLocationSelected(juce::File(pathCopy));
+                    onLocationSelected(juce::File(pathCopy), SidebarTarget::Favorite);
             };
 
             btn->onRightClick = [this, pathCopy]() { showFavoriteContextMenu(pathCopy); };
@@ -371,7 +481,8 @@ class MediaExplorerContent::SidebarComponent : public juce::Component {
         repaint();
     }
 
-    std::function<void(const juce::File&)> onLocationSelected;
+    std::function<void(const juce::File&, SidebarTarget)> onLocationSelected;
+    std::function<void()> onLibrarySelected;  // Fired when the DB / library icon is picked.
 
     bool canAddFavorite() const {
         return static_cast<int>(favoriteButtons_.size()) < kMaxFavorites;
@@ -424,11 +535,10 @@ class MediaExplorerContent::SidebarComponent : public juce::Component {
             diskButton_->setToggleState(false, juce::dontSendNotification);
             diskButton_->setActive(false);
         }
-        // TODO: Library/DB button — uncomment when database feature is implemented
-        // if (libraryButton_.get() != selected) {
-        //     libraryButton_->setToggleState(false, juce::dontSendNotification);
-        //     libraryButton_->setActive(false);
-        // }
+        if (libraryButton_.get() != selected) {
+            libraryButton_->setToggleState(false, juce::dontSendNotification);
+            libraryButton_->setActive(false);
+        }
 
         selected->setToggleState(true, juce::dontSendNotification);
         selected->setActive(true);
@@ -436,8 +546,7 @@ class MediaExplorerContent::SidebarComponent : public juce::Component {
 
     std::unique_ptr<magda::SvgButton> projectButton_;
     std::unique_ptr<magda::SvgButton> diskButton_;
-    // TODO: Library/DB button — uncomment when database feature is implemented
-    // std::unique_ptr<magda::SvgButton> libraryButton_;
+    std::unique_ptr<magda::SvgButton> libraryButton_;
 
     static constexpr int kMaxFavorites = 8;
 
@@ -498,52 +607,67 @@ MediaExplorerContent::MediaExplorerContent() {
         stopTimer();
         startTimer(300);  // 300 ms debounce
     };
+    // Library-mode (DB) search runs the ONNX text encoder + a cosine scan
+    // over media_embedding — too costly to fire per-keystroke. Trigger it
+    // explicitly on Return. Filesystem-mode filtering still updates as the
+    // user types (cheap glob match). An empty box also re-pushes so clearing
+    // the field restores the unfiltered library view without an extra Enter.
+    searchBox_.onReturnKey = [this]() {
+        searchTerm_ = searchBox_.getText();
+        if (dbBrowser_ != nullptr) {
+            dbBrowser_->setQueryText(searchTerm_);
+        }
+    };
     addAndMakeVisible(searchBox_);
 
-    // Setup type filter buttons with icons
-    // Load persisted filter state
+    // Setup type filter buttons with icons (issue #768).
+    // Each filter type gets a distinct active-state backdrop so a user can
+    // tell at a glance which combinations are on. The SVGs themselves are
+    // single-colour outlines; differentiation lives entirely in the
+    // activeBackgroundColor + activeColor pair.
     audioFilterActive_ = magda::Config::getInstance().getBrowserFilterAudio();
     midiFilterActive_ = magda::Config::getInstance().getBrowserFilterMidi();
+    presetFilterActive_ = magda::Config::getInstance().getBrowserFilterPreset();
 
-    auto activeBackground = DarkTheme::getColour(DarkTheme::ACCENT_BLUE).withAlpha(0.25f);
+    const auto audioActiveTint = DarkTheme::getColour(DarkTheme::ACCENT_BLUE);
+    const auto midiActiveTint = DarkTheme::getColour(DarkTheme::ACCENT_ORANGE);
+    const auto presetActiveTint = DarkTheme::getColour(DarkTheme::ACCENT_PURPLE);
 
-    audioFilterButton_ = std::make_unique<magda::SvgButton>("Audio", BinaryData::AUDIO_svg,
-                                                            BinaryData::AUDIO_svgSize);
-    audioFilterButton_->setToggleable(true);
-    audioFilterButton_->setClickingTogglesState(true);
-    audioFilterButton_->setToggleState(audioFilterActive_, juce::dontSendNotification);
-    audioFilterButton_->setOriginalColor(juce::Colour(0xFFB3B3B3));
-    audioFilterButton_->setNormalColor(DarkTheme::getColour(DarkTheme::TEXT_SECONDARY));
-    audioFilterButton_->setHoverColor(DarkTheme::getColour(DarkTheme::TEXT_PRIMARY));
-    audioFilterButton_->setActiveColor(DarkTheme::getColour(DarkTheme::ACCENT_BLUE));
-    audioFilterButton_->setActiveBackgroundColor(activeBackground);
-    audioFilterButton_->setTooltip("Show audio files");
-    audioFilterButton_->onClick = [this]() {
-        audioFilterActive_ = audioFilterButton_->getToggleState();
-        magda::Config::getInstance().setBrowserFilterAudio(audioFilterActive_);
-        magda::Config::getInstance().save();
-        updateMediaFilter();
+    // Dual-icon mode: the SVG files themselves carry the active-state
+    // styling (background fill baked in), so the button only has to swap
+    // between the two assets per state. activeTint kept around in case we
+    // want a complementary border later — currently unused.
+    (void)audioActiveTint;
+    (void)midiActiveTint;
+    (void)presetActiveTint;
+
+    auto setupFilter = [&](std::unique_ptr<magda::SvgButton>& btn, const juce::String& name,
+                           const char* offSvg, int offSize, const char* onSvg, int onSize,
+                           bool initialState, const juce::String& tooltip) {
+        btn = std::make_unique<magda::SvgButton>(name, offSvg, offSize, onSvg, onSize);
+        btn->setToggleable(true);
+        btn->setClickingTogglesState(true);
+        btn->setToggleState(initialState, juce::dontSendNotification);
+        btn->setTooltip(tooltip);
     };
+
+    setupFilter(audioFilterButton_, "Audio", BinaryData::audio_db_off_svg,
+                BinaryData::audio_db_off_svgSize, BinaryData::audio_db_on_svg,
+                BinaryData::audio_db_on_svgSize, audioFilterActive_, "Show audio files");
+    audioFilterButton_->onClick = [this]() { onTypeIconClicked(audioFilterButton_.get()); };
     addAndMakeVisible(*audioFilterButton_);
 
-    midiFilterButton_ =
-        std::make_unique<magda::SvgButton>("MIDI", BinaryData::MIDI_svg, BinaryData::MIDI_svgSize);
-    midiFilterButton_->setToggleable(true);
-    midiFilterButton_->setClickingTogglesState(true);
-    midiFilterButton_->setToggleState(midiFilterActive_, juce::dontSendNotification);
-    midiFilterButton_->setOriginalColor(juce::Colour(0xFFB3B3B3));
-    midiFilterButton_->setNormalColor(DarkTheme::getColour(DarkTheme::TEXT_SECONDARY));
-    midiFilterButton_->setHoverColor(DarkTheme::getColour(DarkTheme::TEXT_PRIMARY));
-    midiFilterButton_->setActiveColor(DarkTheme::getColour(DarkTheme::ACCENT_BLUE));
-    midiFilterButton_->setActiveBackgroundColor(activeBackground);
-    midiFilterButton_->setTooltip("Show MIDI files");
-    midiFilterButton_->onClick = [this]() {
-        midiFilterActive_ = midiFilterButton_->getToggleState();
-        magda::Config::getInstance().setBrowserFilterMidi(midiFilterActive_);
-        magda::Config::getInstance().save();
-        updateMediaFilter();
-    };
+    setupFilter(midiFilterButton_, "MIDI", BinaryData::midi_db_off_svg,
+                BinaryData::midi_db_off_svgSize, BinaryData::midi_db_on_svg,
+                BinaryData::midi_db_on_svgSize, midiFilterActive_, "Show MIDI files");
+    midiFilterButton_->onClick = [this]() { onTypeIconClicked(midiFilterButton_.get()); };
     addAndMakeVisible(*midiFilterButton_);
+
+    setupFilter(presetFilterButton_, "Presets", BinaryData::presets_db_off_svg,
+                BinaryData::presets_db_off_svgSize, BinaryData::presets_db_on_svg,
+                BinaryData::presets_db_on_svgSize, presetFilterActive_, "Show MAGDA presets");
+    presetFilterButton_->onClick = [this]() { onTypeIconClicked(presetFilterButton_.get()); };
+    addAndMakeVisible(*presetFilterButton_);
 
     // View toggle buttons removed - not needed for now
     // View mode selector dropdown removed - not needed for now
@@ -645,6 +769,7 @@ MediaExplorerContent::MediaExplorerContent() {
     fileInfoLabel_.setFont(FontManager::getInstance().getUIFontBold(10.0f));
     fileInfoLabel_.setColour(juce::Label::textColourId, DarkTheme::getTextColour());
     fileInfoLabel_.setJustificationType(juce::Justification::centredLeft);
+    fileInfoLabel_.setMinimumHorizontalScale(1.0F);
     addAndMakeVisible(fileInfoLabel_);
 
     formatLabel_.setText("", juce::dontSendNotification);
@@ -661,6 +786,11 @@ MediaExplorerContent::MediaExplorerContent() {
 
     // Waveform thumbnail
     thumbnailComponent_ = std::make_unique<ThumbnailComponent>();
+    thumbnailComponent_->onStopIndexing = [this]() {
+        if (dbBrowser_) {
+            dbBrowser_->requestStopIndexing();
+        }
+    };
     addAndMakeVisible(*thumbnailComponent_);
 
     // Setup file browser with initial filter
@@ -721,18 +851,57 @@ MediaExplorerContent::MediaExplorerContent() {
 
     // Setup sidebar navigation
     sidebarComponent_ = std::make_unique<SidebarComponent>();
-    sidebarComponent_->onLocationSelected = [this](const juce::File& location) {
-        navigateToDirectory(location);
+    sidebarComponent_->onLocationSelected = [this](const juce::File& location,
+                                                   SidebarTarget target) {
+        // Disk sends an empty File to indicate "you decide"; everything else
+        // sends an explicit path. Both paths funnel into applyView.
+        juce::File root = location.isDirectory() ? location : pickStartupFilesystemRoot();
+        applyView({ViewState::Mode::Filesystem, target, root});
+    };
+    sidebarComponent_->onLibrarySelected = [this]() {
+        applyView({ViewState::Mode::Library, SidebarTarget::Library, juce::File{}});
     };
     addAndMakeVisible(*sidebarComponent_);
 
-    // Navigate to default directory if configured, otherwise fall back to userMusicDirectory
-    auto defaultDir = magda::Config::getInstance().getBrowserDefaultDirectory();
-    if (!defaultDir.empty()) {
-        juce::File dir(defaultDir);
-        if (dir.isDirectory()) {
-            navigateToDirectory(dir);
+    // Real DB browser (Phase F2). Hidden until library mode activates.
+    // addChildComponent (not addAndMakeVisible) is required here:
+    // addAndMakeVisible forces visibility=true, which would defeat the
+    // setVisible(false) and leave the DB browser painted over the file
+    // browser at startup.
+    dbBrowser_ = std::make_unique<MediaDbBrowserContent>();
+    dbBrowser_->onFileSelected = [this](const juce::File& f) {
+        if (previewLockedForIndexing_) {
+            return;
         }
+        loadFileForPreview(f);
+        // Match the file-browser's selectionChanged path: respect the Auto
+        // toggle so picking a DB row auto-plays when the user wants it.
+        if (autoPlayButton_.getToggleState()) {
+            playPreview();
+        }
+    };
+    // Surface indexing progress in the preview area so it's visible from
+    // both the filesystem browser and the DB browser. Empty string clears.
+    dbBrowser_->onIndexingStatus = [this](const juce::String& status) {
+        if (thumbnailComponent_) {
+            thumbnailComponent_->setIndexingStatus(status);
+        }
+    };
+    dbBrowser_->onIndexingActiveChanged = [this](bool active) {
+        setPreviewLockedForIndexing(active);
+    };
+    addChildComponent(*dbBrowser_);
+    dbBrowser_->setVisible(false);
+
+    // Single source of truth: applyView writes sidebar visual + browser
+    // visibility + file-browser root + db-browser kind filter + type-icon
+    // toggle states from one place. The same code path serves startup and
+    // every subsequent click. Run it once with the computed initial view —
+    // restoring the user's last-used view (filesystem / library) from Config.
+    if (magda::Config::getInstance().getBrowserLastView() == "library") {
+        applyView({ViewState::Mode::Library, SidebarTarget::Library, juce::File{}});
+    } else {
+        applyView({ViewState::Mode::Filesystem, SidebarTarget::Disk, pickStartupFilesystemRoot()});
     }
 
     // Setup audio preview
@@ -762,6 +931,142 @@ MediaExplorerContent::~MediaExplorerContent() {
     transportSource_.reset();
     readerSource_.reset();
     previewCallback_.reset();
+}
+
+juce::File MediaExplorerContent::pickStartupFilesystemRoot() const {
+    // Saved default → user's Music folder → home. Returns the first that
+    // exists as a directory.
+    auto defaultDir = magda::Config::getInstance().getBrowserDefaultDirectory();
+    if (!defaultDir.empty()) {
+        juce::File configured(defaultDir);
+        if (configured.isDirectory()) {
+            return configured;
+        }
+    }
+    auto music = juce::File::getSpecialLocation(juce::File::userMusicDirectory);
+    if (music.isDirectory()) {
+        return music;
+    }
+    return juce::File::getSpecialLocation(juce::File::userHomeDirectory);
+}
+
+void MediaExplorerContent::applyView(ViewState target) {
+    // The ONE writer of view state. Touches everything that depends on the
+    // mode/sidebar/root so nothing can drift out of sync:
+    //   1. Sidebar visual selection
+    //   2. file-browser / db-browser visibility
+    //   3. file-browser root (Filesystem mode only)
+    //   4. db-browser kind filter (cleared on every transition)
+    //   5. type-icon toggle states (file-mode booleans vs library-mode radio)
+
+    // 1. Sidebar visual selection.
+    if (sidebarComponent_) {
+        sidebarComponent_->setSidebarVisual(target.sidebar, target.filesystemRoot);
+    }
+
+    // 2–5. Mode-specific application.
+    if (target.mode == ViewState::Mode::Filesystem) {
+        if (dbBrowser_) {
+            dbBrowser_->setVisible(false);
+            dbBrowser_->setKindFilter(std::nullopt);
+        }
+        if (fileBrowser_) {
+            fileBrowser_->setVisible(true);
+            if (target.filesystemRoot.isDirectory()) {
+                fileBrowser_->setRoot(target.filesystemRoot);
+            }
+        }
+        // Restore the file-mode toggle visuals from the persisted booleans
+        // (these reflect the user's last file-mode filter choice in Config).
+        if (audioFilterButton_) {
+            audioFilterButton_->setToggleState(audioFilterActive_, juce::dontSendNotification);
+        }
+        if (midiFilterButton_) {
+            midiFilterButton_->setToggleState(midiFilterActive_, juce::dontSendNotification);
+        }
+        if (presetFilterButton_) {
+            presetFilterButton_->setToggleState(presetFilterActive_, juce::dontSendNotification);
+        }
+    } else {  // Library
+        if (fileBrowser_) {
+            fileBrowser_->setVisible(false);
+        }
+        if (dbBrowser_) {
+            dbBrowser_->setKindFilter(std::nullopt);
+            dbBrowser_->setVisible(true);
+            dbBrowser_->setQueryText(searchTerm_);
+            dbBrowser_->refresh();
+        }
+        // All icons off — library-mode radio starts at "All kinds".
+        if (audioFilterButton_) {
+            audioFilterButton_->setToggleState(false, juce::dontSendNotification);
+        }
+        if (midiFilterButton_) {
+            midiFilterButton_->setToggleState(false, juce::dontSendNotification);
+        }
+        if (presetFilterButton_) {
+            presetFilterButton_->setToggleState(false, juce::dontSendNotification);
+        }
+    }
+
+    currentView_ = target;
+
+    // Persist the mode so the next launch restores the same view.
+    const char* persistedMode =
+        (target.mode == ViewState::Mode::Library) ? "library" : "filesystem";
+    if (magda::Config::getInstance().getBrowserLastView() != persistedMode) {
+        magda::Config::getInstance().setBrowserLastView(persistedMode);
+        magda::Config::getInstance().save();
+    }
+
+    resized();
+}
+
+void MediaExplorerContent::onTypeIconClicked(magda::SvgButton* clicked) {
+    if (!clicked) {
+        return;
+    }
+    const bool nowOn = clicked->getToggleState();  // setClickingTogglesState flipped it already
+
+    if (inLibraryMode()) {
+        // Radio: when one activates, the others go off. All-off means
+        // "any kind" (no filter).
+        if (nowOn) {
+            for (auto* other :
+                 {audioFilterButton_.get(), midiFilterButton_.get(), presetFilterButton_.get()}) {
+                if (other != clicked) {
+                    other->setToggleState(false, juce::dontSendNotification);
+                }
+            }
+        }
+        std::optional<std::string> kind;
+        if (audioFilterButton_ && audioFilterButton_->getToggleState()) {
+            kind = "audio";
+        } else if (midiFilterButton_ && midiFilterButton_->getToggleState()) {
+            kind = "clip";
+        } else if (presetFilterButton_ && presetFilterButton_->getToggleState()) {
+            kind = "preset";
+        }
+        if (dbBrowser_) {
+            dbBrowser_->setKindFilter(kind);
+        }
+        return;
+    }
+
+    // File mode: existing multi-toggle behaviour. Each icon toggles its
+    // own file-type filter independently and persists to Config.
+    if (clicked == audioFilterButton_.get()) {
+        audioFilterActive_ = nowOn;
+        magda::Config::getInstance().setBrowserFilterAudio(audioFilterActive_);
+    } else if (clicked == midiFilterButton_.get()) {
+        midiFilterActive_ = nowOn;
+        magda::Config::getInstance().setBrowserFilterMidi(midiFilterActive_);
+    } else if (clicked == presetFilterButton_.get()) {
+        presetFilterActive_ = nowOn;
+        magda::Config::getInstance().setBrowserFilterPreset(presetFilterActive_);
+    }
+    magda::Config::getInstance().save();
+    updateMediaFilter();
 }
 
 void MediaExplorerContent::setAudioEngine(magda::AudioEngine* engine) {
@@ -821,7 +1126,13 @@ void MediaExplorerContent::setupAudioPreview() {
 }
 
 void MediaExplorerContent::loadFileForPreview(const juce::File& file) {
+    if (previewLockedForIndexing_) {
+        return;
+    }
     stopPreview();
+    if (thumbnailComponent_) {
+        thumbnailComponent_->setIndexingStatus({});
+    }
 
     // CRITICAL: Clear the transport source BEFORE destroying the old reader source
     // This prevents use-after-free when clicking multiple samples
@@ -853,7 +1164,9 @@ void MediaExplorerContent::loadFileForPreview(const juce::File& file) {
         }
     } else {
         playButton_->setEnabled(false);
-        fileInfoLabel_.setText("Could not load: " + file.getFileName(), juce::dontSendNotification);
+        fileInfoLabel_.setText("Could not load: " + file.getFullPathName(),
+                               juce::dontSendNotification);
+        fileInfoLabel_.setTooltip(file.getFullPathName());
 
         // Clear thumbnail
         if (thumbnailComponent_) {
@@ -863,6 +1176,9 @@ void MediaExplorerContent::loadFileForPreview(const juce::File& file) {
 }
 
 void MediaExplorerContent::playPreview() {
+    if (previewLockedForIndexing_) {
+        return;
+    }
     if (transportSource_ && !isPlaying_) {
         transportSource_->setPosition(0.0);
         transportSource_->start();
@@ -883,16 +1199,59 @@ void MediaExplorerContent::stopPreview() {
     }
 }
 
-void MediaExplorerContent::updateFileInfo(const juce::File& file) {
-    if (!file.existsAsFile()) {
-        fileInfoLabel_.setText("No file selected", juce::dontSendNotification);
+void MediaExplorerContent::setPreviewLockedForIndexing(bool locked) {
+    if (previewLockedForIndexing_ == locked) {
+        return;
+    }
+    previewLockedForIndexing_ = locked;
+    if (thumbnailComponent_) {
+        thumbnailComponent_->setIndexingActive(locked);
+    }
+
+    if (locked) {
+        stopPreview();
+        if (transportSource_) {
+            transportSource_->setSource(nullptr);
+        }
+        readerSource_.reset();
+        playButton_->setEnabled(false);
+        stopButton_->setEnabled(false);
+        autoPlayButton_.setEnabled(false);
+        volumeSlider_.setEnabled(false);
+        currentPreviewFile_ = juce::File();
+        if (thumbnailComponent_) {
+            thumbnailComponent_->setFile(juce::File());
+        }
+        fileInfoLabel_.setText("Preview locked during media scan", juce::dontSendNotification);
+        fileInfoLabel_.setTooltip({});
         formatLabel_.setText("", juce::dontSendNotification);
         propertiesLabel_.setText("", juce::dontSendNotification);
         return;
     }
 
-    // File name
-    fileInfoLabel_.setText(file.getFileName(), juce::dontSendNotification);
+    autoPlayButton_.setEnabled(true);
+    volumeSlider_.setEnabled(true);
+    playButton_->setEnabled(currentPreviewFile_.existsAsFile());
+    stopButton_->setEnabled(false);
+    if (!currentPreviewFile_.existsAsFile()) {
+        fileInfoLabel_.setText("No file selected", juce::dontSendNotification);
+        fileInfoLabel_.setTooltip({});
+    }
+}
+
+void MediaExplorerContent::updateFileInfo(const juce::File& file) {
+    if (!file.existsAsFile()) {
+        fileInfoLabel_.setText("No file selected", juce::dontSendNotification);
+        fileInfoLabel_.setTooltip({});
+        formatLabel_.setText("", juce::dontSendNotification);
+        propertiesLabel_.setText("", juce::dontSendNotification);
+        return;
+    }
+
+    // Full path. The label truncates visually, but the tooltip exposes the
+    // complete path when the preview row is narrow.
+    fileInfoLabel_.setText(file.getFullPathName(), juce::dontSendNotification);
+    fileInfoLabel_.setTooltip(file.getFullPathName());
 
     auto* reader = formatManager_.createReaderFor(file);
     if (reader != nullptr) {
@@ -902,16 +1261,16 @@ void MediaExplorerContent::updateFileInfo(const juce::File& file) {
         int channels = reader->numChannels;
 
         // Format info: type, sample rate, bit depth
-        juce::String format = file.getFileExtension().toUpperCase().substring(1) + " • ";
-        format += juce::String(sampleRate / 1000.0, 1) + " kHz • ";
-        format += juce::String(bitDepth) + "-bit • ";
+        juce::String format = file.getFileExtension().toUpperCase().substring(1) + " | ";
+        format += juce::String(sampleRate / 1000.0, 1) + " kHz | ";
+        format += juce::String(bitDepth) + "-bit | ";
         format += juce::String(channels == 1   ? "Mono"
                                : channels == 2 ? "Stereo"
                                                : juce::String(channels) + "ch");
         formatLabel_.setText(format, juce::dontSendNotification);
 
         // Properties: duration, file size
-        juce::String properties = "Duration: " + formatDuration(duration) + " • ";
+        juce::String properties = "Duration: " + formatDuration(duration) + " | ";
         properties += "Size: " + formatFileSize(file.getSize());
         propertiesLabel_.setText(properties, juce::dontSendNotification);
 
@@ -958,6 +1317,13 @@ void MediaExplorerContent::updateMediaFilter() {
     if (fileBrowser_) {
         fileBrowser_->setFileFilter(mediaFileFilter_.get());
         fileBrowser_->refresh();
+    }
+    // Library mode no longer auto-syncs the text into the DB browser as the
+    // user types — DB search is Return-triggered (see searchBox_.onReturnKey
+    // above). Empty box is the one exception: clearing the field should
+    // restore the unfiltered library view without an extra Enter press.
+    if (dbBrowser_ != nullptr && searchTerm_.isEmpty()) {
+        dbBrowser_->setQueryText(searchTerm_);
     }
 }
 
@@ -1034,23 +1400,28 @@ void MediaExplorerContent::resized() {
     // Top bar with all controls
     auto topBar = bounds.removeFromTop(32);
 
-    // Right: Type filter icon buttons, then search fills remaining space
+    // Right: Type filter icon buttons (audio / midi / preset), then search
+    // fills remaining space.
     const int iconButtonSize = 30;
     const int buttonSpacing = 4;
-    const int rightSideWidth = iconButtonSize * 2 + buttonSpacing + 8;  // 2 icons + spacing + gap
+    constexpr int kFilterIcons = 3;
+    const int rightSideWidth =
+        iconButtonSize * kFilterIcons + buttonSpacing * (kFilterIcons - 1) + 8;
     auto searchWidth = juce::jmax(120, topBar.getWidth() - rightSideWidth);
     searchBox_.setBounds(topBar.removeFromLeft(searchWidth));
     topBar.removeFromLeft(8);
 
-    // Right: Type filter icon buttons (square, vertically centered)
     const int iconVerticalOffset = (topBar.getHeight() - iconButtonSize) / 2;
-    audioFilterButton_->setBounds(topBar.removeFromLeft(iconButtonSize)
-                                      .withTrimmedTop(iconVerticalOffset)
-                                      .withHeight(iconButtonSize));
+    auto placeIcon = [&](magda::SvgButton& btn) {
+        btn.setBounds(topBar.removeFromLeft(iconButtonSize)
+                          .withTrimmedTop(iconVerticalOffset)
+                          .withHeight(iconButtonSize));
+    };
+    placeIcon(*audioFilterButton_);
     topBar.removeFromLeft(buttonSpacing);
-    midiFilterButton_->setBounds(topBar.removeFromLeft(iconButtonSize)
-                                     .withTrimmedTop(iconVerticalOffset)
-                                     .withHeight(iconButtonSize));
+    placeIcon(*midiFilterButton_);
+    topBar.removeFromLeft(buttonSpacing);
+    placeIcon(*presetFilterButton_);
 
     bounds.removeFromTop(8);
 
@@ -1071,8 +1442,12 @@ void MediaExplorerContent::resized() {
     sidebarComponent_->setBounds(bounds.removeFromLeft(sidebarWidth));
     bounds.removeFromLeft(8);  // Spacing between sidebar and browser
 
-    // Right: File browser takes all remaining space
+    // Right: File browser (filesystem mode) or DB browser (library mode) —
+    // same bounds either way, visibility is toggled at the click site.
     fileBrowser_->setBounds(bounds);
+    if (dbBrowser_) {
+        dbBrowser_->setBounds(bounds);
+    }
 
     // Now layout preview/inspector area
     previewArea.removeFromTop(4);
@@ -1111,6 +1486,9 @@ void MediaExplorerContent::onDeactivated() {
 
 // FileBrowserListener implementation
 void MediaExplorerContent::selectionChanged() {
+    if (previewLockedForIndexing_) {
+        return;
+    }
     // Read selection from the underlying list directly (more reliable than
     // FileBrowserComponent's cached chosenFiles).
     auto* listComp = dynamic_cast<juce::FileListComponent*>(fileBrowser_->getDisplayComponent());
@@ -1151,6 +1529,7 @@ void MediaExplorerContent::selectionChanged() {
 
         fileInfoLabel_.setText(juce::String(numSelected) + " files selected",
                                juce::dontSendNotification);
+        fileInfoLabel_.setTooltip({});
         formatLabel_.setText("Multiple files", juce::dontSendNotification);
         propertiesLabel_.setText("Total size: " + formatFileSize(totalBytes),
                                  juce::dontSendNotification);
@@ -1168,6 +1547,7 @@ void MediaExplorerContent::selectionChanged() {
         readerSource_.reset();
         playButton_->setEnabled(false);
         fileInfoLabel_.setText("No file selected", juce::dontSendNotification);
+        fileInfoLabel_.setTooltip({});
         formatLabel_.setText("", juce::dontSendNotification);
         propertiesLabel_.setText("", juce::dontSendNotification);
         if (thumbnailComponent_) {
@@ -1187,10 +1567,11 @@ void MediaExplorerContent::selectionChanged() {
         stopPreview();
         playButton_->setEnabled(false);
 
-        fileInfoLabel_.setText(selectedFile.getFileName(), juce::dontSendNotification);
+        fileInfoLabel_.setText(selectedFile.getFullPathName(), juce::dontSendNotification);
+        fileInfoLabel_.setTooltip(selectedFile.getFullPathName());
         formatLabel_.setText("MIDI File", juce::dontSendNotification);
         propertiesLabel_.setText("Size: " + formatFileSize(selectedFile.getSize()) +
-                                     " • Preview: Coming soon",
+                                     " | Preview: Coming soon",
                                  juce::dontSendNotification);
 
         if (thumbnailComponent_) {
@@ -1201,10 +1582,11 @@ void MediaExplorerContent::selectionChanged() {
         stopPreview();
         playButton_->setEnabled(false);
 
-        fileInfoLabel_.setText(selectedFile.getFileName(), juce::dontSendNotification);
+        fileInfoLabel_.setText(selectedFile.getFullPathName(), juce::dontSendNotification);
+        fileInfoLabel_.setTooltip(selectedFile.getFullPathName());
         formatLabel_.setText("Magda Clip", juce::dontSendNotification);
         propertiesLabel_.setText("Size: " + formatFileSize(selectedFile.getSize()) +
-                                     " • Preview: Coming soon",
+                                     " | Preview: Coming soon",
                                  juce::dontSendNotification);
 
         if (thumbnailComponent_) {
@@ -1215,7 +1597,8 @@ void MediaExplorerContent::selectionChanged() {
         stopPreview();
         playButton_->setEnabled(false);
 
-        fileInfoLabel_.setText(selectedFile.getFileName(), juce::dontSendNotification);
+        fileInfoLabel_.setText(selectedFile.getFullPathName(), juce::dontSendNotification);
+        fileInfoLabel_.setTooltip(selectedFile.getFullPathName());
         formatLabel_.setText("Preset", juce::dontSendNotification);
         propertiesLabel_.setText("Size: " + formatFileSize(selectedFile.getSize()),
                                  juce::dontSendNotification);
@@ -1228,7 +1611,8 @@ void MediaExplorerContent::selectionChanged() {
         stopPreview();
         playButton_->setEnabled(false);
 
-        fileInfoLabel_.setText(selectedFile.getFileName(), juce::dontSendNotification);
+        fileInfoLabel_.setText(selectedFile.getFullPathName(), juce::dontSendNotification);
+        fileInfoLabel_.setTooltip(selectedFile.getFullPathName());
         formatLabel_.setText("Unknown format", juce::dontSendNotification);
         propertiesLabel_.setText("Size: " + formatFileSize(selectedFile.getSize()),
                                  juce::dontSendNotification);
@@ -1236,7 +1620,7 @@ void MediaExplorerContent::selectionChanged() {
 }
 
 void MediaExplorerContent::fileClicked(const juce::File& file, const juce::MouseEvent& e) {
-    // Right-click on a directory: offer to add as favorite
+    // Right-click on a directory: favorites + index actions.
     if (e.mods.isPopupMenu() && file.isDirectory()) {
         juce::PopupMenu menu;
         auto favorites = magda::Config::getInstance().getBrowserFavorites();
@@ -1249,24 +1633,207 @@ void MediaExplorerContent::fileClicked(const juce::File& file, const juce::Mouse
         } else if (sidebarComponent_->canAddFavorite()) {
             menu.addItem(2, "Add to favorites");
         } else {
-            menu.addItem(0, "Favorites full (max 8)", false);
+            // SectionHeader, not addItem(0, …) — JUCE asserts on id 0
+            // because it's reserved for "user dismissed". Section headers
+            // are the sanctioned way to put non-clickable label text.
+            menu.addSectionHeader("Favorites full (max 8)");
+        }
+        menu.addSeparator();
+        // Context-aware: first-time Index when nothing under this folder is
+        // in the DB; otherwise expose the two existing-data modes
+        // (Scan for new files / Re-index everything). Range-query against
+        // the path index is O(log N) so it's safe to run on every right-
+        // click.
+        const bool alreadyIndexed = magda::media::hasIndexedDescendantOfFolder(
+            std::filesystem::path(file.getFullPathName().toStdString()));
+        if (alreadyIndexed) {
+            menu.addItem(4, "Scan for new files");
+            menu.addItem(3, "Re-index this folder");
+            menu.addItem(6, "Change folder location...");
+            menu.addSeparator();
+            menu.addItem(5, "Remove from media library");
+        } else {
+            menu.addItem(3, "Index this folder");
         }
 
-        menu.showMenuAsync(juce::PopupMenu::Options(), [this, path](int result) {
-            if (result == 1) {
-                auto favs = magda::Config::getInstance().getBrowserFavorites();
-                favs.erase(std::remove(favs.begin(), favs.end(), path), favs.end());
-                magda::Config::getInstance().setBrowserFavorites(favs);
-                magda::Config::getInstance().save();
-                sidebarComponent_->rebuildFavoriteButtons();
-            } else if (result == 2) {
-                auto favs = magda::Config::getInstance().getBrowserFavorites();
-                favs.push_back(path);
-                magda::Config::getInstance().setBrowserFavorites(favs);
-                magda::Config::getInstance().save();
-                sidebarComponent_->rebuildFavoriteButtons();
-            }
-        });
+        menu.showMenuAsync(
+            juce::PopupMenu::Options(), [this, path, file, alreadyIndexed](int result) {
+                if (result == 1) {
+                    auto favs = magda::Config::getInstance().getBrowserFavorites();
+                    favs.erase(std::remove(favs.begin(), favs.end(), path), favs.end());
+                    magda::Config::getInstance().setBrowserFavorites(favs);
+                    magda::Config::getInstance().save();
+                    sidebarComponent_->rebuildFavoriteButtons();
+                } else if (result == 2) {
+                    auto favs = magda::Config::getInstance().getBrowserFavorites();
+                    favs.push_back(path);
+                    magda::Config::getInstance().setBrowserFavorites(favs);
+                    magda::Config::getInstance().save();
+                    sidebarComponent_->rebuildFavoriteButtons();
+                } else if (result == 3 && dbBrowser_) {
+                    dbBrowser_->startIndexing(
+                        file, alreadyIndexed ? magda::media::MediaDbIndexer::Mode::ForceAll
+                                             : magda::media::MediaDbIndexer::Mode::Incremental);
+                } else if (result == 4 && dbBrowser_) {
+                    dbBrowser_->startIndexing(file, magda::media::MediaDbIndexer::Mode::OnlyNew);
+                } else if (result == 5 && dbBrowser_) {
+                    const auto folderName = file.getFileName();
+                    const auto fsPath = std::filesystem::path(file.getFullPathName().toStdString());
+                    juce::Component::SafePointer<MediaExplorerContent> self(this);
+                    juce::AlertWindow::showAsync(
+                        juce::MessageBoxOptions{}
+                            .withIconType(juce::MessageBoxIconType::WarningIcon)
+                            .withTitle("Remove folder from media library")
+                            .withMessage("Remove every indexed entry under \"" + folderName +
+                                         "\" from the media library?\n"
+                                         "Your audio files on disk are untouched.")
+                            .withButton("Remove")
+                            .withButton("Cancel"),
+                        [self, fsPath](int choice) {
+                            if (self == nullptr || choice != 1) {
+                                return;
+                            }
+                            magda::media::removeFolderFromLibrary(fsPath);
+                            if (self->dbBrowser_ != nullptr) {
+                                self->dbBrowser_->refresh();
+                            }
+                        });
+                } else if (result == 6 && dbBrowser_) {
+                    const auto fsPath = std::filesystem::path(file.getFullPathName().toStdString());
+                    juce::Component::SafePointer<MediaExplorerContent> self(this);
+                    moveFolderChooser_ = std::make_unique<juce::FileChooser>(
+                        "Choose the new parent folder",
+                        file.getParentDirectory().exists()
+                            ? file.getParentDirectory()
+                            : juce::File::getSpecialLocation(juce::File::userHomeDirectory));
+                    moveFolderChooser_->launchAsync(
+                        juce::FileBrowserComponent::openMode |
+                            juce::FileBrowserComponent::canSelectDirectories,
+                        [self, fsPath](const juce::FileChooser& fc) {
+                            if (self == nullptr) {
+                                return;
+                            }
+                            const auto picked = fc.getResult();
+                            if (!picked.isDirectory()) {
+                                return;
+                            }
+                            // The chooser returns the new PARENT directory.
+                            // The folder itself keeps its original name at the
+                            // new location, so build the full destination by
+                            // appending the source folder's leaf name.
+                            const auto newParent =
+                                std::filesystem::path(picked.getFullPathName().toStdString());
+                            const auto newFullPath = newParent / fsPath.filename();
+
+                            auto showError = [](const juce::String& msg) {
+                                juce::AlertWindow::showAsync(
+                                    juce::MessageBoxOptions{}
+                                        .withIconType(juce::MessageBoxIconType::WarningIcon)
+                                        .withTitle("Move folder")
+                                        .withMessage(msg)
+                                        .withButton("OK"),
+                                    nullptr);
+                            };
+
+                            if (newFullPath == fsPath) {
+                                showError("The new parent is the folder's current parent — "
+                                          "nothing to do.");
+                                return;
+                            }
+                            std::error_code ec;
+                            if (std::filesystem::exists(newFullPath, ec)) {
+                                showError("A folder named \"" +
+                                          juce::String(fsPath.filename().string()) +
+                                          "\" already exists at the chosen location. Pick a "
+                                          "different parent or remove the existing folder "
+                                          "first.");
+                                return;
+                            }
+
+                            // Release every handle MAGDA holds on the
+                            // source tree before attempting the rename.
+                            // Two of our subsystems can keep the source
+                            // alive:
+                            //   1. The file browser's
+                            //      DirectoryContentsList polls its current
+                            //      root and enumerates child entries; if
+                            //      that root is at or under the folder we
+                            //      want to move, switching it away first
+                            //      makes the worker stop walking the
+                            //      doomed directory.
+                            //   2. The preview transport keeps an audio
+                            //      reader open on the last-played file,
+                            //      which sits underneath the source
+                            //      folder when the user just auditioned
+                            //      something from it.
+                            // POSIX would silently let the rename happen
+                            // with these handles still open, but Windows
+                            // returns access-denied — so the cleanup is
+                            // required there and harmless elsewhere.
+                            if (self->fileBrowser_ != nullptr) {
+                                const auto parent = fsPath.parent_path();
+                                if (!parent.empty()) {
+                                    self->fileBrowser_->setRoot(
+                                        juce::File(juce::String(parent.string())));
+                                }
+                            }
+                            self->stopPreview();
+                            if (self->transportSource_) {
+                                self->transportSource_->setSource(nullptr);
+                            }
+                            self->currentPreviewFile_ = juce::File();
+
+                            // Physically move the folder first; only update
+                            // the library rows if that succeeded, otherwise
+                            // the DB would point at a path that doesn't
+                            // exist on disk (the original bug).
+                            std::filesystem::rename(fsPath, newFullPath, ec);
+                            if (ec) {
+                                juce::Logger::writeToLog(
+                                    juce::String("[moveFolder] rename failed: code=") +
+                                    juce::String(ec.value()) + " msg='" +
+                                    juce::String(ec.message()) + "' src='" +
+                                    juce::String(fsPath.string()) + "' dst='" +
+                                    juce::String(newFullPath.string()) + "'");
+                                showError("Could not move the folder on disk: " +
+                                          juce::String(ec.message()) + " (code " +
+                                          juce::String(ec.value()) +
+                                          ").\n\nOn Windows this usually means MAGDA, "
+                                          "File Explorer, or an antivirus is holding the "
+                                          "folder open. Close any preview, switch the "
+                                          "explorer pane to a different folder, then try "
+                                          "again. The media library was not changed.");
+                                return;
+                            }
+
+                            const int rows =
+                                magda::media::moveFolderInLibrary(fsPath, newFullPath);
+                            if (rows < 0) {
+                                // DB update failed after the disk move succeeded.
+                                // Put the folder back so we don't leave the user
+                                // with stale DB rows AND a moved folder.
+                                std::error_code revertEc;
+                                std::filesystem::rename(newFullPath, fsPath, revertEc);
+                                showError(
+                                    "The folder was moved on disk, but the library update "
+                                    "was rolled back (likely a name collision). The folder "
+                                    "has been moved back to its original location.");
+                                return;
+                            }
+                            // Navigate the explorer to the new parent so
+                            // the user lands on the moved folder instead
+                            // of staring at the old (now empty of it)
+                            // location.
+                            if (self->fileBrowser_ != nullptr) {
+                                self->fileBrowser_->setRoot(
+                                    juce::File(juce::String(newParent.string())));
+                            }
+                            if (self->dbBrowser_ != nullptr) {
+                                self->dbBrowser_->refresh();
+                            }
+                        });
+                }
+            });
         return;
     }
 
@@ -1277,6 +1844,9 @@ void MediaExplorerContent::fileClicked(const juce::File& file, const juce::Mouse
 }
 
 void MediaExplorerContent::fileDoubleClicked(const juce::File& file) {
+    if (previewLockedForIndexing_) {
+        return;
+    }
     // Only audio files can be played on double-click
     if (isAudioFile(file)) {
         loadFileForPreview(file);
@@ -1368,13 +1938,13 @@ void MediaExplorerContent::mouseDrag(const juce::MouseEvent& e) {
             g.setColour(juce::Colours::white);
             g.setFont(13.0f);
             for (int i = 0; i < maxRows; ++i) {
-                g.drawText(juce::File(paths[i]).getFileName(), 8, 3 + i * rowH, width - 16,
-                           rowH, juce::Justification::centredLeft, true);
+                g.drawText(juce::File(paths[i]).getFileName(), 8, 3 + i * rowH, width - 16, rowH,
+                           juce::Justification::centredLeft, true);
             }
             if (hasMore) {
                 g.drawText("+" + juce::String(paths.size() - maxRows) + " more", 8,
-                           3 + maxRows * rowH, width - 16, rowH,
-                           juce::Justification::centredLeft, true);
+                           3 + maxRows * rowH, width - 16, rowH, juce::Justification::centredLeft,
+                           true);
             }
         }
 

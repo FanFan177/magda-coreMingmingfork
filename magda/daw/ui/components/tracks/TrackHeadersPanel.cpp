@@ -11,6 +11,7 @@
 #include "../../../core/Config.hpp"
 #include "../../../core/DeviceInfo.hpp"
 #include "../../../core/ParameterUtils.hpp"
+#include "../../../core/PluginPreferences.hpp"
 #include "../../../core/RackInfo.hpp"
 #include "../../../core/SelectionManager.hpp"
 #include "../../../core/StringTable.hpp"
@@ -29,6 +30,36 @@ namespace magda {
 
 // dB conversion helpers for volume
 namespace {
+
+namespace te = tracktion::engine;
+
+// First synth (instrument) plugin on `trackId`, walking into racks. Returns
+// nullptr if the track has none.
+te::Plugin* findPrimaryInstrumentForTrack(TrackId trackId) {
+    auto* audioEngine = TrackManager::getInstance().getAudioEngine();
+    if (!audioEngine)
+        return nullptr;
+    auto* bridge = audioEngine->getAudioBridge();
+    if (!bridge)
+        return nullptr;
+    auto* teTrack = bridge->getAudioTrack(trackId);
+    if (!teTrack)
+        return nullptr;
+
+    for (auto* plugin : teTrack->pluginList) {
+        if (plugin != nullptr && plugin->isSynth())
+            return plugin;
+        if (auto* rackInstance = dynamic_cast<te::RackInstance*>(plugin)) {
+            if (rackInstance->type != nullptr) {
+                for (auto* innerPlugin : rackInstance->type->getPlugins()) {
+                    if (innerPlugin != nullptr && innerPlugin->isSynth())
+                        return innerPlugin;
+                }
+            }
+        }
+    }
+    return nullptr;
+}
 
 bool dragObjectToChainNodePathAt(const juce::DynamicObject& obj, int index, ChainNodePath& path) {
     path = {};
@@ -568,6 +599,24 @@ TrackHeadersPanel::TrackHeader::TrackHeader(const juce::String& trackName) : nam
     muteButton->setColour(juce::TextButton::textColourOnId,
                           DarkTheme::getColour(DarkTheme::BACKGROUND));
     muteButton->setClickingTogglesState(true);
+
+    // Master-only speaker mute (shown instead of the "M" button for the master),
+    // matching the inspector and mixer master strips.
+    {
+        auto onIcon = juce::Drawable::createFromImageData(BinaryData::speaker_on_svg,
+                                                          BinaryData::speaker_on_svgSize);
+        auto offIcon = juce::Drawable::createFromImageData(BinaryData::speaker_off_svg,
+                                                           BinaryData::speaker_off_svgSize);
+        masterMuteButton =
+            std::make_unique<juce::DrawableButton>("masterMute", juce::DrawableButton::ImageFitted);
+        masterMuteButton->setImages(onIcon.get(), nullptr, nullptr, nullptr, offIcon.get());
+        masterMuteButton->setEdgeIndent(0);
+        masterMuteButton->setClickingTogglesState(true);
+        masterMuteButton->setColour(juce::DrawableButton::backgroundColourId,
+                                    juce::Colours::transparentBlack);
+        masterMuteButton->setColour(juce::DrawableButton::backgroundOnColourId,
+                                    juce::Colours::transparentBlack);
+    }
 
     soloButton = std::make_unique<juce::TextButton>(tr("tracks.solo"));
     soloButton->setLookAndFeel(&magda::daw::ui::SmallButtonLookAndFeel::getInstance());
@@ -1150,6 +1199,8 @@ void TrackHeadersPanel::tracksChanged() {
         // Add components
         addAndMakeVisible(*header->nameLabel);
         addAndMakeVisible(*header->muteButton);
+        if (header->isMaster)
+            addChildComponent(*header->masterMuteButton);  // shown by layout for master
         addAndMakeVisible(*header->soloButton);
         addAndMakeVisible(*header->recordButton);
         addAndMakeVisible(*header->monitorButton);
@@ -1188,6 +1239,7 @@ void TrackHeadersPanel::tracksChanged() {
 
         // Update UI state
         header->muteButton->setToggleState(track->muted, juce::dontSendNotification);
+        header->masterMuteButton->setToggleState(track->muted, juce::dontSendNotification);
         header->soloButton->setToggleState(track->soloed, juce::dontSendNotification);
         header->recordButton->setToggleState(track->recordArmed, juce::dontSendNotification);
         header->volumeLabel->setValue(gainToDb(track->volume), juce::dontSendNotification);
@@ -1256,6 +1308,7 @@ void TrackHeadersPanel::trackPropertyChanged(int trackId) {
 
         header.nameLabel->setText(track->name, juce::dontSendNotification);
         header.muteButton->setToggleState(track->muted, juce::dontSendNotification);
+        header.masterMuteButton->setToggleState(track->muted, juce::dontSendNotification);
         header.soloButton->setToggleState(track->soloed, juce::dontSendNotification);
         header.recordButton->setToggleState(track->recordArmed, juce::dontSendNotification);
 
@@ -1842,6 +1895,17 @@ void TrackHeadersPanel::setupTrackHeaderWithId(TrackHeader& header, int trackId)
         }
     };
 
+    // Master uses the speaker toggle, which drives the master channel directly.
+    header.masterMuteButton->onClick = [this, trackId]() {
+        int index = getVisibleHeaderIndex(trackId);
+        if (index >= 0) {
+            auto& header = *trackHeaders[index];
+            header.muted = header.masterMuteButton->getToggleState();
+            UndoManager::getInstance().executeCommand(
+                std::make_unique<SetMasterMuteCommand>(header.muted));
+        }
+    };
+
     // Solo button callback - updates TrackManager
     header.soloButton->onClick = [this, trackId, getEditTargets]() {
         int index = getVisibleHeaderIndex(trackId);
@@ -2243,7 +2307,10 @@ void TrackHeadersPanel::layoutVolPanAndButtons(TrackHeader& header, juce::Rectan
         header.volumeLabel->setBounds(content.removeFromLeft(content.getWidth() - btnW - gap));
         header.volumeLabel->setVisible(true);
         content.removeFromLeft(gap);
-        header.muteButton->setBounds(content);
+        // Master uses the speaker toggle in place of the "M" button.
+        header.muteButton->setVisible(false);
+        header.masterMuteButton->setBounds(content.withSizeKeepingCentre(18, 18));
+        header.masterMuteButton->setVisible(true);
         header.soloButton->setVisible(false);
         header.panLabel->setVisible(false);
         header.recordButton->setVisible(false);
@@ -2859,6 +2926,7 @@ void TrackHeadersPanel::showContextMenu(int trackIndex, juce::Point<int> positio
         ToggleIORouting = 6,
         DuplicateContentOnly = 7,
         ToggleFreeze = 8,
+        PreferDrumGrid = 9,
 
         MoveToGroupBase = 100,
         AddSendBase = 500,
@@ -2987,66 +3055,84 @@ void TrackHeadersPanel::showContextMenu(int trackIndex, juce::Point<int> positio
 
     menu.addSeparator();
 
+    // Prefer Drum Grid for the track's primary instrument plugin. The flag
+    // lives at the plugin-identifier level (user-global), so all tracks using
+    // the same instrument get the same default editor.
+    auto* primaryInstrument = findPrimaryInstrumentForTrack(header.trackId);
+    if (primaryInstrument != nullptr) {
+        const auto identifier = primaryInstrument->getIdentifierString();
+        const bool prefersGrid =
+            magda::PluginPreferences::getInstance().prefersDrumGrid(identifier);
+        menu.addItem(PreferDrumGrid, "Prefer Drum Grid for " + primaryInstrument->getName(), true,
+                     prefersGrid);
+    }
+
     // Show/Hide I/O routing
     menu.addItem(ToggleIORouting, header.showIORouting ? tr("tracks.hide_io_routing")
                                                        : tr("tracks.show_io_routing"));
 
     // Show menu and handle result
-    menu.showMenuAsync(juce::PopupMenu::Options().withTargetScreenArea(
-                           localAreaToGlobal(juce::Rectangle<int>(position.x, position.y, 1, 1))),
-                       [this, trackId = header.trackId, trackIndex](int result) {
-                           // Force-dismiss the menu synchronously. JUCE's item-click path only
-                           // exits modal state and relies on async component destruction, which
-                           // leaves the popup visually lingering until the next input event.
-                           // dismissAllActiveMenus() routes through hide(nullptr, true) which
-                           // calls setVisible(false) immediately, so subsequent mutations that
-                           // rebuild the headers won't race the menu's close paint.
-                           juce::PopupMenu::dismissAllActiveMenus();
+    menu.showMenuAsync(
+        juce::PopupMenu::Options().withTargetScreenArea(
+            localAreaToGlobal(juce::Rectangle<int>(position.x, position.y, 1, 1))),
+        [this, trackId = header.trackId, trackIndex](int result) {
+            // Force-dismiss the menu synchronously. JUCE's item-click path only
+            // exits modal state and relies on async component destruction, which
+            // leaves the popup visually lingering until the next input event.
+            // dismissAllActiveMenus() routes through hide(nullptr, true) which
+            // calls setVisible(false) immediately, so subsequent mutations that
+            // rebuild the headers won't race the menu's close paint.
+            juce::PopupMenu::dismissAllActiveMenus();
 
-                           if (result == CollapseToggle) {
-                               handleCollapseToggle(trackId);
-                           } else if (result == RemoveFromGroup) {
-                               TrackManager::getInstance().removeTrackFromGroup(trackId);
-                           } else if (result == DeleteTrack) {
-                               auto cmd = std::make_unique<DeleteTrackCommand>(trackId);
-                               UndoManager::getInstance().executeCommand(std::move(cmd));
-                           } else if (result == DuplicateWithContent) {
-                               auto cmd = std::make_unique<DuplicateTrackCommand>(
-                                   trackId, /*duplicateContent=*/true, /*duplicateDevices=*/true);
-                               UndoManager::getInstance().executeCommand(std::move(cmd));
-                           } else if (result == DuplicateNoContent) {
-                               auto cmd = std::make_unique<DuplicateTrackCommand>(
-                                   trackId, /*duplicateContent=*/false, /*duplicateDevices=*/true);
-                               UndoManager::getInstance().executeCommand(std::move(cmd));
-                           } else if (result == DuplicateContentOnly) {
-                               auto cmd = std::make_unique<DuplicateTrackCommand>(
-                                   trackId, /*duplicateContent=*/true, /*duplicateDevices=*/false);
-                               UndoManager::getInstance().executeCommand(std::move(cmd));
-                           } else if (result == ToggleIORouting) {
-                               if (trackIndex >= 0 &&
-                                   trackIndex < static_cast<int>(trackHeaders.size())) {
-                                   trackHeaders[trackIndex]->showIORouting =
-                                       !trackHeaders[trackIndex]->showIORouting;
-                                   resized();
-                               }
-                           } else if (result == ToggleFreeze) {
-                               auto* t = TrackManager::getInstance().getTrack(trackId);
-                               if (t) {
-                                   TrackManager::getInstance().setTrackFrozen(trackId, !t->frozen);
-                               }
-                           } else if (result >= RemoveSendBase) {
-                               int busIndex = result - RemoveSendBase;
-                               TrackManager::getInstance().removeSend(trackId, busIndex);
-                           } else if (result >= AddSendBase) {
-                               // Checked after RemoveSendBase to avoid collision when trackId
-                               // pushes the value past 600.
-                               TrackId auxId = result - AddSendBase;
-                               TrackManager::getInstance().addSend(trackId, auxId);
-                           } else if (result >= MoveToGroupBase) {
-                               TrackId groupId = result - MoveToGroupBase;
-                               TrackManager::getInstance().addTrackToGroup(trackId, groupId);
-                           }
-                       });
+            if (result == CollapseToggle) {
+                handleCollapseToggle(trackId);
+            } else if (result == RemoveFromGroup) {
+                TrackManager::getInstance().removeTrackFromGroup(trackId);
+            } else if (result == DeleteTrack) {
+                auto cmd = std::make_unique<DeleteTrackCommand>(trackId);
+                UndoManager::getInstance().executeCommand(std::move(cmd));
+            } else if (result == DuplicateWithContent) {
+                auto cmd = std::make_unique<DuplicateTrackCommand>(
+                    trackId, /*duplicateContent=*/true, /*duplicateDevices=*/true);
+                UndoManager::getInstance().executeCommand(std::move(cmd));
+            } else if (result == DuplicateNoContent) {
+                auto cmd = std::make_unique<DuplicateTrackCommand>(
+                    trackId, /*duplicateContent=*/false, /*duplicateDevices=*/true);
+                UndoManager::getInstance().executeCommand(std::move(cmd));
+            } else if (result == DuplicateContentOnly) {
+                auto cmd = std::make_unique<DuplicateTrackCommand>(
+                    trackId, /*duplicateContent=*/true, /*duplicateDevices=*/false);
+                UndoManager::getInstance().executeCommand(std::move(cmd));
+            } else if (result == ToggleIORouting) {
+                if (trackIndex >= 0 && trackIndex < static_cast<int>(trackHeaders.size())) {
+                    trackHeaders[trackIndex]->showIORouting =
+                        !trackHeaders[trackIndex]->showIORouting;
+                    resized();
+                }
+            } else if (result == ToggleFreeze) {
+                auto* t = TrackManager::getInstance().getTrack(trackId);
+                if (t) {
+                    TrackManager::getInstance().setTrackFrozen(trackId, !t->frozen);
+                }
+            } else if (result == PreferDrumGrid) {
+                if (auto* plugin = findPrimaryInstrumentForTrack(trackId)) {
+                    auto& prefs = magda::PluginPreferences::getInstance();
+                    const auto identifier = plugin->getIdentifierString();
+                    prefs.setPrefersDrumGrid(identifier, !prefs.prefersDrumGrid(identifier));
+                }
+            } else if (result >= RemoveSendBase) {
+                int busIndex = result - RemoveSendBase;
+                TrackManager::getInstance().removeSend(trackId, busIndex);
+            } else if (result >= AddSendBase) {
+                // Checked after RemoveSendBase to avoid collision when trackId
+                // pushes the value past 600.
+                TrackId auxId = result - AddSendBase;
+                TrackManager::getInstance().addSend(trackId, auxId);
+            } else if (result >= MoveToGroupBase) {
+                TrackId groupId = result - MoveToGroupBase;
+                TrackManager::getInstance().addTrackToGroup(trackId, groupId);
+            }
+        });
 }
 
 void TrackHeadersPanel::toggleRouting(int trackIndex, RoutingType type) {
@@ -3439,7 +3525,7 @@ void TrackHeadersPanel::showAutomationMenu(TrackId trackId, juce::Component* rel
                 int itemId = kDeviceParamBase + static_cast<int>(deviceParamTargets->size());
                 bool ticked = isTargetShown(target);
                 deviceParamTargets->push_back(target);
-                trackMacrosMenu.addItem(itemId, macro.name, true, ticked);
+                trackMacrosMenu.addItem(itemId, getDisplayNameForTarget(target), true, ticked);
                 any = true;
             }
             if (any)
@@ -3463,7 +3549,7 @@ void TrackHeadersPanel::showAutomationMenu(TrackId trackId, juce::Component* rel
                 int itemId = kDeviceParamBase + static_cast<int>(deviceParamTargets->size());
                 bool ticked = isTargetShown(target);
                 deviceParamTargets->push_back(target);
-                trackModsMenu.addItem(itemId, mod.name + " Rate", true, ticked);
+                trackModsMenu.addItem(itemId, getDisplayNameForTarget(target), true, ticked);
                 any = true;
             }
             if (any)
@@ -3556,7 +3642,8 @@ void TrackHeadersPanel::showAutomationMenu(TrackId trackId, juce::Component* rel
                                     kDeviceParamBase + static_cast<int>(deviceParamTargets->size());
                                 bool ticked = isTargetShown(target);
                                 deviceParamTargets->push_back(target);
-                                modsMenu.addItem(itemId, mod.name + " Rate", true, ticked);
+                                modsMenu.addItem(itemId, getDisplayNameForTarget(target), true,
+                                                 ticked);
                                 any = true;
                             }
                             if (any)
@@ -3581,7 +3668,8 @@ void TrackHeadersPanel::showAutomationMenu(TrackId trackId, juce::Component* rel
                                     kDeviceParamBase + static_cast<int>(deviceParamTargets->size());
                                 bool ticked = isTargetShown(target);
                                 deviceParamTargets->push_back(target);
-                                macrosMenu.addItem(itemId, macro.name, true, ticked);
+                                macrosMenu.addItem(itemId, getDisplayNameForTarget(target), true,
+                                                   ticked);
                                 any = true;
                             }
                             if (any)
@@ -3613,7 +3701,8 @@ void TrackHeadersPanel::showAutomationMenu(TrackId trackId, juce::Component* rel
                                     kDeviceParamBase + static_cast<int>(deviceParamTargets->size());
                                 bool ticked = isTargetShown(target);
                                 deviceParamTargets->push_back(target);
-                                modsMenu.addItem(itemId, mod.name + " Rate", true, ticked);
+                                modsMenu.addItem(itemId, getDisplayNameForTarget(target), true,
+                                                 ticked);
                                 any = true;
                             }
                             if (any)
@@ -3638,7 +3727,8 @@ void TrackHeadersPanel::showAutomationMenu(TrackId trackId, juce::Component* rel
                                     kDeviceParamBase + static_cast<int>(deviceParamTargets->size());
                                 bool ticked = isTargetShown(target);
                                 deviceParamTargets->push_back(target);
-                                macrosMenu.addItem(itemId, macro.name, true, ticked);
+                                macrosMenu.addItem(itemId, getDisplayNameForTarget(target), true,
+                                                   ticked);
                                 any = true;
                             }
                             if (any)
