@@ -88,6 +88,38 @@ std::optional<std::string> selectedString(const juce::ComboBox& cb,
     return table[static_cast<size_t>(id - 1)].toStdString();
 }
 
+class IndexTagOptionsComponent final : public juce::Component {
+  public:
+    IndexTagOptionsComponent() {
+        addAndMakeVisible(includeRootFolderName_);
+        addAndMakeVisible(includePathNodes_);
+
+        includeRootFolderName_.setToggleState(true, juce::dontSendNotification);
+        includePathNodes_.setToggleState(false, juce::dontSendNotification);
+
+        setSize(280, 58);
+    }
+
+    bool includeRootFolderName() const {
+        return includeRootFolderName_.getToggleState();
+    }
+
+    bool includePathNodes() const {
+        return includePathNodes_.getToggleState();
+    }
+
+    void resized() override {
+        auto bounds = getLocalBounds();
+        includeRootFolderName_.setBounds(bounds.removeFromTop(24));
+        bounds.removeFromTop(6);
+        includePathNodes_.setBounds(bounds.removeFromTop(24));
+    }
+
+  private:
+    juce::ToggleButton includeRootFolderName_{"Use folder name"};
+    juce::ToggleButton includePathNodes_{"Use subfolder names"};
+};
+
 juce::String prettyDuration(std::optional<double> seconds) {
     if (!seconds) {
         return "-";
@@ -104,6 +136,46 @@ juce::String displayNameFor(const magda::media::QueryResult& result) {
         return juce::String(*result.displayName);
     }
     return juce::String(result.path.filename().string());
+}
+
+// A compact, branded chip used as the drag image for preset rows. macOS would
+// otherwise show the generic blank-document icon for an unregistered .mps; this
+// gives a clear, distinctive snapshot naming the preset(s) being dragged.
+juce::Image makePresetDragImage(const juce::StringArray& names) {
+    const juce::String text =
+        names.size() == 1 ? names[0] : (juce::String(names.size()) + " presets");
+    auto font = FontManager::getInstance().getUIFont(12.0F);
+    const int textW = juce::GlyphArrangement::getStringWidthInt(font, text);
+    const int padLeft = 26;  // room for the glyph
+    const int padRight = 12;
+    const int width = juce::jlimit(90, 260, padLeft + textW + padRight);
+    const int height = 26;
+
+    juce::Image img(juce::Image::ARGB, width, height, true);
+    juce::Graphics g(img);
+
+    auto bounds =
+        juce::Rectangle<float>(0.0F, 0.0F, static_cast<float>(width), static_cast<float>(height))
+            .reduced(0.5F);
+    g.setColour(DarkTheme::getColour(DarkTheme::SURFACE).withAlpha(0.96F));
+    g.fillRoundedRectangle(bounds, 6.0F);
+    g.setColour(DarkTheme::getColour(DarkTheme::ACCENT_BLUE));
+    g.drawRoundedRectangle(bounds, 6.0F, 1.5F);
+
+    // Two offset squares read as a stacked "preset".
+    const float gy = static_cast<float>(height) * 0.5F;
+    g.setColour(DarkTheme::getColour(DarkTheme::ACCENT_BLUE));
+    g.fillRoundedRectangle(8.0F, gy - 6.0F, 8.0F, 8.0F, 2.0F);
+    g.setColour(DarkTheme::getColour(DarkTheme::SURFACE).withAlpha(0.96F));
+    g.fillRoundedRectangle(11.0F, gy - 2.5F, 8.0F, 8.0F, 2.0F);
+    g.setColour(DarkTheme::getColour(DarkTheme::ACCENT_BLUE));
+    g.drawRoundedRectangle(11.0F, gy - 2.5F, 8.0F, 8.0F, 2.0F, 1.0F);
+
+    g.setColour(DarkTheme::getColour(DarkTheme::TEXT_PRIMARY));
+    g.setFont(font);
+    g.drawText(text, juce::Rectangle<int>(padLeft, 0, width - padLeft - padRight, height),
+               juce::Justification::centredLeft, true);
+    return img;
 }
 
 std::filesystem::path normalizedPath(const std::filesystem::path& path) {
@@ -695,16 +767,43 @@ class MediaDbBrowserContent::ResultsTableModel : public juce::TableListBoxModel 
             return {};
         }
         juce::StringArray paths;
+        juce::StringArray presetNames;
+        bool allPresets = true;
         for (int i = 0; i < selectedRows.size(); ++i) {
             const int row = selectedRows[i];
             if (row < 0 || row >= static_cast<int>(owner_.results_.size())) {
                 continue;
             }
-            paths.addIfNotAlreadyThere(
-                juce::String(owner_.results_[static_cast<size_t>(row)].path.string()));
+            const auto& result = owner_.results_[static_cast<size_t>(row)];
+            paths.addIfNotAlreadyThere(juce::String(result.path.string()));
+            if (result.kind == "preset") {
+                presetNames.add(displayNameFor(result));
+            } else {
+                allPresets = false;
+            }
         }
         if (paths.isEmpty()) {
             return {};
+        }
+
+        // Preset rows: drive a JUCE-internal drag with a clean, branded image on
+        // every platform. The in-app preset drop targets (track FX chain,
+        // arrangement) recognise the {type:"files"} payload, and presets aren't
+        // dragged out to Finder, so the OS file-drag route isn't needed here.
+        // This also avoids macOS showing the generic blank-document .mps icon.
+        if (allPresets) {
+            juce::Array<juce::var> pathArray;
+            for (const auto& p : paths)
+                pathArray.add(p);
+            auto* obj = new juce::DynamicObject();
+            obj->setProperty("type", juce::var("files"));
+            obj->setProperty("paths", juce::var(pathArray));
+            juce::var description(obj);
+            if (auto* container = juce::DragAndDropContainer::findParentDragContainerFor(&owner_)) {
+                container->startDragging(description, &owner_,
+                                         juce::ScaledImage(makePresetDragImage(presetNames)));
+            }
+            return {};  // we started the drag ourselves; suppress ListBox's default
         }
 #if JUCE_LINUX
         juce::Array<juce::var> pathArray;
@@ -2057,38 +2156,31 @@ void MediaDbBrowserContent::startIndexing(const juce::File& dir,
                                             "Optional tags are written to each scanned media row.",
                                             juce::MessageBoxIconType::NoIcon);
         alert->addTextEditor("custom_tags", "", "Tags:");
-        juce::StringArray yesNo;
-        yesNo.add("No");
-        yesNo.add("Yes");
-        alert->addComboBox("folder_tag", yesNo, "Use folder name:");
-        alert->addComboBox("path_tags", yesNo, "Use subfolder names:");
-        if (auto* cb = alert->getComboBoxComponent("folder_tag")) {
-            cb->setSelectedId(2, juce::dontSendNotification);
-        }
-        if (auto* cb = alert->getComboBoxComponent("path_tags")) {
-            cb->setSelectedId(1, juce::dontSendNotification);
-        }
+        // AlertWindow::addCustomComponent does NOT take ownership (it holds a
+        // plain Array<Component*>, not an OwnedArray), so this component must be
+        // deleted by us alongside the alert in every callback path below.
+        auto* tagOptionsComponent = new IndexTagOptionsComponent();
+        alert->addCustomComponent(tagOptionsComponent);
         alert->addButton("Start", 1, juce::KeyPress(juce::KeyPress::returnKey));
         alert->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
 
         const juce::Component::SafePointer<MediaDbBrowserContent> self(this);
         alert->enterModalState(
-            true, juce::ModalCallbackFunction::create([alert, self, dir, mode](int result) mutable {
+            true, juce::ModalCallbackFunction::create([alert, tagOptionsComponent, self, dir,
+                                                       mode](int result) mutable {
                 if (result != 1) {
                     delete alert;
+                    delete tagOptionsComponent;
                     return;
                 }
 
                 magda::media::MediaDbIndexer::ScanTagOptions options;
                 options.root = std::filesystem::path(dir.getFullPathName().toStdString());
                 options.customTags = parseTags(alert->getTextEditorContents("custom_tags"));
-                if (auto* cb = alert->getComboBoxComponent("folder_tag")) {
-                    options.includeRootFolderName = cb->getSelectedId() == 2;
-                }
-                if (auto* cb = alert->getComboBoxComponent("path_tags")) {
-                    options.includePathNodes = cb->getSelectedId() == 2;
-                }
+                options.includeRootFolderName = tagOptionsComponent->includeRootFolderName();
+                options.includePathNodes = tagOptionsComponent->includePathNodes();
                 delete alert;
+                delete tagOptionsComponent;
 
                 if (self != nullptr) {
                     self->startIndexingWithOptions(dir, mode, std::move(options));
