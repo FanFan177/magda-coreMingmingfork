@@ -12,6 +12,7 @@
 #include "../components/chain/custom_ui/SpectrumAnalyzerUI.hpp"
 #include "../components/common/MixerDebugPanel.hpp"
 #include "../components/common/TextSlider.hpp"
+#include "../components/mixer/ClickableLabel.hpp"
 #include "../components/mixer/MasterChannelStrip.hpp"
 #include "../components/mixer/MiniChainRow.hpp"
 #include "../components/mixer/MixerToggleRail.hpp"
@@ -114,6 +115,9 @@ class MixerView : public juce::Component,
 
         void setMeterLevel(float level);
         void setMeterLevels(float leftLevel, float rightLevel);
+
+        // Clear the held peak value (resets the readout to -inf).
+        void resetPeak();
         float getMeterLevel() const {
             return meterLevel;
         }
@@ -145,6 +149,9 @@ class MixerView : public juce::Component,
         bool isMaster_;
         bool isChildTrack_ = false;
         bool selected = false;
+        // Dedup for double-delivered mouse events (self mouse listener); see
+        // ChannelStrip::mouseDown
+        juce::Time lastMouseDownEventTime_;
         float meterLevel = 0.0f;
         juce::Colour trackColour_;
         juce::String trackName_;
@@ -166,7 +173,7 @@ class MixerView : public juce::Component,
         // Meter component
         class LevelMeter;
         std::unique_ptr<LevelMeter> levelMeter;
-        std::unique_ptr<juce::Label> peakLabel;
+        std::unique_ptr<ClickableLabel> peakLabel;
         float peakValue_ = 0.0f;
 
         // Stored bounds for layout regions
@@ -323,6 +330,7 @@ class MixerView : public juce::Component,
     // Spectrum Analyzer post-FX device to match the mixer rail toggles.
     void reconcileAnalysisDevices();
     bool isResizeDragging_ = false;
+    bool wasPlaying_ = false;  // tracks transport edge to auto-reset peak holds
     bool pendingResizeUpdate_ = false;
     bool pendingSendResizeUpdate_ = false;
 

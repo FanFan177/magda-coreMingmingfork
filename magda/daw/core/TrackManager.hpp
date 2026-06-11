@@ -193,6 +193,8 @@ class TrackManager {
     // Track operations
     TrackId createTrack(const juce::String& name = "", TrackType type = TrackType::Audio);
     TrackId createGroupTrack(const juce::String& name = "");
+    TrackId groupTracks(const std::vector<TrackId>& trackIds, const juce::String& name = "Group");
+    std::vector<TrackId> ungroupTrack(TrackId groupId);
     void deleteTrack(TrackId trackId);
     /**
      * Duplicate a track. When `includeDevices` is false, the new track is
@@ -211,6 +213,14 @@ class TrackManager {
     // is what moves a child up/down inside a group). Inserts childId just before
     // beforeChildId; pass INVALID_TRACK_ID to move it to the end of the group.
     void moveChildWithinGroup(TrackId childId, TrackId beforeChildId);
+    // Move a track to a 1-based position among its siblings (its parent group's
+    // children, or the top-level tracks). Hierarchy-aware: a grouped track
+    // reorders within its group; a top-level track (incl. a group header)
+    // reorders among top-level tracks, its own children following via the tree.
+    // Position is clamped to the sibling range.
+    void moveTrackToPosition(TrackId trackId, int oneBasedPosition);
+    // 1-based position of a track among its siblings (0 if not found).
+    int getTrackSiblingPosition(TrackId trackId) const;
     TrackId createTrackInGroup(TrackId groupId, const juce::String& name = "",
                                TrackType type = TrackType::Audio);
     std::vector<TrackId> getChildTracks(TrackId groupId) const;
@@ -278,6 +288,12 @@ class TrackManager {
     // Signal chain management (unified list of devices and racks)
     const std::vector<ChainElement>& getChainElements(TrackId trackId) const;
     void moveNode(TrackId trackId, int fromIndex, int toIndex);
+
+    /// Effect inserts on a track, in order, as display strings (e.g. "Pro-Q 3",
+    /// "1176 (bypassed)"), recursing racks and skipping instrument / MIDI /
+    /// analysis devices. Empty = no processing yet. Used as the mixing agent's
+    /// raw-vs-worked signal (#886).
+    std::vector<std::string> getChainSummary(TrackId trackId) const;
 
     // Post-fader FX chain (flat device list; never racks or instruments).
     // Getting/removing a post-fx device goes through the path-based APIs
@@ -362,12 +378,22 @@ class TrackManager {
     void removeChainByPath(const ChainNodePath& chainPath);  // Path-based removal for nested chains
     ChainInfo* getChain(TrackId trackId, RackId rackId, ChainId chainId);
     const ChainInfo* getChain(TrackId trackId, RackId rackId, ChainId chainId) const;
+    ChainInfo* getChainByPath(const ChainNodePath& chainPath);  // Nested-chain lookup
+    const ChainInfo* getChainByPath(const ChainNodePath& chainPath) const;
     void setChainOutput(TrackId trackId, RackId rackId, ChainId chainId, int outputIndex);
     void setChainMuted(TrackId trackId, RackId rackId, ChainId chainId, bool muted);
     void setChainBypassed(TrackId trackId, RackId rackId, ChainId chainId, bool bypassed);
     void setChainSolo(TrackId trackId, RackId rackId, ChainId chainId, bool solo);
     void setChainVolume(TrackId trackId, RackId rackId, ChainId chainId, float volume);
     void setChainPan(TrackId trackId, RackId rackId, ChainId chainId, float pan);
+    void setChainName(TrackId trackId, RackId rackId, ChainId chainId, const juce::String& name);
+
+    // Path-based chain setters (nesting-aware; used by multi-chain edit fan-out).
+    void setChainMuted(const ChainNodePath& chainPath, bool muted);
+    void setChainBypassed(const ChainNodePath& chainPath, bool bypassed);
+    void setChainSolo(const ChainNodePath& chainPath, bool solo);
+    void setChainVolume(const ChainNodePath& chainPath, float volume);
+    void setChainPan(const ChainNodePath& chainPath, float pan);
     void setChainExpanded(TrackId trackId, RackId rackId, ChainId chainId, bool expanded);
     void setRackVolume(TrackId trackId, RackId rackId, float volume);
     void setRackVolume(const ChainNodePath& rackPath, float volume);
@@ -717,6 +743,33 @@ class TrackManager {
     // UI to rebuild once the final state is in place.
     void notifyTracksChanged();
 
+    /**
+     * @brief Suspend and coalesce structural tracksChanged() notifications.
+     *
+     * Nestable. While any suspension is active, notifyTracksChanged() records
+     * that a change happened instead of firing; when the outermost suspension
+     * ends a single tracksChanged() fires. Intended for bulk multi-track
+     * mutations (AI fan-out, grouping N tracks) where firing per track causes
+     * O(n) full rebuilds of every track/mixer panel and hangs the UI.
+     *
+     * Must be used on the message thread. Mirrors ClipManager::BatchScope.
+     */
+    void beginBatch();
+    void endBatch();
+
+    /// RAII helper for beginBatch/endBatch.
+    class BatchScope {
+      public:
+        BatchScope() {
+            TrackManager::getInstance().beginBatch();
+        }
+        ~BatchScope() {
+            TrackManager::getInstance().endBatch();
+        }
+        BatchScope(const BatchScope&) = delete;
+        BatchScope& operator=(const BatchScope&) = delete;
+    };
+
   private:
     TrackManager();
     ~TrackManager() = default;
@@ -730,6 +783,12 @@ class TrackManager {
     std::vector<TrackInfo> tracks_;
     std::vector<TrackManagerListener*> listeners_;
     int notifyDepth_ = 0;
+
+    // Batch coalescing for structural notifications (see beginBatch()). While
+    // batchDepth_ > 0, notifyTracksChanged() sets the pending flag instead of
+    // firing; endBatch() fires once when the outermost scope closes.
+    int batchDepth_ = 0;
+    bool tracksChangedPending_ = false;
 
     // RAII guard for safe listener iteration. While active, removeListener()
     // nullifies entries instead of erasing. On destruction, compacts the list.

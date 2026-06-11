@@ -385,12 +385,6 @@ ClipId ClipManager::createAudioClipBeats(TrackId trackId, double startBeats, dou
         const double cachedBPM = thumbs.getCachedBPM(audioFilePath);
         if (cachedBPM > 0.0) {
             applyDetectedBPM(cachedBPM);
-        } else {
-            thumbs.requestBPMDetection(audioFilePath, [applyDetectedBPM](double detectedBPM) {
-                if (detectedBPM <= 0.0)
-                    return;
-                applyDetectedBPM(detectedBPM);
-            });
         }
     }
 
@@ -1914,6 +1908,16 @@ bool ClipManager::addMidiNote(ClipId clipId, const MidiNote& note) {
         }
     }
     return false;
+}
+
+void ClipManager::setMidiNotePitchExpression(ClipId clipId, size_t noteIndex,
+                                             std::vector<MidiPitchExpressionPoint> points) {
+    if (auto* clip = getClip(clipId)) {
+        if (clip->isMidi() && noteIndex < clip->midiNotes.size()) {
+            clip->midiNotes[noteIndex].pitchExpression = std::move(points);
+            notifyClipPropertyChanged(clipId);
+        }
+    }
 }
 
 void ClipManager::removeMidiNote(ClipId clipId, int noteIndex) {

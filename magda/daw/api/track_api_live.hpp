@@ -8,7 +8,9 @@ namespace magda {
 class TrackApiLive : public TrackApi {
   public:
     TrackId createTrack(const juce::String& name, TrackType type) override;
+    TrackId groupTracks(const std::vector<TrackId>& trackIds, const juce::String& name) override;
     void deleteTrack(TrackId trackId) override;
+    void moveTrackToPosition(TrackId trackId, int oneBasedPosition) override;
 
     int getNumTracks() const override;
     const std::vector<TrackInfo>& getTracks() const override;
@@ -16,6 +18,7 @@ class TrackApiLive : public TrackApi {
     const TrackInfo* getTrack(TrackId trackId) const override;
 
     void setTrackName(TrackId trackId, const juce::String& name) override;
+    void setTrackColour(TrackId trackId, juce::Colour colour) override;
     void setTrackVolume(TrackId trackId, float volume, bool fromAutomation) override;
     void setTrackPan(TrackId trackId, float pan, bool fromAutomation) override;
     void setTrackMuted(TrackId trackId, bool muted) override;

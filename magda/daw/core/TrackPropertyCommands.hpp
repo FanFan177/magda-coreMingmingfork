@@ -1,9 +1,32 @@
 #pragma once
 
+#include <algorithm>
+
 #include "TrackManager.hpp"
 #include "UndoManager.hpp"
 
 namespace magda {
+
+/**
+ * @brief The child that currently follows @p trackId in its parent group's
+ * childIds list, or INVALID_TRACK_ID if it is the last child / not grouped.
+ *
+ * Captured before a reorder so undo can re-insert the track at the same spot
+ * via moveChildWithinGroup(trackId, sibling).
+ */
+inline TrackId siblingAfterInGroup(TrackId trackId) {
+    const auto* track = TrackManager::getInstance().getTrack(trackId);
+    if (!track || !track->hasParent())
+        return INVALID_TRACK_ID;
+    const auto* parent = TrackManager::getInstance().getTrack(track->parentId);
+    if (!parent)
+        return INVALID_TRACK_ID;
+    const auto& children = parent->childIds;
+    auto it = std::find(children.begin(), children.end(), trackId);
+    if (it == children.end() || std::next(it) == children.end())
+        return INVALID_TRACK_ID;
+    return *std::next(it);
+}
 
 /**
  * @brief Command for setting track volume (supports merging for slider drags)
@@ -159,6 +182,237 @@ class SetTrackInputMonitorCommand : public UndoableCommand {
 };
 
 /**
+ * @brief Command for moving a track to a 1-based position among its siblings.
+ *
+ * Undo restores the track's original sibling position (captured at construction),
+ * which round-trips a stable reorder.
+ */
+class MoveTrackCommand : public UndoableCommand {
+  public:
+    MoveTrackCommand(TrackId trackId, int newPosition)
+        : trackId_(trackId), newPosition_(newPosition) {
+        oldPosition_ = TrackManager::getInstance().getTrackSiblingPosition(trackId);
+    }
+
+    void execute() override {
+        TrackManager::getInstance().moveTrackToPosition(trackId_, newPosition_);
+    }
+    void undo() override {
+        if (oldPosition_ > 0)
+            TrackManager::getInstance().moveTrackToPosition(trackId_, oldPosition_);
+    }
+    juce::String getDescription() const override {
+        return "Move Track";
+    }
+
+  private:
+    TrackId trackId_;
+    int newPosition_;
+    int oldPosition_ = 0;
+};
+
+/**
+ * @brief Command for grouping tracks. Undo dissolves the created group.
+ *
+ * Faithful for the common case of grouping contiguous tracks; ungroup returns
+ * the children to the parent level at the group's position. Redo re-groups the
+ * same (still-existing) tracks.
+ */
+class GroupTracksCommand : public UndoableCommand {
+  public:
+    GroupTracksCommand(std::vector<TrackId> trackIds, juce::String name)
+        : trackIds_(std::move(trackIds)), name_(std::move(name)) {}
+
+    void execute() override {
+        groupId_ = TrackManager::getInstance().groupTracks(trackIds_, name_);
+    }
+    void undo() override {
+        if (groupId_ != INVALID_TRACK_ID)
+            TrackManager::getInstance().ungroupTrack(groupId_);
+    }
+    juce::String getDescription() const override {
+        return "Group Tracks";
+    }
+    TrackId getCreatedGroupId() const {
+        return groupId_;
+    }
+
+  private:
+    std::vector<TrackId> trackIds_;
+    juce::String name_;
+    TrackId groupId_ = INVALID_TRACK_ID;
+};
+
+/**
+ * @brief Command for ungrouping a group track. Undo re-groups the children.
+ */
+class UngroupTrackCommand : public UndoableCommand {
+  public:
+    explicit UngroupTrackCommand(TrackId groupId) : ungroupTarget_(groupId) {
+        if (const auto* group = TrackManager::getInstance().getTrack(groupId)) {
+            name_ = group->name;
+            children_ = group->childIds;
+        }
+    }
+
+    void execute() override {
+        TrackManager::getInstance().ungroupTrack(ungroupTarget_);
+    }
+    void undo() override {
+        if (children_.size() >= 2) {
+            // Re-group the children; track the new group so redo ungroups it.
+            ungroupTarget_ = TrackManager::getInstance().groupTracks(children_, name_);
+        }
+    }
+    juce::String getDescription() const override {
+        return "Ungroup Track";
+    }
+
+    /// The children captured before ungrouping (for callers that select them).
+    const std::vector<TrackId>& getChildren() const {
+        return children_;
+    }
+
+  private:
+    TrackId ungroupTarget_;
+    juce::String name_;
+    std::vector<TrackId> children_;
+};
+
+/**
+ * @brief Command for moving a track to a flat index in the track list.
+ *
+ * Mirrors TrackManager::moveTrack (0-based flat-vector reorder, used by the
+ * drag-reorder gesture). Captures the track's index before the move and
+ * restores it on undo.
+ */
+class MoveTrackToIndexCommand : public UndoableCommand {
+  public:
+    MoveTrackToIndexCommand(TrackId trackId, int newIndex)
+        : trackId_(trackId), newIndex_(newIndex) {}
+
+    void execute() override {
+        auto& tm = TrackManager::getInstance();
+        oldIndex_ = tm.getTrackIndex(trackId_);
+        tm.moveTrack(trackId_, newIndex_);
+    }
+    void undo() override {
+        if (oldIndex_ >= 0)
+            TrackManager::getInstance().moveTrack(trackId_, oldIndex_);
+    }
+    juce::String getDescription() const override {
+        return "Move Track";
+    }
+
+  private:
+    TrackId trackId_;
+    int newIndex_;
+    int oldIndex_ = -1;
+};
+
+/**
+ * @brief Command for reordering a track within its parent group's children.
+ *
+ * Mirrors TrackManager::moveChildWithinGroup. Captures the following sibling so
+ * undo re-inserts the track at its original position.
+ */
+class MoveChildWithinGroupCommand : public UndoableCommand {
+  public:
+    MoveChildWithinGroupCommand(TrackId childId, TrackId beforeChildId)
+        : childId_(childId), beforeChildId_(beforeChildId) {}
+
+    void execute() override {
+        oldBeforeChildId_ = siblingAfterInGroup(childId_);
+        TrackManager::getInstance().moveChildWithinGroup(childId_, beforeChildId_);
+    }
+    void undo() override {
+        TrackManager::getInstance().moveChildWithinGroup(childId_, oldBeforeChildId_);
+    }
+    juce::String getDescription() const override {
+        return "Move Track in Group";
+    }
+
+  private:
+    TrackId childId_;
+    TrackId beforeChildId_;
+    TrackId oldBeforeChildId_ = INVALID_TRACK_ID;
+};
+
+/**
+ * @brief Command for adding a track to a group. Undo restores the track's
+ * previous parent (and position within it) or returns it to the top level,
+ * along with its audio output routing.
+ */
+class AddTrackToGroupCommand : public UndoableCommand {
+  public:
+    AddTrackToGroupCommand(TrackId trackId, TrackId groupId)
+        : trackId_(trackId), groupId_(groupId) {}
+
+    void execute() override {
+        auto& tm = TrackManager::getInstance();
+        const auto* track = tm.getTrack(trackId_);
+        oldParentId_ = track ? track->parentId : INVALID_TRACK_ID;
+        oldBeforeChildId_ = siblingAfterInGroup(trackId_);
+        oldAudioOutput_ = track ? track->audioOutputDevice : juce::String();
+        tm.addTrackToGroup(trackId_, groupId_);
+    }
+    void undo() override {
+        auto& tm = TrackManager::getInstance();
+        tm.removeTrackFromGroup(trackId_);
+        if (oldParentId_ != INVALID_TRACK_ID) {
+            tm.addTrackToGroup(trackId_, oldParentId_);
+            tm.moveChildWithinGroup(trackId_, oldBeforeChildId_);
+        }
+        tm.setTrackAudioOutput(trackId_, oldAudioOutput_);
+    }
+    juce::String getDescription() const override {
+        return "Add Track to Group";
+    }
+
+  private:
+    TrackId trackId_;
+    TrackId groupId_;
+    TrackId oldParentId_ = INVALID_TRACK_ID;
+    TrackId oldBeforeChildId_ = INVALID_TRACK_ID;
+    juce::String oldAudioOutput_;
+};
+
+/**
+ * @brief Command for removing a track from its group. Undo re-adds it to its
+ * previous parent at its original position and restores its audio output.
+ */
+class RemoveTrackFromGroupCommand : public UndoableCommand {
+  public:
+    explicit RemoveTrackFromGroupCommand(TrackId trackId) : trackId_(trackId) {}
+
+    void execute() override {
+        auto& tm = TrackManager::getInstance();
+        const auto* track = tm.getTrack(trackId_);
+        oldParentId_ = track ? track->parentId : INVALID_TRACK_ID;
+        oldBeforeChildId_ = siblingAfterInGroup(trackId_);
+        oldAudioOutput_ = track ? track->audioOutputDevice : juce::String();
+        tm.removeTrackFromGroup(trackId_);
+    }
+    void undo() override {
+        if (oldParentId_ == INVALID_TRACK_ID)
+            return;
+        auto& tm = TrackManager::getInstance();
+        tm.addTrackToGroup(trackId_, oldParentId_);
+        tm.moveChildWithinGroup(trackId_, oldBeforeChildId_);
+        tm.setTrackAudioOutput(trackId_, oldAudioOutput_);
+    }
+    juce::String getDescription() const override {
+        return "Remove Track from Group";
+    }
+
+  private:
+    TrackId trackId_;
+    TrackId oldParentId_ = INVALID_TRACK_ID;
+    TrackId oldBeforeChildId_ = INVALID_TRACK_ID;
+    juce::String oldAudioOutput_;
+};
+
+/**
  * @brief Command for setting track name
  */
 class SetTrackNameCommand : public UndoableCommand {
@@ -226,6 +480,82 @@ class SetSendLevelCommand : public UndoableCommand {
     TrackId trackId_;
     int busIndex_;
     float oldLevel_ = 1.0f, newLevel_;
+};
+
+/**
+ * @brief Command for adding a send from one track to another (aux bus).
+ */
+class AddSendCommand : public UndoableCommand {
+  public:
+    AddSendCommand(TrackId sourceTrackId, TrackId destTrackId)
+        : sourceTrackId_(sourceTrackId), destTrackId_(destTrackId) {}
+
+    void execute() override {
+        auto& tm = TrackManager::getInstance();
+        tm.addSend(sourceTrackId_, destTrackId_);
+        // Capture the bus index that addSend assigned so undo can remove exactly
+        // this send (addSend auto-allocates the dest's aux bus index).
+        busIndex_ = -1;
+        if (const auto* source = tm.getTrack(sourceTrackId_)) {
+            for (const auto& send : source->sends) {
+                if (send.destTrackId == destTrackId_) {
+                    busIndex_ = send.busIndex;
+                    break;
+                }
+            }
+        }
+    }
+    void undo() override {
+        if (busIndex_ >= 0)
+            TrackManager::getInstance().removeSend(sourceTrackId_, busIndex_);
+    }
+    juce::String getDescription() const override {
+        return "Add Send";
+    }
+
+  private:
+    TrackId sourceTrackId_;
+    TrackId destTrackId_;
+    int busIndex_ = -1;
+};
+
+/**
+ * @brief Command for removing a send. Restores level on undo.
+ */
+class RemoveSendCommand : public UndoableCommand {
+  public:
+    RemoveSendCommand(TrackId sourceTrackId, int busIndex)
+        : sourceTrackId_(sourceTrackId), busIndex_(busIndex) {
+        if (const auto* source = TrackManager::getInstance().getTrack(sourceTrackId)) {
+            for (const auto& send : source->sends) {
+                if (send.busIndex == busIndex) {
+                    saved_ = send;
+                    hasSaved_ = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    void execute() override {
+        TrackManager::getInstance().removeSend(sourceTrackId_, busIndex_);
+    }
+    void undo() override {
+        if (!hasSaved_)
+            return;
+        auto& tm = TrackManager::getInstance();
+        tm.addSend(sourceTrackId_, saved_.destTrackId);
+        tm.setSendLevel(sourceTrackId_, saved_.busIndex, saved_.level);
+    }
+    juce::String getDescription() const override {
+        return "Remove Send";
+    }
+
+  private:
+    TrackId sourceTrackId_;
+    int busIndex_;
+    SendInfo saved_;
+    bool hasSaved_ = false;
 };
 
 /**

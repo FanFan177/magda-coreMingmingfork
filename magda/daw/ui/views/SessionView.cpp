@@ -22,6 +22,7 @@
 #include "../themes/DarkTheme.hpp"
 #include "../themes/FontManager.hpp"
 #include "../themes/SmallButtonLookAndFeel.hpp"
+#include "../utils/SelectionPolicy.hpp"
 #include "ClipSlotButton.hpp"
 #include "core/ClipCommands.hpp"
 #include "core/ClipPropertyCommands.hpp"
@@ -126,8 +127,8 @@ class SessionView::SessionToggleRail : public juce::Component {
     SessionToggleRail() {
         auto& cfg = Config::getInstance();
 
-        setupButton(sendsButton_, "SessionShowSends", BinaryData::send_svg,
-                    BinaryData::send_svgSize, "Show sends", cfg.getMixerShowSends(),
+        setupButton(sendsButton_, "SessionShowSends", BinaryData::iconsendsboldm_svg,
+                    BinaryData::iconsendsboldm_svgSize, "Show sends", cfg.getMixerShowSends(),
                     [](bool v) { Config::getInstance().setMixerShowSends(v); });
 
         setupButton(routingButton_, "SessionShowRouting", BinaryData::inputoutput_svg,
@@ -835,7 +836,8 @@ class SessionView::MiniSendStrip : public juce::Component {
             slot.removeButton->setColour(juce::TextButton::textColourOffId,
                                          DarkTheme::getColour(DarkTheme::TEXT_SECONDARY));
             slot.removeButton->onClick = [this, busIdx]() {
-                TrackManager::getInstance().removeSend(trackId_, busIdx);
+                UndoManager::getInstance().executeCommand(
+                    std::make_unique<RemoveSendCommand>(trackId_, busIdx));
             };
             addAndMakeVisible(*slot.removeButton);
 
@@ -886,8 +888,8 @@ class SessionView::MiniSendStrip : public juce::Component {
         auto safeThis = juce::Component::SafePointer<MiniSendStrip>(this);
         menu.showMenuAsync(juce::PopupMenu::Options(), [safeThis](int result) {
             if (safeThis && result >= 1000) {
-                TrackManager::getInstance().addSend(safeThis->trackId_,
-                                                    static_cast<TrackId>(result - 1000));
+                UndoManager::getInstance().executeCommand(std::make_unique<AddSendCommand>(
+                    safeThis->trackId_, static_cast<TrackId>(result - 1000)));
             }
         });
     }
@@ -1987,6 +1989,34 @@ void SessionView::rebuildTracks() {
             UndoManager::getInstance().executeCommand(
                 std::make_unique<DeleteTrackCommand>(trackId));
         };
+        header->canGroupSelectedTracks = [trackId]() {
+            auto& sel = SelectionManager::getInstance();
+            return sel.getSelectedTrackCount() >= 2 && sel.isTrackSelected(trackId);
+        };
+        header->onGroupSelectedTracks = []() {
+            auto& sel = SelectionManager::getInstance();
+            std::vector<TrackId> selectedTracks(sel.getSelectedTracks().begin(),
+                                                sel.getSelectedTracks().end());
+            auto cmd = std::make_unique<GroupTracksCommand>(selectedTracks, "Group");
+            auto* cmdPtr = cmd.get();
+            UndoManager::getInstance().executeCommand(std::move(cmd));
+            TrackId groupId = cmdPtr->getCreatedGroupId();
+            if (groupId != INVALID_TRACK_ID)
+                sel.selectTrack(groupId);
+        };
+        header->canUngroupTracks = [trackId]() {
+            const auto* track = TrackManager::getInstance().getTrack(trackId);
+            return track != nullptr && track->isGroup() && !track->childIds.empty();
+        };
+        header->onUngroupTracks = [trackId]() {
+            auto cmd = std::make_unique<UngroupTrackCommand>(trackId);
+            auto childIds = cmd->getChildren();
+            UndoManager::getInstance().executeCommand(std::move(cmd));
+            if (!childIds.empty()) {
+                std::unordered_set<TrackId> selectedChildren(childIds.begin(), childIds.end());
+                SelectionManager::getInstance().selectTracks(selectedChildren);
+            }
+        };
 
         int headerIdx = i;
         header->onHeaderMouseDown = [this, headerIdx](const juce::MouseEvent& e) {
@@ -2765,14 +2795,56 @@ void SessionView::onClipSlotClicked(int trackIndex, int sceneIndex, juce::Modifi
 
     if (clipId != INVALID_CLIP_ID) {
         // Select the clip (update inspector) - no playback change
-        if (mods.isCommandDown())
+        if (magda::isToggleSelectClick(mods))
             SelectionManager::getInstance().toggleClipSelection(clipId);
+        else if (magda::isRangeSelectClick(mods))
+            rangeSelectSlots(trackIndex, sceneIndex, clipId);
         else
             SelectionManager::getInstance().selectClip(clipId);
     } else {
         // Empty slot - select the track
         selectTrack(trackId);
     }
+}
+
+void SessionView::rangeSelectSlots(int trackIndex, int sceneIndex, ClipId clickedClipId) {
+    auto& sel = SelectionManager::getInstance();
+    auto& clipManager = ClipManager::getInstance();
+
+    // Anchor = last single-clicked clip; the range is the rectangle of slots
+    // between the anchor's (track, scene) cell and the clicked cell
+    const auto* anchorClip = clipManager.getClip(sel.getAnchorClip());
+    int anchorTrackIndex = -1;
+    if (anchorClip != nullptr && anchorClip->sceneIndex >= 0) {
+        for (size_t i = 0; i < visibleTrackIds_.size(); ++i) {
+            if (visibleTrackIds_[i] == anchorClip->trackId) {
+                anchorTrackIndex = static_cast<int>(i);
+                break;
+            }
+        }
+    }
+
+    if (anchorTrackIndex < 0) {
+        sel.selectClip(clickedClipId);
+        return;
+    }
+
+    const int loTrack = std::min(anchorTrackIndex, trackIndex);
+    const int hiTrack = std::max(anchorTrackIndex, trackIndex);
+    const int loScene = std::min(anchorClip->sceneIndex, sceneIndex);
+    const int hiScene = std::max(anchorClip->sceneIndex, sceneIndex);
+
+    std::unordered_set<ClipId> clipsInRange;
+    for (int t = loTrack; t <= hiTrack; ++t) {
+        for (int s = loScene; s <= hiScene; ++s) {
+            ClipId id = clipManager.getClipInSlot(visibleTrackIds_[static_cast<size_t>(t)], s);
+            if (id != INVALID_CLIP_ID)
+                clipsInRange.insert(id);
+        }
+    }
+
+    if (!clipsInRange.empty())
+        sel.selectClips(clipsInRange);
 }
 
 void SessionView::onPlayButtonClicked(int trackIndex, int sceneIndex) {
@@ -3307,13 +3379,17 @@ void SessionView::updateClipSlotAppearance(int trackIndex, int sceneIndex) {
             slot->slotIsRecording = false;
             slot->isSelected = SelectionManager::getInstance().isClipSelected(clipId);
             // Issue #1157: read through the accessor — for autoTempo clips
-            // this computes lengthBeats × 60 / projectBPM live, so the slot
-            // progress overlay stays correct after a project-tempo change
-            // even before the seconds cache is refreshed.
+            // this computes beats × 60 / projectBPM live, so the slot progress
+            // overlay stays correct after a project-tempo change even before the
+            // seconds cache is refreshed. Use the LOOP length (what the playhead
+            // wraps at), not the clip placement length: reinterpreting a clip's
+            // source BPM changes loopLengthBeats without touching
+            // placement.lengthBeats, so getTimelineLength() would leave the bar
+            // out of sync with the playhead position.
             {
                 double sessionBPM =
                     timelineController_ ? timelineController_->getState().tempo.bpm : 120.0;
-                slot->clipLength = clip->getTimelineLength(sessionBPM);
+                slot->clipLength = clip->getTimelineLoopLength(sessionBPM);
             }
             {
                 auto posIt = clipPlayheadPositions_.find(clipId);

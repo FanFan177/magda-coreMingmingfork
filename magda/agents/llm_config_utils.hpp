@@ -4,6 +4,7 @@
 
 #include "../daw/core/Config.hpp"
 #include "llm_presets.hpp"
+#include "openai_url.hpp"
 #include "version.hpp"
 
 namespace magda {
@@ -18,7 +19,8 @@ inline llm::Provider providerFromString(const std::string& s) {
         return llm::Provider::Anthropic;
     if (s == provider::GEMINI)
         return llm::Provider::Gemini;
-    // deepseek, openrouter, openai_chat all use the OpenAI Chat Completions format
+    // deepseek, openrouter, local_server, openai_chat all use the OpenAI Chat
+    // Completions format
     return llm::Provider::OpenAIChat;
 }
 
@@ -41,15 +43,56 @@ inline juce::String defaultBaseUrl(const std::string& providerStr) {
 inline llm::ProviderConfig toLLMProviderConfig(const Config::AgentLLMConfig& config,
                                                const std::string& agentName = {}) {
     auto provider = providerFromString(config.provider);
+    const bool isLocalServer = (config.provider == provider::LOCAL_SERVER);
 
     llm::ProviderConfig pc;
     pc.provider = provider;
     pc.model = juce::String(config.model);
-    pc.baseUrl =
-        config.baseUrl.empty() ? defaultBaseUrl(config.provider) : juce::String(config.baseUrl);
+
+    // Generic local server stores one shared model in Config; the preset leaves
+    // the per-agent model blank. The id is opaque (slashes, quant suffixes,
+    // vendor prefixes all pass through untouched).
+    if (isLocalServer && pc.model.isEmpty())
+        pc.model = juce::String(Config::getInstance().getLocalServerModel());
+
+    // Until full model customization ships, always resolve to the latest model
+    // per Claude family, so stale saved configs (or an older pinned id) don't
+    // keep loading a superseded model. Self-maintaining: bump the constant and
+    // every config follows. The families ARE the tiers, so collapsing within a
+    // family is safe (unlike GPT-5's sub-tiers, which stay as chosen).
+    if (pc.model.startsWith("claude-opus-"))
+        pc.model = model::CLAUDE_OPUS;
+    else if (pc.model.startsWith("claude-sonnet-"))
+        pc.model = model::CLAUDE_SONNET;
+    else if (pc.model.startsWith("claude-haiku-"))
+        pc.model = model::CLAUDE_HAIKU;
+
+    // Claude Opus 4.8 deprecated the temperature parameter (like GPT-5) and
+    // rejects requests that include it.
+    if (pc.model.startsWith("claude-opus-"))
+        pc.noTemperature = true;
+    if (isLocalServer) {
+        // Resolve base URL: per-agent → Config → default, then normalize so
+        // host:port and host:port/v1(/) all route to .../v1/chat/completions.
+        std::string raw =
+            !config.baseUrl.empty() ? config.baseUrl : Config::getInstance().getLocalServerUrl();
+        if (raw.empty())
+            raw = DEFAULT_LOCAL_SERVER_URL;
+        pc.baseUrl = juce::String(normalizeOpenAIBaseUrl(raw));
+    } else {
+        pc.baseUrl =
+            config.baseUrl.empty() ? defaultBaseUrl(config.provider) : juce::String(config.baseUrl);
+    }
 
     // API key: per-agent value first, then per-provider credential, then env var
-    if (!config.apiKey.empty()) {
+    if (isLocalServer) {
+        // Optional bearer token (GPUStack etc.); vanilla Ollama ignores it.
+        // Send the real token when set, otherwise a harmless placeholder since
+        // some OpenAI clients reject an empty key.
+        std::string key =
+            !config.apiKey.empty() ? config.apiKey : Config::getInstance().getLocalServerApiKey();
+        pc.apiKey = key.empty() ? juce::String("local") : juce::String(key);
+    } else if (!config.apiKey.empty()) {
         pc.apiKey = juce::String(config.apiKey);
     } else {
         auto credential = Config::getInstance().getAICredential(config.provider);

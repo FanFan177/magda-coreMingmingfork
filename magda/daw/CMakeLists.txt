@@ -52,7 +52,6 @@ juce_add_binary_data(MagdaAssets
     ../../assets/icons/general/add.svg
     ../../assets/icons/general/settings_nobg.svg
     ../../assets/icons/general/menu.svg
-    ../../assets/icons/general/chord.svg
     ../../assets/icons/general/funnel.svg
     ../../assets/icons/general/learn.svg
     ../../assets/icons/general/refresh.svg
@@ -67,19 +66,13 @@ juce_add_binary_data(MagdaAssets
     ../../assets/icons/general/server_stop.svg
     ../../assets/icons/general/open_in_new.svg
     ../../assets/icons/general/power_on.svg
-    ../../assets/icons/general/rack.svg
-    ../../assets/icons/general/fxchain.svg
     ../../assets/icons/general/input-output.svg
-    ../../assets/icons/general/tree.svg
     ../../assets/icons/general/save.svg
     ../../assets/icons/general/folder-open.svg
     ../../assets/icons/general/piano_roll.svg
     ../../assets/icons/general/drum_grid.svg
-    ../../assets/icons/general/faust-logo.svg
     ../../assets/icons/general/faust-text-logo.svg
     ../../assets/icons/general/script.svg
-    ../../assets/icons/general/volume_up.svg
-    ../../assets/icons/general/volume_off.svg
     ../../assets/icons/general/speaker_on.svg
     ../../assets/icons/general/speaker_off.svg
     ../../assets/BoldMGlyph.svg
@@ -90,6 +83,27 @@ juce_add_binary_data(MagdaAssets
     ../../assets/icons/general/harddrive.svg
     ../../assets/icons/general/database.svg
     ../../assets/icons/general/favorite.svg
+    # MIDI editor icons
+    ../../assets/icons/midi_editor/icon-velocity-boldm.svg
+    ../../assets/icons/midi_editor/icon-cc-boldm.svg
+    ../../assets/icons/midi_editor/icon-mpe-boldm.svg
+    ../../assets/icons/midi_editor/icon-chord-boldm.svg
+    ../../assets/icons/midi_editor/stacks.svg
+    # Track chain icons
+    ../../assets/icons/trackchain/icon-mods-boldm.svg
+    ../../assets/icons/trackchain/icon-racks-boldm.svg
+    ../../assets/icons/trackchain/icon-treeview-boldm.svg
+    ../../assets/icons/trackchain/icon-presets-round-boldm.svg
+    ../../assets/icons/trackchain/icon-sends-boldm.svg
+    ../../assets/icons/trackchain/icon-inserts-boldm.svg
+    ../../assets/icons/trackchain/oscilloscope3.svg
+    ../../assets/icons/trackchain/icon-spectrum-boldm.svg
+    ../../assets/icons/trackchain/icon-levels-boldm.svg
+    ../../assets/icons/trackchain/icon-checkmix-boldm.svg
+    ../../assets/icons/trackchain/devices/audio-device.svg
+    ../../assets/icons/trackchain/devices/midi-device.svg
+    ../../assets/icons/trackchain/devices/instrument-device.svg
+    ../../assets/icons/trackchain/gain-staging.svg
     # Transport icons
     ../../assets/icons/transport/play_off.svg
     ../../assets/icons/transport/play_on.svg
@@ -130,7 +144,6 @@ juce_add_binary_data(MagdaAssets
     ../../assets/icons/inspector/fade_scurve.svg
     ../../assets/icons/inspector/fade_gain.svg
     ../../assets/icons/inspector/fade_speedramp.svg
-    ../../assets/icons/inspector/phase_invert.svg
     # Resume/arrangement icons
     ../../assets/icons/resume/resume.svg
     ../../assets/icons/resume/resume_on.svg
@@ -140,22 +153,14 @@ juce_add_binary_data(MagdaAssets
     ../../assets/icons/automation/automation.svg
     # Waveform icons
     ../../assets/icons/waveform/sine-wave.svg
-    ../../assets/icons/waveform/bare_sine.svg
-    ../../assets/icons/waveform/time_bend.svg
     ../../assets/icons/waveform/time_bend_off.svg
     ../../assets/icons/waveform/time_bend_on.svg
-    ../../assets/icons/waveform/note_slice.svg
     ../../assets/icons/waveform/note_slice_off.svg
     ../../assets/icons/waveform/note_slice_on.svg
-    ../../assets/icons/waveform/bezier.svg
-    ../../assets/icons/waveform/bend-in-out.svg
     ../../assets/icons/waveform/curve.svg
     # Analysis device icons
-    ../../assets/icons/analysis/oscilloscope.svg
-    ../../assets/icons/analysis/spectrum.svg
     ../../assets/icons/analysis/postfx.svg
-    # Track-chain header icons
-    ../../assets/icons/trackchain/gain-staging.svg
+    ../../assets/icons/analysis/analysis2.svg
     # Toolbar icons
     ../../assets/icons/toolbar/density_small.svg
     ../../assets/icons/toolbar/density_medium.svg
@@ -173,29 +178,14 @@ juce_add_binary_data(MagdaAssets
     # Legacy view mode icons (still used by the clip inspector view toggle)
     ../../assets/icons/footer/Session.svg
     ../../assets/icons/footer/Arrangement.svg
-    ../../assets/icons/footer/Mix.svg
-    ../../assets/icons/footer/Master.svg
     # Sidebar icons
     ../../assets/icons/sidebar/plug.svg
-    ../../assets/icons/sidebar/sample.svg
-    ../../assets/icons/sidebar/preset.svg
-    ../../assets/icons/sidebar/info.svg
-    ../../assets/icons/sidebar/console.svg
     # Browser icons
     ../../assets/icons/browser/browser.svg
-    ../../assets/icons/browser/AUDIO-DEVICE.svg
-    ../../assets/icons/browser/INSTRUMENT_DEVICE.svg
-    ../../assets/icons/browser/MIDI-DEVICE.svg
     ../../assets/midi.svg
-    ../../assets/icons/browser/AUDIO.svg
-    ../../assets/icons/browser/MIDI.svg
-    # Media-explorer filter icons (issue #768) — three coloured backdrops
-    ../../assets/icons/media_db/audio_db_off.svg
-    ../../assets/icons/media_db/audio_db_on.svg
-    ../../assets/icons/media_db/midi_db_off.svg
-    ../../assets/icons/media_db/midi_db_on.svg
-    ../../assets/icons/media_db/presets_db_off.svg
-    ../../assets/icons/media_db/presets_db_on.svg
+    ../../assets/icons/browser/icon-audio-boldm.svg
+    ../../assets/icons/browser/icon-midi-boldm.svg
+    ../../assets/icons/browser/icon-preset-boldm.svg
     # Mixer fader icons
     ../../assets/icons/fader/fader_thumb.svg
     ../../assets/icons/fader/fader_track.svg
@@ -216,6 +206,11 @@ juce_add_binary_data(MagdaAssets
     ../../assets/icons/panels/bottom_close.svg
     ../../assets/icons/panels/enter_fs.svg
     ../../assets/icons/panels/exit_fs.svg
+    # Panel tab icons (BoldM)
+    ../../assets/icons/panels/icon-browser-boldm.svg
+    ../../assets/icons/panels/icon-console-boldm.svg
+    ../../assets/icons/panels/icon-inspector-boldm.svg
+    ../../assets/icons/panels/icon-plugins-boldm.svg
 
     # Fontaudio waveform icons
     ../../assets/icons/fontaudio/fad-modsine.svg
@@ -234,7 +229,6 @@ juce_add_binary_data(MagdaAssets
     ../../assets/icons/fontaudio/fad-logo-juce.svg
     # AI icons
     ../../assets/icons/ai/psychology.svg
-    ../../assets/icons/ai/robot.svg
     ../../assets/icons/ai/ai.svg
     # Session view icons
     ../../assets/icons/session/hide.svg

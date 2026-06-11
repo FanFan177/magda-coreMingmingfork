@@ -30,6 +30,18 @@ inline double wrapPhase(double value, double period) {
 enum class FadeCurve : int { Linear = 1, Convex = 2, Concave = 3, SCurve = 4 };
 
 /**
+ * @brief Per-note pitch expression point (MPE pitch glide)
+ *
+ * Beat position is relative to the note's start. Value is a pitch offset in
+ * semitones from the note's base pitch (MPE pitchbend, ±48 semitone range —
+ * matches Tracktion Engine's fixed MPE conversion range).
+ */
+struct MidiPitchExpressionPoint {
+    double beat = 0.0;       // Position relative to note start (0..note length)
+    double semitones = 0.0;  // Pitch offset in semitones (-48..+48)
+};
+
+/**
  * @brief MIDI note data for MIDI clips
  */
 struct MidiNote {
@@ -38,6 +50,13 @@ struct MidiNote {
     double startBeat = 0.0;    // Start position in beats within clip
     double lengthBeats = 1.0;  // Duration in beats
     int chordGroup = 0;        // 0 = unlinked, >0 = linked to ChordAnnotation with same ID
+
+    // Per-note pitch glide (MPE). Sorted by beat. Empty = no expression.
+    std::vector<MidiPitchExpressionPoint> pitchExpression;
+
+    bool hasPitchExpression() const {
+        return !pitchExpression.empty();
+    }
 };
 
 /**
@@ -577,6 +596,20 @@ struct ClipInfo {
     /// Timeline-domain end position (start + length).
     double getTimelineEnd(double projectBPM) const {
         return getTimelineStart(projectBPM) + getTimelineLength(projectBPM);
+    }
+
+    /// Timeline-domain seconds for the looping playback span — the length the
+    /// session playhead sweeps before it wraps. A looping clip wraps at its loop
+    /// length, which is the basis SessionClipScheduler uses for the playhead
+    /// position. This diverges from getTimelineLength() after a source-BPM
+    /// reinterpretation changes loopLengthBeats without touching
+    /// placement.lengthBeats; use this (not getTimelineLength) for the slot
+    /// progress overlay so the bar and the playhead stay consistent.
+    double getTimelineLoopLength(double projectBPM) const {
+        if (loopEnabled && loopLengthBeats > 0.0 && isValidBpm(projectBPM)) {
+            return loopLengthBeats * 60.0 / projectBPM;
+        }
+        return getTimelineLength(projectBPM);
     }
 
     /// Source-domain seconds for the loop start. For autoTempo clips, computed

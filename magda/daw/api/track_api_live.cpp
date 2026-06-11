@@ -8,8 +8,16 @@ TrackId TrackApiLive::createTrack(const juce::String& name, TrackType type) {
     return TrackManager::getInstance().createTrack(name, type);
 }
 
+TrackId TrackApiLive::groupTracks(const std::vector<TrackId>& trackIds, const juce::String& name) {
+    return TrackManager::getInstance().groupTracks(trackIds, name);
+}
+
 void TrackApiLive::deleteTrack(TrackId trackId) {
     TrackManager::getInstance().deleteTrack(trackId);
+}
+
+void TrackApiLive::moveTrackToPosition(TrackId trackId, int oneBasedPosition) {
+    TrackManager::getInstance().moveTrackToPosition(trackId, oneBasedPosition);
 }
 
 int TrackApiLive::getNumTracks() const {
@@ -30,6 +38,10 @@ const TrackInfo* TrackApiLive::getTrack(TrackId trackId) const {
 
 void TrackApiLive::setTrackName(TrackId trackId, const juce::String& name) {
     TrackManager::getInstance().setTrackName(trackId, name);
+}
+
+void TrackApiLive::setTrackColour(TrackId trackId, juce::Colour colour) {
+    TrackManager::getInstance().setTrackColour(trackId, colour);
 }
 
 void TrackApiLive::setTrackVolume(TrackId trackId, float volume, bool fromAutomation) {

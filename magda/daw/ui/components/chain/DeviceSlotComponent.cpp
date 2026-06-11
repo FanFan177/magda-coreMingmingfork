@@ -211,8 +211,8 @@ DeviceSlotComponent::DeviceSlotComponent(const magda::DeviceInfo& device) : devi
     };
 
     // Mod button (toggle mod panel) - bare sine icon
-    modButton_ = std::make_unique<magda::SvgButton>("Mod", BinaryData::bare_sine_svg,
-                                                    BinaryData::bare_sine_svgSize);
+    modButton_ = std::make_unique<magda::SvgButton>("Mod", BinaryData::iconmodsboldm_svg,
+                                                    BinaryData::iconmodsboldm_svgSize);
     applyHeaderIconStyle(*modButton_, DarkTheme::getColour(DarkTheme::ACCENT_ORANGE));
     modButton_->setToggleState(modPanelVisible_, juce::dontSendNotification);
     modButton_->setActive(modPanelVisible_);
@@ -279,8 +279,9 @@ DeviceSlotComponent::DeviceSlotComponent(const magda::DeviceInfo& device) : devi
     addAndMakeVisible(gainLabel_);
 
     // ----- MOCK UI (no wiring): MAGDA preset menu button (top header) -----
-    presetButton_ = std::make_unique<magda::SvgButton>("Presets", BinaryData::preset_svg,
-                                                       BinaryData::preset_svgSize);
+    presetButton_ =
+        std::make_unique<magda::SvgButton>("Presets", BinaryData::iconpresetsroundboldm_svg,
+                                           BinaryData::iconpresetsroundboldm_svgSize);
     // Indigo sits between ACCENT_BLUE and ACCENT_PURPLE — distinct from both
     // utility blue (ui/multiOut) and macro purple, signals "MAGDA presets".
     constexpr juce::uint32 PRESET_INDIGO = 0xFF5577CC;
@@ -816,6 +817,9 @@ void DeviceSlotComponent::timerCallback() {
     if (!bridge)
         return;
 
+    if (compiledPanel_ != nullptr || traits_.isAnalysis)
+        refreshInlinePluginBindings();
+
     // Update UI button state to match the actual window state.
     if (uiButton_) {
         // Analysis devices use the popout AnalyzerWindow, not a native plugin window.
@@ -1051,6 +1055,7 @@ void DeviceSlotComponent::setNodePath(const magda::ChainNodePath& path) {
 
     // Update MIDI custom UIs with the now-valid trackId (createCustomUI runs before setNodePath).
     bindDeviceSlotMidiCustomUIs(customUI_, nodePath_);
+    refreshInlinePluginBindings();
 }
 
 int DeviceSlotComponent::getCustomUITabIndex() const {
@@ -1227,10 +1232,12 @@ void DeviceSlotComponent::updateFromDevice(const magda::DeviceInfo& device) {
         currentPresetName_.clear();
         pluginPresetName_.clear();
         currentPluginPresetFile_ = juce::File();
-        // AI panel output is plugin-specific too — wipe so we don't show
-        // stale 4OSC results on a slot that now holds a different plugin.
-        if (auto* live = magda::TrackManager::getInstance().getDeviceInChainByPath(nodePath_))
+        // AI panel output + conversation are plugin-specific too — wipe so we
+        // don't show stale results or carry history onto a different plugin.
+        if (auto* live = magda::TrackManager::getInstance().getDeviceInChainByPath(nodePath_)) {
             live->aiPanelOutput.clear();
+            live->aiConversation.clear();
+        }
     }
 
     device_ = device;
@@ -2081,6 +2088,7 @@ void DeviceSlotComponent::toggleAnalyzerWindow() {
     } else if (auto* spec = dynamic_cast<daw::audio::SpectrumAnalyzerPlugin*>(plugin.get())) {
         auto ui = std::make_unique<SpectrumAnalyzerUI>();
         ui->setPlugin(spec);
+        ui->setTrackId(nodePath_.trackId);  // enables the masking overlay in the external window
         content = std::move(ui);
     }
     if (content == nullptr)
@@ -2122,6 +2130,10 @@ void DeviceSlotComponent::mouseDown(const juce::MouseEvent& e) {
 }
 
 void DeviceSlotComponent::showMultiOutMenu() {
+    // Item IDs: 1..N = per-pair toggles (vector index + 1), then the bulk actions.
+    constexpr int ACTIVATE_ALL_ID = 9001;
+    constexpr int DEACTIVATE_ALL_ID = 9002;
+
     juce::PopupMenu menu;
     menu.addSectionHeader("Multi-Output Routing");
 
@@ -2133,6 +2145,8 @@ void DeviceSlotComponent::showMultiOutMenu() {
     if (!freshDevice || !freshDevice->multiOut.isMultiOut)
         return;
 
+    bool anyInactive = false;
+    bool anyActive = false;
     for (size_t i = 0; i < freshDevice->multiOut.outputPairs.size(); ++i) {
         const auto& pair = freshDevice->multiOut.outputPairs[i];
 
@@ -2141,16 +2155,24 @@ void DeviceSlotComponent::showMultiOutMenu() {
             continue;
 
         menu.addItem(static_cast<int>(i + 1), pair.name, true, pair.active);
+        (pair.active ? anyActive : anyInactive) = true;
     }
+
+    menu.addSeparator();
+    menu.addItem(ACTIVATE_ALL_ID, "Activate All", anyInactive);
+    menu.addItem(DEACTIVATE_ALL_ID, "Deactivate All", anyActive);
 
     auto safeThis = juce::Component::SafePointer<DeviceSlotComponent>(this);
     auto deviceId = device_.id;
 
-    menu.showMenuAsync(juce::PopupMenu::Options(), [safeThis, trackId, deviceId](int result) {
+    // Anchor at the multi-out button so the menu stays put when it reopens
+    // after a per-pair toggle (multi-toggle in one session).
+    auto options = juce::PopupMenu::Options().withTargetComponent(multiOutButton_.get());
+
+    menu.showMenuAsync(options, [safeThis, trackId, deviceId](int result) {
         if (!safeThis || result == 0)
             return;
 
-        int pairIndex = result - 1;
         auto& tm = magda::TrackManager::getInstance();
 
         // Get fresh device info
@@ -2158,6 +2180,27 @@ void DeviceSlotComponent::showMultiOutMenu() {
         if (!device || !device->multiOut.isMultiOut)
             return;
 
+        if (result == ACTIVATE_ALL_ID) {
+            // Re-fetch the device each pass: activating a pair inserts a track,
+            // which can reallocate and invalidate the DeviceInfo pointer.
+            for (size_t i = 0;; ++i) {
+                auto* dev = tm.getDevice(trackId, deviceId);
+                if (!dev || i >= dev->multiOut.outputPairs.size())
+                    break;
+                const auto& pair = dev->multiOut.outputPairs[i];
+                if (pair.outputIndex == 0 || pair.active)
+                    continue;
+                tm.activateMultiOutPair(trackId, deviceId, static_cast<int>(i));
+            }
+            return;
+        }
+
+        if (result == DEACTIVATE_ALL_ID) {
+            tm.deactivateAllMultiOutPairs(trackId, deviceId);
+            return;
+        }
+
+        int pairIndex = result - 1;
         if (pairIndex < 0 || pairIndex >= static_cast<int>(device->multiOut.outputPairs.size()))
             return;
 
@@ -2167,6 +2210,10 @@ void DeviceSlotComponent::showMultiOutMenu() {
         } else {
             tm.activateMultiOutPair(trackId, deviceId, pairIndex);
         }
+
+        // Reopen so several pairs can be toggled in one menu session;
+        // clicking outside (result == 0) ends it.
+        safeThis->showMultiOutMenu();
     });
 }
 
@@ -2363,6 +2410,22 @@ void DeviceSlotComponent::updateCustomUI() {
         compiledPanel_->updateFromDevice(device_);
 
     customUI_.update(device_);
+}
+
+void DeviceSlotComponent::refreshInlinePluginBindings() {
+    if (!nodePath_.isValid())
+        return;
+
+    if (compiledPanel_ != nullptr) {
+        if (auto* audioEngine = magda::TrackManager::getInstance().getAudioEngine()) {
+            if (auto* bridge = audioEngine->getAudioBridge()) {
+                auto plugin = bridge->getPlugin(nodePath_);
+                compiledPanel_->bindPlugin(plugin.get());
+            }
+        }
+    }
+
+    customUI_.refreshLivePluginBindings();
 }
 
 void DeviceSlotComponent::wirePadChainLinkCallbacks() {

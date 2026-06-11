@@ -9,6 +9,7 @@
 #include "../../themes/DarkTheme.hpp"
 #include "../../themes/FontManager.hpp"
 #include "../../themes/MixerMetrics.hpp"
+#include "../../utils/SelectionPolicy.hpp"
 #include "BinaryData.h"
 #include "LevelMeterBallistics.hpp"
 #include "core/ChainNodePath.hpp"
@@ -366,12 +367,14 @@ void MasterChannelStrip::setupControls() {
 
     // Peak / fader-value readout above the fader. Mono font keeps digits in
     // a tabular grid so they don't shift sideways as the value changes.
-    peakValueLabel = std::make_unique<juce::Label>();
+    peakValueLabel = std::make_unique<ClickableLabel>();
     peakValueLabel->setText("-inf", juce::dontSendNotification);
     peakValueLabel->setJustificationType(juce::Justification::centred);
     peakValueLabel->setColour(juce::Label::textColourId,
                               DarkTheme::getColour(DarkTheme::TEXT_PRIMARY));
     peakValueLabel->setFont(FontManager::getInstance().getMonoFont(10.0f));
+    peakValueLabel->setTooltip("Click to reset peak");
+    peakValueLabel->onClick = [this]() { resetPeak(); };
     addAndMakeVisible(*peakValueLabel);
 
     // Volume slider - TextSlider with vertical orientation and dB display
@@ -451,6 +454,7 @@ void MasterChannelStrip::setupControls() {
 
     miniSpectrumUI_ = std::make_unique<daw::ui::SpectrumAnalyzerUI>();
     miniSpectrumUI_->setCompact(true);
+    miniSpectrumUI_->setTrackId(MASTER_TRACK_ID);  // masking overlay (shown when popped out)
     miniSpectrumUI_->setPersistGlobalDefaults(false);
     miniSpectrumUI_->setVisible(false);
     miniSpectrumUI_->onControlsExpandedChanged = relayoutOnExpand;
@@ -550,7 +554,11 @@ void MasterChannelStrip::setSelected(bool shouldBeSelected) {
 
 void MasterChannelStrip::mouseDown(const juce::MouseEvent& event) {
     if (!event.mods.isPopupMenu()) {
-        SelectionManager::getInstance().selectTrack(MASTER_TRACK_ID);
+        if (magda::isToggleSelectClick(event.mods)) {
+            SelectionManager::getInstance().toggleTrackSelection(MASTER_TRACK_ID);
+        } else {
+            SelectionManager::getInstance().selectTrack(MASTER_TRACK_ID);
+        }
     }
 }
 
@@ -725,6 +733,12 @@ void MasterChannelStrip::setPeakLevels(float leftPeak, float rightPeak) {
             peakValueLabel->setText(peakText, juce::dontSendNotification);
         }
     }
+}
+
+void MasterChannelStrip::resetPeak() {
+    peakValue_ = 0.0f;
+    if (peakValueLabel)
+        peakValueLabel->setText("-inf", juce::dontSendNotification);
 }
 
 }  // namespace magda

@@ -23,7 +23,10 @@ class TrackContentPanel;
  * - Resize handles (left/right edges)
  * - Selection
  */
-class ClipComponent : public juce::Component, public ClipManagerListener, private juce::Timer {
+class ClipComponent : public juce::Component,
+                      public ClipManagerListener,
+                      public juce::ChangeListener,
+                      private juce::Timer {
   public:
     explicit ClipComponent(ClipId clipId, TrackContentPanel* parent);
     ~ClipComponent() override;
@@ -53,6 +56,10 @@ class ClipComponent : public juce::Component, public ClipManagerListener, privat
     void clipsChanged() override;
     void clipPropertyChanged(ClipId clipId) override;
     void clipSelectionChanged(ClipId clipId) override;
+
+    // ChangeListener - the audio thumbnail broadcasts as its samples stream in,
+    // so we repaint to fill the waveform progressively while a long file loads.
+    void changeListenerCallback(juce::ChangeBroadcaster* source) override;
 
     // Selection state
     bool isSelected() const {
@@ -128,6 +135,7 @@ class ClipComponent : public juce::Component, public ClipManagerListener, privat
     bool isDragging_ = false;
     bool isCommitting_ = false;             // True during mouseUp commit phase
     bool shouldDeselectOnMouseUp_ = false;  // Delayed deselection for multi-selection
+    bool pendingAltAction_ = false;         // Alt+click: copy on drag, edit cursor on release
 
     // Audio clip drag state
     double dragStartSpeedRatio_ = 1.0;
@@ -194,7 +202,7 @@ class ClipComponent : public juce::Component, public ClipManagerListener, privat
     bool isOnFadeInHandle(int x, int y) const;
     bool isOnFadeOutHandle(int x, int y) const;
     bool isOnVolumeHandle(int x, int y) const;
-    void updateCursor(bool isAltDown = false, bool isShiftDown = false, bool isEraseDown = false);
+    void updateCursor(const juce::ModifierKeys& mods = {});
 
     // Helper to get current clip info
     const ClipInfo* getClipInfo() const;
@@ -217,6 +225,12 @@ class ClipComponent : public juce::Component, public ClipManagerListener, privat
                               juce::Rectangle<int> waveformArea, double clipDisplayLength,
                               juce::Colour waveColourOverride = {});
     void timerCallback() override;
+
+    // Register/unregister as a change listener on the clip's audio thumbnail
+    // while it is still loading, so the waveform repaints as data streams in and
+    // the listener is dropped once the thumbnail is fully loaded. Idempotent.
+    void updateWaveformLoadListener(const juce::String& audioFilePath);
+    juce::String waveformListenerPath_;  // thumbnail path we are currently listening to (or empty)
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(ClipComponent)
 };

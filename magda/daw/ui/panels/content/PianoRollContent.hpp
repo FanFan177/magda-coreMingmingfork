@@ -132,6 +132,11 @@ class PianoRollContent : public MidiEditorContent, public magda::SelectionManage
     std::unique_ptr<magda::SvgButton> chordToggle_;
     std::unique_ptr<magda::SvgButton> chordDetectBtn_;
     std::unique_ptr<magda::SvgButton> velocityToggle_;
+    std::unique_ptr<magda::SvgButton> pitchGlideToggle_;
+    std::unique_ptr<magda::SvgButton> ccLanesBtn_;
+
+    // CC strip button is lit while the drawer is open with CC/pitchbend lanes
+    void updateCcLanesButtonState();
 
     // Live MIDI note monitor hooks (plumbing lives in MidiEditorContent).
     void highlightMonitoredNote(int noteNumber, bool noteOn) override;
@@ -147,6 +152,9 @@ class PianoRollContent : public MidiEditorContent, public magda::SelectionManage
     void setNoteHeight(int height, bool persist);
     void setNoteHeightAnchored(int height, int anchorNote, int anchorScreenY, bool persist);
     void loadNoteHeightFromClip(magda::ClipId clipId);
+
+    // Multi-track overlay: push the shared overlay set into the grid
+    void applyOverlayTracks() override;
 
     // Helper to get current header height based on chord row visibility
     int getHeaderHeight() const {

@@ -41,6 +41,7 @@ class PianoRollGridComponent : public juce::Component,
 
     // Component overrides
     void paint(juce::Graphics& g) override;
+    void paintOverChildren(juce::Graphics& g) override;
     void resized() override;
 
     // Timer (for pending chord blink)
@@ -81,6 +82,13 @@ class PianoRollGridComponent : public juce::Component,
     }
     TrackId getTrackId() const {
         return trackId_;
+    }
+
+    // Multi-track overlay (ghost notes from other tracks, #1281). Overlay
+    // tracks render as dimmed, non-interactive notes in their track colour.
+    void setOverlayTracks(std::vector<TrackId> trackIds);
+    const std::vector<TrackId>& getOverlayTracks() const {
+        return overlayTrackIds_;
     }
 
     // Zoom settings
@@ -138,6 +146,13 @@ class PianoRollGridComponent : public juce::Component,
 
     // Phase marker preview (overrides clip->midiOffset during drag)
     void setPhasePreview(double beats, bool active);
+
+    // Pitch glide (MPE pitch expression) overlay editing mode.
+    // When enabled, mouse interaction edits per-note pitch curves instead of notes.
+    void setPitchExpressionMode(bool enabled);
+    bool isPitchExpressionMode() const {
+        return pitchExpressionMode_;
+    }
 
     // Playhead position (for drawing playhead line during playback)
     void setPlayheadPosition(double positionSeconds);
@@ -204,6 +219,7 @@ class PianoRollGridComponent : public juce::Component,
     std::function<void(ClipId, size_t, double)> onNoteResized;  // clipId, index, newLength
     std::function<void(ClipId, size_t)> onNoteDeleted;          // clipId, index
     std::function<void(ClipId, size_t, bool)> onNoteSelected;   // clipId, index, isAdditive
+    std::function<void(ClipId, size_t)> onNoteRangeSelected;    // clipId, index
 
     // Callback when note selection changes (e.g. after lasso, deselect-all)
     // Provides the full set of currently selected note indices for the primary clip
@@ -238,6 +254,10 @@ class PianoRollGridComponent : public juce::Component,
     std::function<void(ClipId, double, double, std::vector<std::pair<int, int>>, juce::String)>
         onChordDropped;
 
+    // Pitch glide edited — clipId, noteIndex, new point set (sorted by beat)
+    std::function<void(ClipId, size_t, std::vector<MidiPitchExpressionPoint>)>
+        onPitchExpressionChanged;
+
     // DragAndDropTarget
     bool isInterestedInDragSource(const SourceDetails& details) override;
     void itemDragEnter(const SourceDetails& details) override;
@@ -254,6 +274,10 @@ class PianoRollGridComponent : public juce::Component,
     std::vector<ClipId> selectedClipIds_;  // All selected clips (editable)
     std::vector<ClipId> clipIds_;          // All clips being displayed
     TrackId trackId_ = INVALID_TRACK_ID;
+
+    // Tracks whose MIDI renders as a ghost overlay (paint-only, never interactive)
+    std::vector<TrackId> overlayTrackIds_;
+    void paintOverlayNotes(juce::Graphics& g);
 
     // Note range
     static constexpr int MIN_NOTE = 0;    // C-2
@@ -367,6 +391,57 @@ class PianoRollGridComponent : public juce::Component,
     // Painting helpers
     void paintGrid(juce::Graphics& g, juce::Rectangle<int> area);
     void paintBeatLines(juce::Graphics& g, juce::Rectangle<int> area, double lengthBeats);
+
+    // ------------------------------------------------------------------
+    // Pitch glide (MPE pitch expression) overlay
+    // ------------------------------------------------------------------
+    bool pitchExpressionMode_ = false;
+
+    // Active edit gesture state (working copy committed on mouseUp)
+    ClipId expressionClipId_ = INVALID_CLIP_ID;
+    size_t expressionNoteIndex_ = 0;
+    std::vector<MidiPitchExpressionPoint> expressionWorkingPoints_;
+    int expressionDragPointIndex_ = -1;
+    bool isExpressionDragging_ = false;
+
+    static constexpr int EXPRESSION_POINT_HIT_RADIUS = 6;
+    static constexpr double MAX_PITCH_EXPRESSION_SEMITONES = 48.0;
+
+    void paintPitchExpression(juce::Graphics& g);
+    bool handleExpressionMouseDown(const juce::MouseEvent& e);
+    void handleExpressionMouseDrag(const juce::MouseEvent& e);
+    void handleExpressionMouseUp(const juce::MouseEvent& e);
+    bool handleExpressionDoubleClick(const juce::MouseEvent& e);
+    void commitExpressionEdit();
+
+    // Coordinate helpers for expression editing
+    double expressionRelBeatForX(ClipId clipId, const MidiNote& note, int x) const;
+    juce::Point<float> expressionPointToScreen(ClipId clipId, const MidiNote& note,
+                                               const MidiPitchExpressionPoint& point) const;
+    static double evaluatePitchExpression(const std::vector<MidiPitchExpressionPoint>& points,
+                                          double relBeat);
+
+    struct ExpressionHit {
+        ClipId clipId = INVALID_CLIP_ID;
+        size_t noteIndex = 0;
+        int pointIndex = -1;  // -1 = note body (no existing point)
+
+        bool operator==(const ExpressionHit& other) const {
+            return clipId == other.clipId && noteIndex == other.noteIndex &&
+                   pointIndex == other.pointIndex;
+        }
+        bool operator!=(const ExpressionHit& other) const {
+            return !(*this == other);
+        }
+    };
+    std::optional<ExpressionHit> hitTestExpressionPoint(juce::Point<int> pos) const;
+    std::optional<ExpressionHit> hitTestExpressionNote(juce::Point<int> pos) const;
+
+    // Point under the mouse (for the pitch value label)
+    std::optional<ExpressionHit> hoveredExpressionPoint_;
+    void paintExpressionPointLabel(juce::Graphics& g, const MidiNote& note,
+                                   const MidiPitchExpressionPoint& point,
+                                   juce::Point<float> screen);
 
     // Grid snap helper
     double snapBeatToGrid(double beat) const;

@@ -7,11 +7,11 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 
 #include "../../../../agents/automation_agent.hpp"
 #include "../../../../agents/command_agent.hpp"
 #include "../../../../agents/controller_profile_agent.hpp"
-#include "../../../../agents/daw_agent.hpp"
 #include "../../../../agents/drummer_agent.hpp"
 #include "../../../../agents/dsl_interpreter.hpp"
 #include "../../../../agents/four_osc_agent.hpp"
@@ -20,12 +20,16 @@
 #include "../../../../agents/internal_plugins.hpp"
 #include "../../../../agents/llama_model_manager.hpp"
 #include "../../../../agents/llm_presets.hpp"
+#include "../../../../agents/mixing_agent.hpp"
 #include "../../../../agents/music_agent.hpp"
 #include "../../../../agents/router_agent.hpp"
 #include "../../../api/magda_api_live.hpp"
+#include "../../../audio/analysis/OfflineMixAnalysis.hpp"
 #include "../../../core/AppPaths.hpp"
 #include "../../../core/ClipManager.hpp"
 #include "../../../core/Config.hpp"
+#include "../../../core/ConsoleRouting.hpp"
+#include "../../../core/MixAnalysisService.hpp"
 #include "../../../core/ParameterUtils.hpp"
 #include "../../../core/PresetManager.hpp"
 #include "../../../core/SelectionManager.hpp"
@@ -35,6 +39,7 @@
 #include "../../../core/controllers/BindingRegistry.hpp"
 #include "../../../core/controllers/ControllerProfileRegistry.hpp"
 #include "../../../core/controllers/ControllerRegistry.hpp"
+#include "../../../project/ProjectManager.hpp"
 #include "../../components/common/SvgButton.hpp"
 #include "../../state/TimelineController.hpp"
 #include "../../themes/DarkTheme.hpp"
@@ -313,6 +318,19 @@ class AIChatConsoleContent::AutocompletePopup : public juce::Component, public j
 // RequestThread
 // ============================================================================
 
+magda::ConversationStore::Channel AIChatConsoleContent::conversationChannel(magda::ViewMode mode) {
+    switch (mode) {
+        case magda::ViewMode::Live:
+            return magda::ConversationStore::Channel::Session;
+        case magda::ViewMode::Mix:
+        case magda::ViewMode::Master:
+            return magda::ConversationStore::Channel::Mixing;
+        case magda::ViewMode::Arrange:
+            break;
+    }
+    return magda::ConversationStore::Channel::Arrangement;
+}
+
 AIChatConsoleContent::RequestThread::RequestThread(AIChatConsoleContent& owner)
     : juce::Thread("AI Chat Request"), owner_(owner) {}
 
@@ -323,29 +341,43 @@ void AIChatConsoleContent::RequestThread::run() {
     auto totalStart = std::chrono::steady_clock::now();
     double routerMs = 0.0, agentMs = 0.0;
 
-    // Step 1: Classify intent via router. Skipped entirely when the user is
-    // on a drum-targetable track and didn't lead with an explicit @alias —
-    // context is unambiguous, no need to spend a model call on classification.
-    const bool hasExplicitAlias = juce::String(message).trimStart().startsWithChar('@');
-    std::string intent = "COMMAND";  // default fallback
-    if (owner_.drummerModeActive_ && !hasExplicitAlias) {
-        intent = "DRUM";
-        DBG("MAGDA Router: bypassed (drummer mode, context-driven)");
-    } else if (owner_.routerAgent_) {
+    // Step 1: Resolve which agent this turn routes to from the view-context data
+    // model (#1402). consoleSurfaceForView() declares each view's agent surface;
+    // resolveConsoleIntent() applies the escape-hatch / capture / drummer / router
+    // precedence. The router is only consulted for Classified views (Arrange) and
+    // is wrapped in a callback so the routing model stays UI/agent-free.
+    const auto trimmedMessage = juce::String(message).trimStart();
+    magda::RoutingContext routingCtx;
+    routingCtx.hasExplicitAlias = trimmedMessage.startsWithChar('@');
+    routingCtx.hasExplicitCommand = trimmedMessage.startsWith("[COMMAND:");
+    routingCtx.drummerModeActive = owner_.drummerModeActive_;
+    // Mixer view hard-scopes to MIXING via the view surface; there's no separate
+    // attached-capture override anymore (the analysis lives in MixAnalysisService).
+    routingCtx.mixCaptureAttached = false;
+
+    auto classify = [&]() -> std::string {
+        if (!owner_.routerAgent_)
+            return {};
         auto routerStart = std::chrono::steady_clock::now();
         auto classification = owner_.routerAgent_->classify(message);
         routerMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
                                                              routerStart)
                        .count();
-        if (!classification.hasError) {
-            intent = classification.intent;
-            DBG("MAGDA Router: intent=" + juce::String(intent) + " (" + juce::String(routerMs, 0) +
-                "ms)");
-        } else {
+        if (classification.hasError) {
             DBG("MAGDA Router: error: " + juce::String(classification.error) +
                 ", defaulting to COMMAND");
+            return {};
         }
-    }
+        DBG("MAGDA Router: intent=" + juce::String(classification.intent) + " (" +
+            juce::String(routerMs, 0) + "ms)");
+        return classification.intent;
+    };
+
+    const auto decision =
+        magda::resolveConsoleIntent(owner_.currentViewMode_, routingCtx, classify);
+    const magda::ConsoleIntent intent = decision.intent;
+    DBG("MAGDA Router: routed to " + juce::String(magda::toIntentString(intent)) + " (" +
+        juce::String(decision.source) + ")");
 
     if (threadShouldExit())
         return;
@@ -428,16 +460,25 @@ void AIChatConsoleContent::RequestThread::run() {
         return true;
     };
 
+    // Centralised conversation memory (#1402): render the active view's thread
+    // and prepend it so the agent builds on earlier turns. The original message
+    // is recorded verbatim once the turn completes (see the callAsync below).
+    const auto convoChannel = conversationChannel(owner_.currentViewMode_);
+    const std::string priorContext = owner_.conversation_.render(convoChannel);
+    const std::string contextualMessage =
+        priorContext.empty() ? message : priorContext + "\nUser request: " + message;
+
     // Step 2: Dispatch to agents based on classification
     std::string dslCode;                                   // DSL from command agent
     std::vector<magda::Instruction> musicInstructions;     // IR from music agent
     std::string musicDescription;                          // description from DSL music agent
     std::vector<magda::AutoInstruction> autoInstructions;  // IR from automation agent
+    std::string mixAnalysis;                               // prose from the mix-analysis agent
     std::string error;
 
     auto agentStart = std::chrono::steady_clock::now();
 
-    if (intent == "BOTH") {
+    if (intent == magda::ConsoleIntent::Both) {
         // Run both agents in parallel, each streaming into its own labeled section.
         // A shared render callback rebuilds the streaming region from both buffers so
         // tokens from one agent never interleave into the other's text.
@@ -506,14 +547,16 @@ void AIChatConsoleContent::RequestThread::run() {
         std::future<magda::MusicAgent::GenerateResult> musicFuture;
 
         if (owner_.commandAgent_) {
-            commandFuture = std::async(std::launch::async, [this, &message, cmdOnToken]() {
-                return owner_.commandAgent_->generateStreaming(message, cmdOnToken);
-            });
+            commandFuture =
+                std::async(std::launch::async, [this, &contextualMessage, cmdOnToken]() {
+                    return owner_.commandAgent_->generateStreaming(contextualMessage, cmdOnToken);
+                });
         }
         if (owner_.musicAgent_) {
-            musicFuture = std::async(std::launch::async, [this, &message, musicOnToken]() {
-                return owner_.musicAgent_->generateStreaming(message, musicOnToken);
-            });
+            musicFuture =
+                std::async(std::launch::async, [this, &contextualMessage, musicOnToken]() {
+                    return owner_.musicAgent_->generateStreaming(contextualMessage, musicOnToken);
+                });
         }
 
         if (commandFuture.valid()) {
@@ -538,9 +581,9 @@ void AIChatConsoleContent::RequestThread::run() {
         }
         if (threadShouldExit())
             return;
-    } else if (intent == "COMMAND") {
+    } else if (intent == magda::ConsoleIntent::Command) {
         if (owner_.commandAgent_) {
-            auto result = owner_.commandAgent_->generateStreaming(message, onToken);
+            auto result = owner_.commandAgent_->generateStreaming(contextualMessage, onToken);
             if (threadShouldExit())
                 return;
             if (result.hasError)
@@ -548,9 +591,9 @@ void AIChatConsoleContent::RequestThread::run() {
             else
                 dslCode = result.dslOutput;
         }
-    } else if (intent == "MUSIC") {
+    } else if (intent == magda::ConsoleIntent::Music) {
         if (owner_.musicAgent_) {
-            auto result = owner_.musicAgent_->generateStreaming(message, onToken);
+            auto result = owner_.musicAgent_->generateStreaming(contextualMessage, onToken);
             if (threadShouldExit())
                 return;
             if (result.hasError) {
@@ -560,9 +603,9 @@ void AIChatConsoleContent::RequestThread::run() {
                 musicDescription = std::move(result.description);
             }
         }
-    } else if (intent == "AUTOMATION") {
+    } else if (intent == magda::ConsoleIntent::Automation) {
         if (owner_.automationAgent_) {
-            auto result = owner_.automationAgent_->generateStreaming(message, onToken);
+            auto result = owner_.automationAgent_->generateStreaming(contextualMessage, onToken);
             if (threadShouldExit())
                 return;
             if (result.hasError)
@@ -570,7 +613,7 @@ void AIChatConsoleContent::RequestThread::run() {
             else
                 autoInstructions = std::move(result.instructions);
         }
-    } else if (intent == "DRUM") {
+    } else if (intent == magda::ConsoleIntent::Drum) {
         // Drummer agent: emits compact role-grid output. Reuses the music IR
         // path because Hit ops land in musicInstructions and execute through
         // InstructionExecutor like any other note/chord.
@@ -581,11 +624,11 @@ void AIChatConsoleContent::RequestThread::run() {
         // of generating from scratch. Output still lands in a new clip (the
         // executor never inherits the selected clip).
         if (owner_.drummerAgent_) {
-            std::string drummerMessage = message;
+            std::string drummerMessage = contextualMessage;
             if (owner_.selectedClipContextAvailable_ && owner_.selectedClipContextEnabled_) {
                 auto contextPreamble = formatSelectedClipsAsDrummerContext();
                 if (contextPreamble.isNotEmpty()) {
-                    drummerMessage = contextPreamble.toStdString() + "\nUser request: " + message;
+                    drummerMessage = contextPreamble.toStdString() + "\n" + contextualMessage;
                 }
             }
             auto result = owner_.drummerAgent_->generateStreaming(drummerMessage, onToken);
@@ -597,6 +640,34 @@ void AIChatConsoleContent::RequestThread::run() {
                 musicInstructions = std::move(result.instructions);
                 musicDescription = std::move(result.description);
             }
+        }
+    } else if (intent == magda::ConsoleIntent::Session) {
+        // Session (Live) view hard-scopes here (#1402). The session agent isn't
+        // built yet (stub); the real clip-launch/scene/performance agent is a
+        // later issue. Surface a clear notice rather than silently doing nothing.
+        error = "The session agent isn't available yet.";
+    } else if (intent == magda::ConsoleIntent::Mixing) {
+        // Mixer view hard-scopes here (#1402). The measured analysis is gathered
+        // by the mixer's Analyze button (#886) and held by MixAnalysisService; we
+        // hand that measured data to the agent as context and let the user discuss
+        // it. The typed message is the question. We're off the message thread, so
+        // streaming the prose token-by-token (like the other intents) is safe.
+        auto cached = magda::MixAnalysisService::getInstance().latest();
+        if (!cached.has_value() || cached->tracks.empty()) {
+            error = "No mix analysis yet. Run one from the mixer's Analyze button first.";
+        } else {
+            magda::MixAnalysisAgent::Input input = std::move(*cached);
+            input.question = message;           // empty => a general assessment
+            input.priorContext = priorContext;  // continuity across analyses (#886)
+
+            magda::MixAnalysisAgent mixAgent;
+            auto r = mixAgent.generateStreaming(input, onToken);
+            if (threadShouldExit())
+                return;
+            if (r.hasError)
+                error = r.error.empty() ? "Mix analysis failed." : r.error;
+            else
+                mixAnalysis = std::move(r.analysis);
         }
     }
 
@@ -619,12 +690,19 @@ void AIChatConsoleContent::RequestThread::run() {
     juce::MessageManager::callAsync(
         [safeThis, dsl = std::move(dslCode), musicIR = std::move(musicInstructions),
          musicDesc = std::move(musicDescription), autoIR = std::move(autoInstructions),
-         error = std::move(error), anchor, routerMs, agentMs, totalMs]() {
+         mixAnalysis = std::move(mixAnalysis), error = std::move(error), userMsg = message,
+         channel = convoChannel, anchor, routerMs, agentMs, totalMs]() {
             if (!safeThis)
                 return;
 
+            // Execution runs synchronously on the message thread; a multi-track
+            // fan-out can take a beat. Show the busy cursor so there's feedback
+            // even while the thread is occupied (a spinner couldn't animate).
+            juce::MouseCursor::showWaitCursor();
+
             std::string response;
-            bool hasContent = !dsl.empty() || !musicIR.empty() || !autoIR.empty();
+            bool hasContent =
+                !dsl.empty() || !musicIR.empty() || !autoIR.empty() || !mixAnalysis.empty();
 
             if (!error.empty() && !hasContent) {
                 response = error;
@@ -635,6 +713,10 @@ void AIChatConsoleContent::RequestThread::run() {
                 // the piano-roll, producing O(n^2) work and a visible stall
                 // between stream-end and notes appearing on screen.
                 magda::ClipManager::BatchScope batchScope;
+                // Same idea for structural track changes: an "all tracks"
+                // fan-out (group/mute/fx across N tracks) fires tracksChanged()
+                // per track, rebuilding every track/mixer panel N times.
+                magda::TrackManager::BatchScope trackBatch;
 
                 // Execute DSL from command agent
                 int commandClipId = -1;
@@ -709,9 +791,21 @@ void AIChatConsoleContent::RequestThread::run() {
                     }
                 }
 
+                // Mix-analysis agent (#886): plain prose, no DSL/IR to execute.
+                if (!mixAnalysis.empty()) {
+                    if (!response.empty())
+                        response += "\n";
+                    response += mixAnalysis;
+                }
+
                 if (!error.empty())
                     response += "\n[Warning] " + error;
             }
+
+            // Record the exchange into the view's conversation thread before the
+            // timing footer is added, so the stored reply is clean prose the next
+            // turn can build on.
+            safeThis->conversation_.record(channel, userMsg, response);
 
             // Append timing info
             auto formatMs = [](double ms) -> std::string {
@@ -755,6 +849,7 @@ void AIChatConsoleContent::RequestThread::run() {
             safeThis->processing_ = false;
             safeThis->restoreSendIcon();
             safeThis->inputBox_->grabKeyboardFocus();
+            juce::MouseCursor::hideWaitCursor();
         });
 }
 
@@ -810,6 +905,15 @@ AIChatConsoleContent::AIChatConsoleContent() {
         juce::Drawable::createFromImageData(BinaryData::clip_svg, BinaryData::clip_svgSize);
     drumIconDrawable_ = juce::Drawable::createFromImageData(BinaryData::drum_grid_svg,
                                                             BinaryData::drum_grid_svgSize);
+    // View-context glyphs (#1402), matching the footer view switcher.
+    sessionIconDrawable_ = juce::Drawable::createFromImageData(
+        BinaryData::iconsessionboldm_svg, BinaryData::iconsessionboldm_svgSize);
+    arrangeIconDrawable_ = juce::Drawable::createFromImageData(
+        BinaryData::iconarrangementboldm_svg, BinaryData::iconarrangementboldm_svgSize);
+    mixIconDrawable_ = juce::Drawable::createFromImageData(BinaryData::iconmixboldm_svg,
+                                                           BinaryData::iconmixboldm_svgSize);
+    currentViewMode_ = magda::ViewModeController::getInstance().getViewMode();
+    magda::ViewModeController::getInstance().addListener(this);
 
     // Context label (always visible, inside bottom bar)
     contextLabel_.setFont(FontManager::getInstance().getMonoFont(11.0f));
@@ -833,6 +937,17 @@ AIChatConsoleContent::AIChatConsoleContent() {
     };
     selectedClipContextToggle_.setVisible(false);
     addAndMakeVisible(selectedClipContextToggle_);
+
+    // Mix analysis is gathered from the mixer's Analyze button now (#886); this
+    // panel observes MixAnalysisService so it can show a "mix analysis ready" chip
+    // in mixer view and use the latest measurement as agent context.
+    analysisChip_.setJustificationType(juce::Justification::centredLeft);
+    analysisChip_.setFont(juce::Font(11.0f));
+    analysisChip_.setColour(juce::Label::textColourId,
+                            DarkTheme::getColour(DarkTheme::ACCENT_CYAN));
+    analysisChip_.setInterceptsMouseClicks(false, false);
+    addChildComponent(analysisChip_);
+    magda::MixAnalysisService::getInstance().addListener(this);
 
     // Send button (embedded in bottom bar) — SVG icon
     auto enterSvg =
@@ -870,6 +985,9 @@ AIChatConsoleContent::AIChatConsoleContent() {
     clearButton_.setAlpha(0.35f);
     clearButton_.onClick = [this]() {
         chatHistory_.setText(juce::String::charToString(0x25C6) + " MAGDA\n\n");
+        // The visible chat is one shared buffer across views, so clearing it
+        // wipes every view's conversation memory too.
+        conversation_.clearAll();
     };
     addAndMakeVisible(clearButton_);
 
@@ -1015,8 +1133,6 @@ AIChatConsoleContent::AIChatConsoleContent() {
     }
 
     // Create agents
-    agent_ = std::make_unique<magda::DAWAgent>(*magdaApi_);  // legacy DSL REPL
-    agent_->start();
     routerAgent_ = std::make_unique<magda::RouterAgent>();
     commandAgent_ = std::make_unique<magda::CommandAgent>(*magdaApi_);
     musicAgent_ = std::make_unique<magda::MusicAgent>();
@@ -1027,6 +1143,8 @@ AIChatConsoleContent::AIChatConsoleContent() {
 }
 
 AIChatConsoleContent::~AIChatConsoleContent() {
+    magda::MixAnalysisService::getInstance().removeListener(this);
+    magda::ViewModeController::getInstance().removeListener(this);
     selectedClipContextToggle_.setLookAndFeel(nullptr);
     if (dslEditor_)
         dslEditor_->removeKeyListener(this);
@@ -1042,8 +1160,6 @@ AIChatConsoleContent::~AIChatConsoleContent() {
 
     // Signal cancellation
     shouldStop_ = true;
-    if (agent_)
-        agent_->requestCancel();
     if (routerAgent_)
         routerAgent_->requestCancel();
     if (commandAgent_)
@@ -1069,9 +1185,6 @@ AIChatConsoleContent::~AIChatConsoleContent() {
             DBG("AIChatConsole: Warning - controller thread did not stop within timeout");
         controllerThread_.reset();
     }
-
-    if (agent_)
-        agent_->stop();
 }
 
 juce::String AIChatConsoleContent::resolveAliases(const juce::String& text) {
@@ -1150,8 +1263,6 @@ void AIChatConsoleContent::sendMessage(const juce::String& text) {
 
     // If a previous request thread is still around, stop it before starting a new one
     if (requestThread_ && requestThread_->isThreadRunning()) {
-        if (agent_)
-            agent_->requestCancel();
         if (routerAgent_)
             routerAgent_->requestCancel();
         if (commandAgent_)
@@ -1189,8 +1300,6 @@ void AIChatConsoleContent::sendMessage(const juce::String& text) {
 
     // Reset cancel state and start new request
     shouldStop_ = false;
-    if (agent_)
-        agent_->resetCancel();
     if (routerAgent_)
         routerAgent_->resetCancel();
     if (commandAgent_)
@@ -1216,8 +1325,6 @@ void AIChatConsoleContent::cancelRequest() {
         return;
 
     shouldStop_ = true;
-    if (agent_)
-        agent_->requestCancel();
     if (routerAgent_)
         routerAgent_->requestCancel();
     if (commandAgent_)
@@ -1315,14 +1422,21 @@ void AIChatConsoleContent::paint(juce::Graphics& g) {
                              combined.getRight() - 1.0f);
 
         // Draw context icon
-        if (contextIcon_ != ContextIcon::None) {
+        {
+            // #1402: the context glyph reflects the active view, not selection.
             juce::Drawable* icon = nullptr;
-            if (contextIcon_ == ContextIcon::Drummer)
-                icon = drumIconDrawable_.get();
-            else if (contextIcon_ == ContextIcon::Track || contextIcon_ == ContextIcon::Device)
-                icon = trackIconDrawable_.get();
-            else if (contextIcon_ == ContextIcon::Clip)
-                icon = clipIconDrawable_.get();
+            switch (currentViewMode_) {
+                case magda::ViewMode::Live:
+                    icon = sessionIconDrawable_.get();
+                    break;
+                case magda::ViewMode::Arrange:
+                    icon = arrangeIconDrawable_.get();
+                    break;
+                case magda::ViewMode::Mix:
+                case magda::ViewMode::Master:
+                    icon = mixIconDrawable_.get();
+                    break;
+            }
 
             if (icon) {
                 auto iconBounds = contextIconBounds_.toFloat().reduced(6.0f);
@@ -1333,9 +1447,15 @@ void AIChatConsoleContent::paint(juce::Graphics& g) {
                 auto iconCopy = icon->createCopy();
                 iconCopy->replaceColour(svgGrey, colour);
                 iconCopy->replaceColour(svgWhite, colour);
+                // The footer view glyphs use fill="currentColor", which JUCE
+                // resolves to black. Recolour that too (matches SvgButton) or
+                // the icon renders dark regardless of the grey/white swaps.
+                iconCopy->replaceColour(juce::Colours::black, colour);
+                iconCopy->replaceColour(juce::Colour(0xFF000000), colour);
                 iconCopy->drawWithin(g, iconBounds, juce::RectanglePlacement::centred, 1.0f);
             }
         }
+
     } else {
         // Draw DSL output area as rounded panel
         auto outputBounds = dslOutput_.getBounds().toFloat();
@@ -1360,7 +1480,15 @@ void AIChatConsoleContent::resized() {
         // Context bar above tabs
         auto bottomBar = bounds.removeFromBottom(26);
         bottomBarBounds_ = bottomBar;
+
+        // Footer right edge, from the right: send, then the mix-analysis chip
+        // (#886, mixer view when an analysis is ready), then the clip-context
+        // toggle when a drum clip is in context.
         sendButton_.setBounds(bottomBar.removeFromRight(22));
+        if (analysisChip_.isVisible()) {
+            bottomBar.removeFromRight(6);
+            analysisChip_.setBounds(bottomBar.removeFromRight(120));
+        }
         if (selectedClipContextToggle_.isVisible()) {
             bottomBar.removeFromRight(6);
             selectedClipContextToggle_.setBounds(bottomBar.removeFromRight(86));
@@ -1416,6 +1544,7 @@ void AIChatConsoleContent::resized() {
 void AIChatConsoleContent::onActivated() {
     buildAliasList();
     updateConfigStatus();
+    updateAnalysisChip();
     if (isShowing()) {
         if (activeTab_ == ConsoleTab::AI)
             inputBox_->grabKeyboardFocus();
@@ -1556,6 +1685,9 @@ void AIChatConsoleContent::projectOpened(const magda::ProjectInfo& /*info*/) {
     // Reset chat history
     chatHistory_.setText(juce::String::charToString(0x25C6) + " MAGDA\n\n");
 
+    // A different project means a fresh conversation; drop all view memory.
+    conversation_.clearAll();
+
     // Cancel any in-flight request
     cancelRequest();
 }
@@ -1566,6 +1698,40 @@ void AIChatConsoleContent::projectOpened(const magda::ProjectInfo& /*info*/) {
 
 void AIChatConsoleContent::configChanged() {
     updateConfigStatus();
+}
+
+void AIChatConsoleContent::viewModeChanged(magda::ViewMode mode, const magda::AudioEngineProfile&) {
+    if (currentViewMode_ == mode)
+        return;
+    currentViewMode_ = mode;
+    // Reflect the view in the context glyph. The active view also scopes agent
+    // routing in RequestThread::run (mixer view -> mixing agent, #1402).
+    updateContextBar();
+    // The mix-analysis chip is mixer-view only, so refresh it on view change.
+    updateAnalysisChip();
+}
+
+// ============================================================================
+// Mix analysis context (#886) — gathered by the mixer's Analyze button, held by
+// MixAnalysisService; the console surfaces it as a chip and uses it as context.
+// ============================================================================
+
+void AIChatConsoleContent::mixAnalysisChanged() {
+    updateAnalysisChip();
+}
+
+void AIChatConsoleContent::updateAnalysisChip() {
+    const bool mixerView =
+        (currentViewMode_ == magda::ViewMode::Mix || currentViewMode_ == magda::ViewMode::Master);
+    const bool haveAnalysis = magda::MixAnalysisService::getInstance().latest().has_value();
+    const bool show = mixerView && haveAnalysis;
+    if (show)
+        analysisChip_.setText(juce::String::charToString(0x25C6) + " mix analysis ready",
+                              juce::dontSendNotification);
+    if (analysisChip_.isVisible() != show) {
+        analysisChip_.setVisible(show);
+        resized();  // reflow the footer
+    }
 }
 
 // ============================================================================
@@ -1579,6 +1745,7 @@ void AIChatConsoleContent::selectionTypeChanged(magda::SelectionType newType) {
         selectedClipContextAvailable_ = false;
         updateContextBar();
     }
+    updateAnalysisChip();
 }
 
 namespace {
@@ -1849,10 +2016,15 @@ void AIChatConsoleContent::updateConfigStatus() {
             status = status.substring(0, 1).toUpperCase() + status.substring(1);
     }
 
-    if (musicCfg.model.empty())
+    if (preset == magda::preset::LOCAL_SERVER) {
+        auto serverModel = config.getLocalServerModel();
+        status +=
+            " | " + (serverModel.empty() ? juce::String("No model") : juce::String(serverModel));
+    } else if (musicCfg.model.empty()) {
         status += " | Embedded";
-    else
+    } else {
         status += " | " + juce::String(musicCfg.model);
+    }
 
     // If embedded local provider, show model status + toggle button
     if (isLocalPreset() && serverToggleButton_) {

@@ -25,7 +25,11 @@ class TrackApi {
     virtual ~TrackApi() = default;
 
     virtual TrackId createTrack(const juce::String& name, TrackType type) = 0;
+    virtual TrackId groupTracks(const std::vector<TrackId>& trackIds, const juce::String& name) = 0;
     virtual void deleteTrack(TrackId trackId) = 0;
+    // Move a track to a 1-based position among its siblings (top-level tracks,
+    // or its parent group's children). Position is clamped to range.
+    virtual void moveTrackToPosition(TrackId trackId, int oneBasedPosition) = 0;
 
     virtual int getNumTracks() const = 0;
     virtual const std::vector<TrackInfo>& getTracks() const = 0;
@@ -33,6 +37,7 @@ class TrackApi {
     virtual const TrackInfo* getTrack(TrackId trackId) const = 0;
 
     virtual void setTrackName(TrackId trackId, const juce::String& name) = 0;
+    virtual void setTrackColour(TrackId trackId, juce::Colour colour) = 0;
     virtual void setTrackVolume(TrackId trackId, float volume, bool fromAutomation = false) = 0;
     virtual void setTrackPan(TrackId trackId, float pan, bool fromAutomation = false) = 0;
     virtual void setTrackMuted(TrackId trackId, bool muted) = 0;

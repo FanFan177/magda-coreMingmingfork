@@ -17,11 +17,18 @@ inline constexpr const char* GEMINI = "gemini";
 inline constexpr const char* DEEPSEEK = "deepseek";
 inline constexpr const char* OPENROUTER = "openrouter";
 inline constexpr const char* LLAMA_LOCAL = "llama_local";
+// Generic local / OpenAI-compatible HTTP server (LM Studio, Ollama, GPUStack,
+// llama.cpp server, ...). Configured by base URL; routed through OpenAI-Chat.
+inline constexpr const char* LOCAL_SERVER = "local_server";
 }  // namespace provider
+
+// Default base URL for the generic local server (Ollama's default port).
+inline constexpr const char* DEFAULT_LOCAL_SERVER_URL = "http://localhost:11434/v1";
 
 // --- Preset IDs ---
 namespace preset {
 inline constexpr const char* LOCAL_EMBEDDED = "local_embedded";
+inline constexpr const char* LOCAL_SERVER = "local_server";
 inline constexpr const char* CLOUD_OPENAI = "cloud_openai";
 inline constexpr const char* CLOUD_ANTHROPIC = "cloud_anthropic";
 inline constexpr const char* CLOUD_GEMINI = "cloud_gemini";
@@ -42,7 +49,9 @@ inline constexpr const char* GPT_5_NANO = "gpt-5-nano";
 inline constexpr const char* GPT_5_4 = "gpt-5.4";
 inline constexpr const char* GPT_5_5 = "gpt-5.5";
 // Anthropic
-inline constexpr const char* CLAUDE_OPUS = "claude-opus-4-6";
+inline constexpr const char* CLAUDE_OPUS_4_7 = "claude-opus-4-7";
+inline constexpr const char* CLAUDE_OPUS_4_8 = "claude-opus-4-8";
+inline constexpr const char* CLAUDE_OPUS = CLAUDE_OPUS_4_8;  // latest Opus
 inline constexpr const char* CLAUDE_SONNET = "claude-sonnet-4-6";
 inline constexpr const char* CLAUDE_HAIKU = "claude-haiku-4-5-20251001";
 // Gemini

@@ -15,6 +15,8 @@ dsl_grammar.hpp
     internal_plugins.hpp
     compact_parser.hpp
     compact_parser.cpp
+    conversation_store.hpp
+    conversation_store.cpp
     instruction_executor.hpp
     instruction_executor.cpp
     llm_config_utils.hpp
@@ -28,6 +30,8 @@ dsl_grammar.hpp
     drummer_agent.cpp
     gain_staging_agent.hpp
     gain_staging_agent.cpp
+    mixing_agent.hpp
+    mixing_agent.cpp
     automation_parser.hpp
     automation_parser.cpp
     automation_executor.hpp
@@ -45,8 +49,6 @@ dsl_grammar.hpp
     llm_client_factory.hpp
     model_downloader.hpp
     model_downloader.cpp
-    daw_agent.hpp
-    daw_agent.cpp
     four_osc_agent.hpp
     four_osc_agent.cpp
     four_osc_apply.hpp

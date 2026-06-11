@@ -88,9 +88,16 @@ class StubAliasApi : public AliasApi {
 class StubUndoApi : public UndoApi {
   public:
     int executeCalls = 0;
+    int compoundDepth = 0;
 
     void executeCommand(std::unique_ptr<UndoableCommand>) override {
         ++executeCalls;
+    }
+    void beginCompound(const juce::String&) override {
+        ++compoundDepth;
+    }
+    void endCompound() override {
+        --compoundDepth;
     }
 };
 
@@ -178,10 +185,26 @@ class MockTrackApi : public TrackApi {
         TrackId id;
         juce::String value;
     };
+    struct ColourWrite {
+        TrackId id;
+        juce::Colour value;
+    };
+    struct GroupWrite {
+        std::vector<TrackId> ids;
+        juce::String name;
+        TrackId groupId;
+    };
+    struct MoveWrite {
+        TrackId id;
+        int position;
+    };
 
     std::vector<TrackInfo> created;
     std::vector<TrackId> deleted;
     std::vector<NameWrite> nameWrites;
+    std::vector<ColourWrite> colourWrites;
+    std::vector<GroupWrite> groupWrites;
+    std::vector<MoveWrite> moveWrites;
     std::vector<VolumeWrite> volumeWrites;
     std::vector<PanWrite> panWrites;
     std::vector<MuteWrite> muteWrites;
@@ -198,8 +221,21 @@ class MockTrackApi : public TrackApi {
         created.push_back(t);
         return t.id;
     }
+    TrackId groupTracks(const std::vector<TrackId>& ids, const juce::String& name) override {
+        TrackInfo group;
+        group.id = nextId++;
+        group.name = name;
+        group.type = TrackType::Group;
+        group.childIds = ids;
+        tracks.push_back(group);
+        groupWrites.push_back({ids, name, group.id});
+        return group.id;
+    }
     void deleteTrack(TrackId id) override {
         deleted.push_back(id);
+    }
+    void moveTrackToPosition(TrackId id, int oneBasedPosition) override {
+        moveWrites.push_back({id, oneBasedPosition});
     }
     int getNumTracks() const override {
         return static_cast<int>(tracks.size());
@@ -221,6 +257,9 @@ class MockTrackApi : public TrackApi {
     }
     void setTrackName(TrackId id, const juce::String& name) override {
         nameWrites.push_back({id, name});
+    }
+    void setTrackColour(TrackId id, juce::Colour colour) override {
+        colourWrites.push_back({id, colour});
     }
     void setTrackVolume(TrackId id, float v, bool /*fromAuto*/) override {
         volumeWrites.push_back({id, v});

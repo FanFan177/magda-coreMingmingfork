@@ -25,8 +25,9 @@ statement: track_statement
 // Track statements
 track_statement: "track" "(" params? ")" chain?
 
-// Filter statements (for bulk operations)
-filter_statement: "filter" "(" "tracks" "," condition ")" chain?
+// Filter statements (for bulk operations). Omitting the condition targets
+// every track - used for the master-selected "all tracks" fan-out.
+filter_statement: "filter" "(" "tracks" ("," condition)? ")" chain?
 
 // Groove statements (swing/shuffle templates)
 groove_statement: "groove" "." groove_method
@@ -54,6 +55,8 @@ method_call: "clip" "." "new" "(" params? ")"
            | "clip" "." "delete" "(" params? ")"
            | "clips" "." "select" "(" clip_condition ")"
            | "track" "." "set" "(" params? ")"
+           | "track" "." "group" "(" params? ")"
+           | "track" "." "move" "(" params? ")"
            | "fx" "." "add" "(" params? ")"
            | "notes" "." "select" "(" note_condition ")"
            | "notes" "." "delete" "(" ")"
@@ -116,7 +119,9 @@ IMPORTANT: When the user says "create a track", always use new=true to ensure a 
 METHOD CHAINING:
 - .clip.new(bar=3, length_bars=4) - Create MIDI clip at bar
 - .clip.new(length_bars=4) - Create MIDI clip after the last clip on the track (omit bar to auto-place)
-- .track.set(name="X", volume_db=-3, pan=0.5, mute=true, solo=true)
+- .track.set(name="X", colour="#ff5a36", volume_db=-3, pan=0.5, mute=true, solo=true)
+- .track.group(name="Drums", tracks="1,2,3") - Group existing tracks by 1-based IDs from the state snapshot; context switches to the new group
+- .track.move(index=N) - Move the track (or group) to 1-based position N among its siblings (top-level tracks, or its parent group's children)
 - .fx.add(name="eq") - Add internal FX (eq, compressor, reverb, delay, chorus, phaser, filter, utility, pitch shift, ir reverb)
 - .fx.add(name="<plugin_alias>") - Add third-party plugin using alias token (e.g. <serum_2>, <pro_q_3>, <surge_xt>)
 - .fx.add(name="Pro-Q 3") - Add plugin by exact display name (prefer alias tokens when available)
@@ -132,9 +137,14 @@ METHOD CHAINING:
 FILTER OPERATIONS (bulk):
 - filter(tracks, track.name == "X").delete() - Delete all tracks named X
 - filter(tracks, track.name == "X").track.set(mute=true) - Mute all tracks named X
+- filter(tracks, track.name == "X").track.group(name="Group") - Group all matching tracks
 - filter(tracks, track.name == "X").select() - Select all matching tracks
 - filter(tracks, track.name == "X").for_each(.clip.new(bar=1, length_bars=4)) - Apply operations to each matched track
 - filter(tracks, track.name == "X").for_each(.fx.add(name="reverb").track.set(mute=true)) - Chain multiple operations per track
+- filter(tracks) - No condition targets EVERY track. Use this for "all tracks": filter(tracks).track.group(name="All"), filter(tracks).track.set(mute=true), etc.
+
+ALL-TRACKS SCOPE:
+- When the state snapshot contains "scope":"all_tracks" (the master track is selected), the user is addressing every track at once. Use filter(tracks) with no condition rather than enumerating ids.
 
 EXAMPLES:
 - "create a bass track" -> track(name="Bass")
@@ -151,6 +161,15 @@ EXAMPLES:
   track(name="Vocals").fx.add(name="reverb")
   track(name="Vocals").fx.add(name="delay")
 - "rename the first clip on track 1 to Intro" -> track(id=1).clip.rename(index=0, name="Intro")
+- "move track 4 to the top" -> track(id=4).track.move(index=1)
+- "move the bass track down to position 3" -> track(name="Bass").track.move(index=3)
+- "group tracks 1, 2, and 3 as Drums" -> track(id=1).track.group(name="Drums", tracks="1,2,3")
+- "group all tracks" (master selected) -> filter(tracks).track.group(name="All Tracks")
+- "mute all tracks" (master selected) -> filter(tracks).track.set(mute=true)
+- "color code drums red" -> track(name="Drums").track.set(colour="#ff5a36")
+- "organize the session into rhythm and vocals groups" ->
+  track(id=1).track.group(name="Rhythm", tracks="1,2,3").track.set(colour="#ff5a36")
+  track(id=4).track.group(name="Vocals", tracks="4,5").track.set(colour="#44c7ff")
 - "rename selected clips to FOO" -> track(id=1).clip.rename(name="FOO")   // omit index to rename selected clips
 - "select track 1" -> track(id=1).select()
 - "select all clips longer than 2 bars on track 1" -> track(id=1).clips.select(clip.length_bars > 2)

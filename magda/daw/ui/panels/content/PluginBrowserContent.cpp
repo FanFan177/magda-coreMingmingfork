@@ -97,9 +97,10 @@ class PluginBrowserContent::PluginTreeItem : public juce::TreeViewItem {
             bounds.removeFromLeft(16);
         }
 
-        // Plugin type icon
+        // Plugin type icon (capped to a small square so the glyphs don't
+        // dominate the row height)
         auto iconArea = bounds.removeFromLeft(18);
-        auto iconBounds = iconArea.toFloat().reduced(1.0f);
+        auto iconBounds = iconArea.toFloat().withSizeKeepingCentre(12.0f, 12.0f);
         if (plugin_.category == "Instrument" && owner_.instrumentIcon_) {
             owner_.instrumentIcon_->drawWithin(g, iconBounds, juce::RectanglePlacement::centred,
                                                1.0f);
@@ -251,20 +252,20 @@ class PluginBrowserContent::CategoryTreeItem : public juce::TreeViewItem {
 PluginBrowserContent::PluginBrowserContent() {
     setName("Plugin Browser");
 
-    instrumentIcon_ = juce::Drawable::createFromImageData(BinaryData::INSTRUMENT_DEVICE_svg,
-                                                          BinaryData::INSTRUMENT_DEVICE_svgSize);
+    instrumentIcon_ = juce::Drawable::createFromImageData(BinaryData::instrumentdevice_svg,
+                                                          BinaryData::instrumentdevice_svgSize);
     if (instrumentIcon_)
         instrumentIcon_->replaceColour(juce::Colour(0xFFB3B3B3),
                                        DarkTheme::getColour(DarkTheme::TEXT_SECONDARY));
 
-    effectIcon_ = juce::Drawable::createFromImageData(BinaryData::AUDIODEVICE_svg,
-                                                      BinaryData::AUDIODEVICE_svgSize);
+    effectIcon_ = juce::Drawable::createFromImageData(BinaryData::audiodevice_svg,
+                                                      BinaryData::audiodevice_svgSize);
     if (effectIcon_)
         effectIcon_->replaceColour(juce::Colour(0xFFB3B3B3),
                                    DarkTheme::getColour(DarkTheme::TEXT_SECONDARY));
 
-    midiIcon_ = juce::Drawable::createFromImageData(BinaryData::MIDIDEVICE_svg,
-                                                    BinaryData::MIDIDEVICE_svgSize);
+    midiIcon_ = juce::Drawable::createFromImageData(BinaryData::mididevice_svg,
+                                                    BinaryData::mididevice_svgSize);
     if (midiIcon_)
         midiIcon_->replaceColour(juce::Colour(0xFFB3B3B3),
                                  DarkTheme::getColour(DarkTheme::TEXT_SECONDARY));

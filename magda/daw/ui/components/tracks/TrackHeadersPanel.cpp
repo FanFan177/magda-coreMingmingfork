@@ -23,6 +23,7 @@
 #include "../../themes/DarkTheme.hpp"
 #include "../../themes/FontManager.hpp"
 #include "../../themes/SmallButtonLookAndFeel.hpp"
+#include "../../utils/SelectionPolicy.hpp"
 #include "../automation/AutomationLaneComponent.hpp"
 #include "../mixer/LevelMeterBallistics.hpp"
 #include "../mixer/RoutingSyncHelper.hpp"
@@ -532,9 +533,26 @@ class SessionModeButton : public juce::Component {
 };
 }  // namespace
 
+namespace {
+// Track name label that yields to selection-modifier clicks: Cmd/Shift+click
+// must toggle / range-select the track (handled by the panel's child mouse
+// listener), not open the rename editor.
+class TrackNameLabel : public juce::Label {
+  public:
+    using juce::Label::Label;
+
+  protected:
+    void mouseUp(const juce::MouseEvent& e) override {
+        if (magda::isToggleSelectClick(e.mods) || magda::isRangeSelectClick(e.mods))
+            return;
+        juce::Label::mouseUp(e);
+    }
+};
+}  // namespace
+
 TrackHeadersPanel::TrackHeader::TrackHeader(const juce::String& trackName) : name(trackName) {
     // Create UI components
-    nameLabel = std::make_unique<juce::Label>("trackName", trackName);
+    nameLabel = std::make_unique<TrackNameLabel>("trackName", trackName);
     nameLabel->setEditable(true);
     nameLabel->setColour(juce::Label::textColourId, DarkTheme::getColour(DarkTheme::TEXT_PRIMARY));
     nameLabel->setColour(juce::Label::backgroundColourId, juce::Colours::transparentBlack);
@@ -1095,6 +1113,7 @@ void TrackHeadersPanel::tracksChanged() {
     for (auto& header : trackHeaders) {
         removeChildComponent(header->nameLabel.get());
         removeChildComponent(header->muteButton.get());
+        removeChildComponent(header->masterMuteButton.get());
         removeChildComponent(header->soloButton.get());
         removeChildComponent(header->volumeLabel.get());
         removeChildComponent(header->panLabel.get());
@@ -1150,9 +1169,13 @@ void TrackHeadersPanel::tracksChanged() {
 
         // Add components
         addAndMakeVisible(*header->nameLabel);
-        addAndMakeVisible(*header->muteButton);
-        if (header->isMaster)
-            addChildComponent(*header->masterMuteButton);  // shown by layout for master
+        if (header->isMaster) {
+            addChildComponent(*header->muteButton);
+            addAndMakeVisible(*header->masterMuteButton);
+        } else {
+            addAndMakeVisible(*header->muteButton);
+            addChildComponent(*header->masterMuteButton);
+        }
         addAndMakeVisible(*header->soloButton);
         addAndMakeVisible(*header->recordButton);
         addAndMakeVisible(*header->monitorButton);
@@ -2099,7 +2122,8 @@ void TrackHeadersPanel::rebuildSendLabels(TrackHeader& header, TrackId trackId) 
             menu.addItem(1, tr("tracks.remove_send_label"));
             menu.showMenuAsync(juce::PopupMenu::Options(), [trackId, busIndex](int result) {
                 if (result == 1) {
-                    TrackManager::getInstance().removeSend(trackId, busIndex);
+                    UndoManager::getInstance().executeCommand(
+                        std::make_unique<RemoveSendCommand>(trackId, busIndex));
                 }
             });
         };
@@ -2145,7 +2169,7 @@ void TrackHeadersPanel::paintTrackHeader(juce::Graphics& g, const TrackHeader& h
 
     // Group indicator color strip on outer edge
     if (header.isGroup) {
-        g.setColour(DarkTheme::getColour(DarkTheme::ACCENT_ORANGE).withAlpha(0.7f));
+        g.setColour(header.trackColour.withAlpha(0.95f));
         int stripX = headersOnRight_ ? bgArea.getRight() - 3 : bgArea.getX();
         g.fillRect(stripX, bgArea.getY(), 3, bgArea.getHeight());
     }
@@ -2581,6 +2605,15 @@ AutomationLaneId TrackHeadersPanel::findLaneResizeHandleAt(juce::Point<int> pos)
 }
 
 void TrackHeadersPanel::mouseDown(const juce::MouseEvent& event) {
+    // addMouseListener(this, true) makes clicks that land directly on the
+    // panel arrive twice: once via the normal virtual and once via the
+    // self-listener. Toggle selection is self-inverting, so the duplicate
+    // delivery used to undo it instantly. Drop the second delivery of the
+    // same physical event (identical event time).
+    if (event.eventTime == lastMouseDownEventTime_)
+        return;
+    lastMouseDownEventTime_ = event.eventTime;
+
     // Convert to panel coordinates (handles clicks forwarded from children)
     auto localEvent = event.getEventRelativeTo(this);
     auto pos = localEvent.getPosition();
@@ -2628,11 +2661,22 @@ void TrackHeadersPanel::mouseDown(const juce::MouseEvent& event) {
                 // child's own onClick still fires (e.g. cmd-clicking the mute
                 // button still toggles mute); accepted trade-off.
                 const bool fromChild = event.originalComponent != this;
-                if (event.mods.isCommandDown() && !event.mods.isPopupMenu()) {
+
+                // Right-click is an action target, not a selection gesture. If
+                // the clicked track is already part of a multi-selection, keep
+                // that selection intact so context-menu actions can operate on
+                // the full selected track set.
+                if (event.mods.isPopupMenu()) {
+                    if (!fromChild)
+                        showContextMenu(i, pos);
+                    break;
+                }
+
+                if (magda::isToggleSelectClick(event.mods)) {
                     // Cmd+click: toggle track in multi-selection
                     SelectionManager::getInstance().toggleTrackSelection(trackId);
                     grabKeyboardFocus();
-                } else if (event.mods.isShiftDown() && !event.mods.isPopupMenu()) {
+                } else if (magda::isRangeSelectClick(event.mods)) {
                     // Shift+click: range select from anchor to clicked track
                     auto anchorTrack = SelectionManager::getInstance().getAnchorTrack();
                     int anchorIndex = -1;
@@ -2665,11 +2709,8 @@ void TrackHeadersPanel::mouseDown(const juce::MouseEvent& event) {
                     }
                 }
 
-                // Right-click shows context menu (only for direct clicks, not child forwards)
-                if (event.mods.isPopupMenu() && event.originalComponent == this) {
-                    showContextMenu(i, pos);
-                } else if (event.originalComponent == this && !event.mods.isCommandDown() &&
-                           !event.mods.isShiftDown()) {
+                if (event.originalComponent == this && !event.mods.isCommandDown() &&
+                    !event.mods.isShiftDown()) {
                     // Record potential drag start (plain clicks or clicks on multi-selected track)
                     draggedTrackIndex_ = i;
                     dragStartX_ = localEvent.x;
@@ -2887,6 +2928,8 @@ void TrackHeadersPanel::showContextMenu(int trackIndex, juce::Point<int> positio
         DuplicateContentOnly = 7,
         ToggleFreeze = 8,
         PreferDrumGrid = 9,
+        GroupSelectedTracks = 10,
+        UngroupTracks = 11,
 
         MoveToGroupBase = 100,
         AddSendBase = 500,
@@ -2905,6 +2948,8 @@ void TrackHeadersPanel::showContextMenu(int trackIndex, juce::Point<int> positio
         menu.addItem(CollapseToggle, track->isCollapsedIn(currentViewMode_)
                                          ? tr("tracks.expand_group")
                                          : tr("tracks.collapse_group"));
+        if (!track->childIds.empty())
+            menu.addItem(UngroupTracks, "Ungroup tracks");
         menu.addSeparator();
     }
 
@@ -2934,6 +2979,12 @@ void TrackHeadersPanel::showContextMenu(int trackIndex, juce::Point<int> positio
     if (!track->isTopLevel()) {
         menu.addItem(RemoveFromGroup, tr("tracks.remove_from_group"));
     }
+
+    auto& selection = SelectionManager::getInstance();
+    const bool canGroupSelectedTracks =
+        selection.getSelectedTrackCount() >= 2 && selection.isTrackSelected(header.trackId);
+    if (canGroupSelectedTracks)
+        menu.addItem(GroupSelectedTracks, "Group tracks");
 
     menu.addSeparator();
 
@@ -3047,7 +3098,26 @@ void TrackHeadersPanel::showContextMenu(int trackIndex, juce::Point<int> positio
             if (result == CollapseToggle) {
                 handleCollapseToggle(trackId);
             } else if (result == RemoveFromGroup) {
-                TrackManager::getInstance().removeTrackFromGroup(trackId);
+                UndoManager::getInstance().executeCommand(
+                    std::make_unique<RemoveTrackFromGroupCommand>(trackId));
+            } else if (result == GroupSelectedTracks) {
+                auto& sel = SelectionManager::getInstance();
+                std::vector<TrackId> selectedTracks(sel.getSelectedTracks().begin(),
+                                                    sel.getSelectedTracks().end());
+                auto cmd = std::make_unique<GroupTracksCommand>(selectedTracks, "Group");
+                auto* cmdPtr = cmd.get();
+                UndoManager::getInstance().executeCommand(std::move(cmd));
+                TrackId groupId = cmdPtr->getCreatedGroupId();
+                if (groupId != INVALID_TRACK_ID)
+                    sel.selectTrack(groupId);
+            } else if (result == UngroupTracks) {
+                auto cmd = std::make_unique<UngroupTrackCommand>(trackId);
+                auto childIds = cmd->getChildren();
+                UndoManager::getInstance().executeCommand(std::move(cmd));
+                if (!childIds.empty()) {
+                    std::unordered_set<TrackId> selectedChildren(childIds.begin(), childIds.end());
+                    SelectionManager::getInstance().selectTracks(selectedChildren);
+                }
             } else if (result == DeleteTrack) {
                 auto cmd = std::make_unique<DeleteTrackCommand>(trackId);
                 UndoManager::getInstance().executeCommand(std::move(cmd));
@@ -3083,15 +3153,18 @@ void TrackHeadersPanel::showContextMenu(int trackIndex, juce::Point<int> positio
                 }
             } else if (result >= RemoveSendBase) {
                 int busIndex = result - RemoveSendBase;
-                TrackManager::getInstance().removeSend(trackId, busIndex);
+                UndoManager::getInstance().executeCommand(
+                    std::make_unique<RemoveSendCommand>(trackId, busIndex));
             } else if (result >= AddSendBase) {
                 // Checked after RemoveSendBase to avoid collision when trackId
                 // pushes the value past 600.
                 TrackId auxId = result - AddSendBase;
-                TrackManager::getInstance().addSend(trackId, auxId);
+                UndoManager::getInstance().executeCommand(
+                    std::make_unique<AddSendCommand>(trackId, auxId));
             } else if (result >= MoveToGroupBase) {
                 TrackId groupId = result - MoveToGroupBase;
-                TrackManager::getInstance().addTrackToGroup(trackId, groupId);
+                UndoManager::getInstance().executeCommand(
+                    std::make_unique<AddTrackToGroupCommand>(trackId, groupId));
             }
         });
 }
@@ -3246,8 +3319,10 @@ void TrackHeadersPanel::executeDrop() {
             return;
     }
 
-    if (isMultiDrag)
-        UndoManager::getInstance().beginCompoundOperation("Move Tracks");
+    // A single drag can fan out into several primitives (reparent + reorder),
+    // so always wrap the whole gesture in one compound undo step.
+    auto& undo = UndoManager::getInstance();
+    undo.beginCompoundOperation("Move Tracks");
 
     if (dropTargetType_ == DropTargetType::BetweenTracks && dropTargetIndex_ >= 0) {
         // Determine the target parent based on drop position
@@ -3307,16 +3382,19 @@ void TrackHeadersPanel::executeDrop() {
                 const auto* beforeTrack = trackManager.getTrack(dropBeforeTrackId);
                 if (beforeTrack != nullptr && beforeTrack->parentId == targetParentId)
                     beforeChildId = dropBeforeTrackId;
-                trackManager.moveChildWithinGroup(trackId, beforeChildId);
+                undo.executeCommand(
+                    std::make_unique<MoveChildWithinGroupCommand>(trackId, beforeChildId));
                 continue;
             }
 
-            // Update group membership if needed
+            // Update group membership if needed. addTrackToGroup detaches from the
+            // current parent first, so a single command covers the reparent.
             if (track->parentId != targetParentId) {
-                trackManager.removeTrackFromGroup(trackId);
-                if (targetParentId != INVALID_TRACK_ID) {
-                    trackManager.addTrackToGroup(trackId, targetParentId);
-                }
+                if (targetParentId != INVALID_TRACK_ID)
+                    undo.executeCommand(
+                        std::make_unique<AddTrackToGroupCommand>(trackId, targetParentId));
+                else
+                    undo.executeCommand(std::make_unique<RemoveTrackFromGroupCommand>(trackId));
             }
 
             // Adjust insertion index: if track is currently above insertAt, removing it
@@ -3327,7 +3405,7 @@ void TrackHeadersPanel::executeDrop() {
                 adjustedTarget--;
             }
 
-            trackManager.moveTrack(trackId, adjustedTarget);
+            undo.executeCommand(std::make_unique<MoveTrackToIndexCommand>(trackId, adjustedTarget));
 
             // Next track goes after this one
             insertAt = trackManager.getTrackIndex(trackId) + 1;
@@ -3335,12 +3413,11 @@ void TrackHeadersPanel::executeDrop() {
     } else if (dropTargetType_ == DropTargetType::OntoGroup && dropTargetIndex_ >= 0) {
         TrackId groupId = trackHeaders[dropTargetIndex_]->trackId;
         for (auto trackId : tracksToMove) {
-            trackManager.addTrackToGroup(trackId, groupId);
+            undo.executeCommand(std::make_unique<AddTrackToGroupCommand>(trackId, groupId));
         }
     }
 
-    if (isMultiDrag)
-        UndoManager::getInstance().endCompoundOperation();
+    undo.endCompoundOperation();
 
     // TrackManager will notify listeners which triggers tracksChanged()
 }

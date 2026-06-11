@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <map>
+#include <unordered_set>
 
 #include "../audio/AudioBridge.hpp"
 #include "../audio/MidiBridge.hpp"
@@ -207,16 +208,16 @@ void setChainElementsBypassed(std::vector<ChainElement>& elements, const ChainNo
 }
 
 void enforcePostFxAnalysisDeviceOrder(std::vector<PostFxChainElement>& elements) {
-    auto findAnalysis = [&elements](int order) {
-        return std::find_if(elements.begin(), elements.end(), [order](const auto& element) {
-            return postFxAnalysisDeviceOrder(element.device.pluginId) == order;
-        });
-    };
-
-    auto osc = findAnalysis(0);
-    auto spectrum = findAnalysis(1);
-    if (osc != elements.end() && spectrum != elements.end() && spectrum < osc)
-        std::iter_swap(osc, spectrum);
+    // Keep the analysis devices (oscilloscope, spectrum, levels) in a stable,
+    // canonical order among themselves without disturbing any non-analysis
+    // post-FX devices' relative positions.
+    std::stable_sort(elements.begin(), elements.end(), [](const auto& a, const auto& b) {
+        const int oa = postFxAnalysisDeviceOrder(a.device.pluginId);
+        const int ob = postFxAnalysisDeviceOrder(b.device.pluginId);
+        if (oa < 0 || ob < 0)
+            return false;  // leave non-analysis devices where they are
+        return oa < ob;
+    });
 }
 
 }  // namespace
@@ -342,6 +343,173 @@ TrackId TrackManager::createTrack(const juce::String& name, TrackType type) {
 TrackId TrackManager::createGroupTrack(const juce::String& name) {
     juce::String groupName = name.isEmpty() ? "Group" : name;
     return createTrack(groupName, TrackType::Group);
+}
+
+TrackId TrackManager::groupTracks(const std::vector<TrackId>& trackIds, const juce::String& name) {
+    if (trackIds.size() < 2)
+        return INVALID_TRACK_ID;
+
+    // createGroupTrack/moveTrack/addTrackToGroup each fire notifyTracksChanged();
+    // coalesce them so the UI rebuilds once instead of once per grouped track.
+    BatchScope batch;
+
+    std::unordered_set<TrackId> requested(trackIds.begin(), trackIds.end());
+    requested.erase(INVALID_TRACK_ID);
+    requested.erase(MASTER_TRACK_ID);
+
+    std::vector<TrackId> tracksToGroup;
+    tracksToGroup.reserve(requested.size());
+
+    for (const auto& track : tracks_) {
+        if (requested.count(track.id) == 0)
+            continue;
+
+        bool hasSelectedAncestor = false;
+        TrackId parentId = track.parentId;
+        while (parentId != INVALID_TRACK_ID) {
+            if (requested.count(parentId) != 0) {
+                hasSelectedAncestor = true;
+                break;
+            }
+
+            const auto* parent = getTrack(parentId);
+            parentId = parent != nullptr ? parent->parentId : INVALID_TRACK_ID;
+        }
+
+        if (!hasSelectedAncestor)
+            tracksToGroup.push_back(track.id);
+    }
+
+    if (tracksToGroup.size() < 2)
+        return INVALID_TRACK_ID;
+
+    int firstSelectedIndex = getTrackIndex(tracksToGroup.front());
+    if (firstSelectedIndex < 0)
+        return INVALID_TRACK_ID;
+
+    TrackId parentGroupId = INVALID_TRACK_ID;
+    bool hasSharedParent = true;
+    if (const auto* firstTrack = getTrack(tracksToGroup.front())) {
+        parentGroupId = firstTrack->parentId;
+        for (auto trackId : tracksToGroup) {
+            const auto* track = getTrack(trackId);
+            if (!track || track->parentId != parentGroupId) {
+                hasSharedParent = false;
+                break;
+            }
+        }
+    } else {
+        hasSharedParent = false;
+    }
+
+    int parentInsertIndex = -1;
+    if (hasSharedParent && parentGroupId != INVALID_TRACK_ID) {
+        if (const auto* parent = getTrack(parentGroupId)) {
+            for (auto trackId : tracksToGroup) {
+                auto it = std::find(parent->childIds.begin(), parent->childIds.end(), trackId);
+                if (it == parent->childIds.end())
+                    continue;
+
+                const int childIndex =
+                    static_cast<int>(std::distance(parent->childIds.begin(), it));
+                parentInsertIndex =
+                    parentInsertIndex < 0 ? childIndex : std::min(parentInsertIndex, childIndex);
+            }
+        }
+    }
+
+    TrackId groupId = createGroupTrack(name);
+    if (groupId == INVALID_TRACK_ID)
+        return INVALID_TRACK_ID;
+
+    moveTrack(groupId, firstSelectedIndex);
+
+    if (hasSharedParent && parentGroupId != INVALID_TRACK_ID) {
+        addTrackToGroup(groupId, parentGroupId);
+
+        if (auto* parent = getTrack(parentGroupId)) {
+            auto& siblings = parent->childIds;
+            siblings.erase(std::remove(siblings.begin(), siblings.end(), groupId), siblings.end());
+
+            auto insertIt = siblings.end();
+            if (parentInsertIndex >= 0) {
+                insertIt = siblings.begin() +
+                           juce::jlimit(0, static_cast<int>(siblings.size()), parentInsertIndex);
+            }
+            siblings.insert(insertIt, groupId);
+        }
+    }
+
+    for (auto trackId : tracksToGroup)
+        addTrackToGroup(trackId, groupId);
+
+    return groupId;
+}
+
+std::vector<TrackId> TrackManager::ungroupTrack(TrackId groupId) {
+    auto* group = getTrack(groupId);
+    if (!group || !group->isGroup() || group->childIds.empty())
+        return {};
+
+    const auto children = group->childIds;
+    const TrackId parentGroupId = group->parentId;
+    const int groupIndex = getTrackIndex(groupId);
+    if (groupIndex < 0)
+        return {};
+
+    int groupSiblingIndex = -1;
+    if (auto* parent = getTrack(parentGroupId)) {
+        auto it = std::find(parent->childIds.begin(), parent->childIds.end(), groupId);
+        if (it != parent->childIds.end())
+            groupSiblingIndex = static_cast<int>(std::distance(parent->childIds.begin(), it));
+    }
+
+    for (auto childId : children) {
+        auto* child = getTrack(childId);
+        if (!child)
+            continue;
+
+        child->parentId = parentGroupId;
+        child->audioOutputDevice =
+            parentGroupId != INVALID_TRACK_ID ? "track:" + juce::String(parentGroupId) : "master";
+        notifyTrackPropertyChanged(childId);
+        syncMultiOutChildOutputsForSource(childId);
+    }
+
+    group = getTrack(groupId);
+    if (!group)
+        return {};
+    group->childIds.clear();
+
+    if (auto* parent = getTrack(parentGroupId)) {
+        auto& siblings = parent->childIds;
+        siblings.erase(std::remove(siblings.begin(), siblings.end(), groupId), siblings.end());
+
+        auto insertIt = siblings.end();
+        if (groupSiblingIndex >= 0) {
+            insertIt = siblings.begin() +
+                       juce::jlimit(0, static_cast<int>(siblings.size()), groupSiblingIndex);
+        }
+        siblings.insert(insertIt, children.begin(), children.end());
+    }
+
+    int insertAt = groupIndex + 1;
+    for (auto childId : children) {
+        int currentIndex = getTrackIndex(childId);
+        if (currentIndex < 0)
+            continue;
+
+        int adjustedTarget = insertAt;
+        if (currentIndex < adjustedTarget)
+            adjustedTarget--;
+
+        moveTrack(childId, adjustedTarget);
+        insertAt = getTrackIndex(childId) + 1;
+    }
+
+    deleteTrack(groupId);
+    notifyTracksChanged();
+    return children;
 }
 
 void TrackManager::deleteTrack(TrackId trackId) {
@@ -814,6 +982,89 @@ void TrackManager::moveChildWithinGroup(TrackId childId, TrackId beforeChildId) 
                          : std::find(children.begin(), children.end(), beforeChildId);
     children.insert(insertPos, childId);
 
+    notifyTracksChanged();
+}
+
+int TrackManager::getTrackSiblingPosition(TrackId trackId) const {
+    const auto* track = getTrack(trackId);
+    if (!track)
+        return 0;
+
+    const std::vector<TrackId>* siblings = nullptr;
+    std::vector<TrackId> topLevel;
+    if (track->hasParent()) {
+        const auto* parent = getTrack(track->parentId);
+        if (!parent)
+            return 0;
+        siblings = &parent->childIds;
+    } else {
+        topLevel = getTopLevelTracks();
+        siblings = &topLevel;
+    }
+
+    for (size_t i = 0; i < siblings->size(); ++i)
+        if ((*siblings)[i] == trackId)
+            return static_cast<int>(i) + 1;
+    return 0;
+}
+
+void TrackManager::moveTrackToPosition(TrackId trackId, int oneBasedPosition) {
+    auto* track = getTrack(trackId);
+    if (!track)
+        return;
+
+    // Grouped track: reorder within the parent's childIds (the display order for
+    // group children). Compute the sibling that should follow it at the target
+    // position and insert before it.
+    if (track->hasParent()) {
+        const auto* parent = getTrack(track->parentId);
+        if (!parent)
+            return;
+        std::vector<TrackId> order = parent->childIds;
+        const int count = static_cast<int>(order.size());
+        if (count <= 1)
+            return;
+        const int pos = juce::jlimit(1, count, oneBasedPosition);
+        order.erase(std::remove(order.begin(), order.end(), trackId), order.end());
+        const TrackId before = (pos - 1 < static_cast<int>(order.size()))
+                                   ? order[static_cast<size_t>(pos - 1)]
+                                   : INVALID_TRACK_ID;
+        moveChildWithinGroup(trackId, before);  // fires notifyTracksChanged()
+        return;
+    }
+
+    // Top-level track (incl. a group header): reorder among top-level tracks.
+    // Display is tree-derived, so only the header's position relative to other
+    // top-level tracks in tracks_ matters; its children follow via childIds.
+    auto topLevel = getTopLevelTracks();
+    const int count = static_cast<int>(topLevel.size());
+    if (count <= 1)
+        return;
+    const int pos = juce::jlimit(1, count, oneBasedPosition);
+
+    std::vector<TrackId> desired;
+    desired.reserve(topLevel.size());
+    for (auto id : topLevel)
+        if (id != trackId)
+            desired.push_back(id);
+    const TrackId anchor = (pos - 1 < static_cast<int>(desired.size()))
+                               ? desired[static_cast<size_t>(pos - 1)]
+                               : INVALID_TRACK_ID;
+
+    auto self = std::find_if(tracks_.begin(), tracks_.end(),
+                             [&](const TrackInfo& t) { return t.id == trackId; });
+    if (self == tracks_.end())
+        return;
+    const TrackInfo info = *self;
+    tracks_.erase(self);
+
+    if (anchor == INVALID_TRACK_ID) {
+        tracks_.push_back(info);
+    } else {
+        auto at = std::find_if(tracks_.begin(), tracks_.end(),
+                               [&](const TrackInfo& t) { return t.id == anchor; });
+        tracks_.insert(at, info);
+    }
     notifyTracksChanged();
 }
 
@@ -1306,6 +1557,40 @@ const std::vector<ChainElement>& TrackManager::getChainElements(TrackId trackId)
         return track->chain.fxChainElements;
     }
     return empty;
+}
+
+std::vector<std::string> TrackManager::getChainSummary(TrackId trackId) const {
+    std::vector<std::string> out;
+    const auto* track = getTrack(trackId);
+    if (track == nullptr)
+        return out;
+
+    auto add = [&out](const DeviceInfo& d) {
+        // Only effect inserts -- the mixing chain. Skip instruments, MIDI
+        // processors and analysis (transparent) devices.
+        if (d.deviceType != DeviceType::Effect)
+            return;
+        juce::String s = d.name;
+        if (d.bypassed)
+            s += " (bypassed)";
+        out.push_back(s.toStdString());
+    };
+
+    std::function<void(const std::vector<ChainElement>&)> walk =
+        [&](const std::vector<ChainElement>& elements) {
+            for (const auto& e : elements) {
+                if (magda::isDevice(e))
+                    add(magda::getDevice(e));
+                else
+                    for (const auto& chain : magda::getRack(e).chains)
+                        walk(chain.elements);
+            }
+        };
+    walk(track->chain.fxChainElements);
+    for (const auto& pf : track->chain.postFxChainElements)
+        add(pf.device);
+
+    return out;
 }
 
 void TrackManager::moveNode(TrackId trackId, int fromIndex, int toIndex) {
@@ -1818,6 +2103,66 @@ void TrackManager::removeChainByPath(const ChainNodePath& chainPath) {
     }
 }
 
+ChainInfo* TrackManager::getChainByPath(const ChainNodePath& chainPath) {
+    if (chainPath.steps.empty() || chainPath.steps.back().type != ChainStepType::Chain)
+        return nullptr;
+
+    const ChainId chainId = chainPath.steps.back().id;
+
+    // Parent rack is the path with the trailing Chain step removed.
+    ChainNodePath rackPath;
+    rackPath.trackId = chainPath.trackId;
+    for (size_t i = 0; i + 1 < chainPath.steps.size(); ++i)
+        rackPath.steps.push_back(chainPath.steps[i]);
+
+    if (auto* rack = getRackByPath(rackPath)) {
+        for (auto& chain : rack->chains) {
+            if (chain.id == chainId)
+                return &chain;
+        }
+    }
+    return nullptr;
+}
+
+const ChainInfo* TrackManager::getChainByPath(const ChainNodePath& chainPath) const {
+    return const_cast<TrackManager*>(this)->getChainByPath(chainPath);
+}
+
+void TrackManager::setChainMuted(const ChainNodePath& chainPath, bool muted) {
+    if (auto* chain = getChainByPath(chainPath)) {
+        chain->muted = muted;
+        notifyTrackDevicesChanged(chainPath.trackId);
+    }
+}
+
+void TrackManager::setChainBypassed(const ChainNodePath& chainPath, bool bypassed) {
+    if (auto* chain = getChainByPath(chainPath)) {
+        chain->bypassed = bypassed;
+        notifyTrackDevicesChanged(chainPath.trackId);
+    }
+}
+
+void TrackManager::setChainSolo(const ChainNodePath& chainPath, bool solo) {
+    if (auto* chain = getChainByPath(chainPath)) {
+        chain->solo = solo;
+        notifyTrackDevicesChanged(chainPath.trackId);
+    }
+}
+
+void TrackManager::setChainVolume(const ChainNodePath& chainPath, float volume) {
+    if (auto* chain = getChainByPath(chainPath)) {
+        chain->volume = juce::jlimit(-60.0f, 6.0f, volume);
+        notifyTrackPropertyChanged(chainPath.trackId);
+    }
+}
+
+void TrackManager::setChainPan(const ChainNodePath& chainPath, float pan) {
+    if (auto* chain = getChainByPath(chainPath)) {
+        chain->pan = juce::jlimit(-1.0f, 1.0f, pan);
+        notifyTrackPropertyChanged(chainPath.trackId);
+    }
+}
+
 ChainInfo* TrackManager::getChain(TrackId trackId, RackId rackId, ChainId chainId) {
     if (auto* rack = getRack(trackId, rackId)) {
         auto& chains = rack->chains;
@@ -1882,6 +2227,17 @@ void TrackManager::setChainVolume(TrackId trackId, RackId rackId, ChainId chainI
 void TrackManager::setChainPan(TrackId trackId, RackId rackId, ChainId chainId, float pan) {
     if (auto* chain = getChain(trackId, rackId, chainId)) {
         chain->pan = juce::jlimit(-1.0f, 1.0f, pan);
+        notifyTrackPropertyChanged(trackId);
+    }
+}
+
+void TrackManager::setChainName(TrackId trackId, RackId rackId, ChainId chainId,
+                                const juce::String& name) {
+    if (auto* chain = getChain(trackId, rackId, chainId)) {
+        auto trimmed = name.trim();
+        if (trimmed.isEmpty() || trimmed == chain->name)
+            return;
+        chain->name = trimmed;
         notifyTrackPropertyChanged(trackId);
     }
 }
@@ -2284,10 +2640,30 @@ void TrackManager::refreshIdCountersFromTracks() {
 // ============================================================================
 
 void TrackManager::notifyTracksChanged() {
+    // While a batch is open, coalesce: record the change and fire once when the
+    // outermost scope closes. A multi-track fan-out (group/mute/fx across N
+    // tracks) would otherwise rebuild every track/mixer panel N times.
+    if (batchDepth_ > 0) {
+        tracksChangedPending_ = true;
+        return;
+    }
     ScopedNotifyGuard guard(*this);
     for (size_t i = 0; i < listeners_.size(); ++i) {
         if (listeners_[i])
             listeners_[i]->tracksChanged();
+    }
+}
+
+void TrackManager::beginBatch() {
+    ++batchDepth_;
+}
+
+void TrackManager::endBatch() {
+    if (batchDepth_ == 0)
+        return;
+    if (--batchDepth_ == 0 && tracksChangedPending_) {
+        tracksChangedPending_ = false;
+        notifyTracksChanged();
     }
 }
 

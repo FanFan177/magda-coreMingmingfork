@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <random>
+#include <sstream>
 
 #include "../daw/api/clip_api.hpp"
 #include "../daw/api/magda_api.hpp"
@@ -21,6 +22,7 @@
 #include "../daw/core/PluginAlias.hpp"
 #include "../daw/core/SelectionManager.hpp"
 #include "../daw/core/TrackManager.hpp"
+#include "../daw/core/TrackPropertyCommands.hpp"
 #include "../daw/core/UndoManager.hpp"
 #include "../daw/engine/AudioEngine.hpp"
 #include "../daw/engine/TracktionEngineWrapper.hpp"
@@ -29,6 +31,25 @@
 #include "music_helpers.hpp"
 
 namespace magda::dsl {
+
+namespace {
+
+juce::String normaliseColourString(juce::String raw) {
+    raw = raw.trim().unquoted();
+    if (raw.startsWithChar('#'))
+        raw = raw.substring(1);
+    if (raw.startsWithIgnoreCase("0x"))
+        raw = raw.substring(2);
+    if (raw.length() == 6)
+        raw = "ff" + raw;
+    return raw;
+}
+
+juce::Colour parseDslColour(const std::string& value) {
+    return juce::Colour::fromString(normaliseColourString(juce::String(value)));
+}
+
+}  // namespace
 
 // ============================================================================
 // Tokenizer Implementation
@@ -360,6 +381,9 @@ bool Interpreter::execute(const char* dslCode) {
     if (selectedClip != INVALID_CLIP_ID)
         ctx_.currentClipId = selectedClip;
 
+    for (const auto& track : api_.tracks().getTracks())
+        ctx_.trackIndexSnapshotIds.push_back(track.id);
+
     DBG("MAGDA DSL: Executing: " + juce::String(dslCode).substring(0, 200));
 
     Tokenizer tok(dslCode);
@@ -447,12 +471,12 @@ bool Interpreter::parseTrackStatement(Tokenizer& tok) {
     if (params.has("id")) {
         // Reference existing track by 1-based index
         int id = params.getInt("id");
-        int index = id - 1;
-        if (index < 0 || index >= tm.getNumTracks()) {
+        const int trackId = trackIndexToId(id);
+        if (trackId < 0) {
             ctx_.setError("Track " + juce::String(id) + " not found");
             return false;
         }
-        ctx_.currentTrackId = tm.getTracks()[static_cast<size_t>(index)].id;
+        ctx_.currentTrackId = trackId;
     } else if (params.has("name")) {
         juce::String name(params.get("name"));
         bool forceNew = params.getBool("new", false);
@@ -495,54 +519,64 @@ bool Interpreter::parseFilterStatement(Tokenizer& tok) {
         return false;
     }
 
-    if (!tok.expect(TokenType::COMMA)) {
-        ctx_.setError("Expected ',' after 'tracks'");
-        return false;
-    }
-
-    // Parse condition: track.field == "value"
-    Token trackToken = tok.next();
-    if (!trackToken.is("track")) {
-        ctx_.setError("Expected 'track' in filter condition");
-        return false;
-    }
-
-    if (!tok.expect(TokenType::DOT)) {
-        ctx_.setError("Expected '.' after 'track'");
-        return false;
-    }
-
-    Token field = tok.next();
-    if (field.type != TokenType::IDENTIFIER) {
-        ctx_.setError("Expected field name after 'track.'");
-        return false;
-    }
-
-    Token op = tok.next();
-    if (op.type != TokenType::EQUALS_EQUALS) {
-        ctx_.setError("Expected '==' in filter condition");
-        return false;
-    }
-
-    Token value = tok.next();
-    if (value.type != TokenType::STRING) {
-        ctx_.setError("Expected string value in filter condition");
-        return false;
-    }
-
-    if (!tok.expect(TokenType::RPAREN)) {
-        ctx_.setError("Expected ')' after filter condition");
-        return false;
-    }
-
     // Execute filter: find matching tracks
     auto& tm = api_.tracks();
     ctx_.filteredTrackIds.clear();
 
-    if (field.value == "name") {
-        for (const auto& track : tm.getTracks()) {
-            if (track.name == juce::String(value.value))
-                ctx_.filteredTrackIds.push_back(track.id);
+    if (tok.peek().is(TokenType::RPAREN)) {
+        // filter(tracks) with no condition targets every track. This is the
+        // master-selected fan-out: when the state snapshot carries
+        // "scope":"all_tracks", the agent addresses all tracks at once
+        // (e.g. filter(tracks).track.group(...) or .track.set(mute=true)).
+        tok.next();  // consume ')'
+        for (const auto& track : tm.getTracks())
+            ctx_.filteredTrackIds.push_back(track.id);
+    } else {
+        if (!tok.expect(TokenType::COMMA)) {
+            ctx_.setError("Expected ',' after 'tracks'");
+            return false;
+        }
+
+        // Parse condition: track.field == "value"
+        Token trackToken = tok.next();
+        if (!trackToken.is("track")) {
+            ctx_.setError("Expected 'track' in filter condition");
+            return false;
+        }
+
+        if (!tok.expect(TokenType::DOT)) {
+            ctx_.setError("Expected '.' after 'track'");
+            return false;
+        }
+
+        Token field = tok.next();
+        if (field.type != TokenType::IDENTIFIER) {
+            ctx_.setError("Expected field name after 'track.'");
+            return false;
+        }
+
+        Token op = tok.next();
+        if (op.type != TokenType::EQUALS_EQUALS) {
+            ctx_.setError("Expected '==' in filter condition");
+            return false;
+        }
+
+        Token value = tok.next();
+        if (value.type != TokenType::STRING) {
+            ctx_.setError("Expected string value in filter condition");
+            return false;
+        }
+
+        if (!tok.expect(TokenType::RPAREN)) {
+            ctx_.setError("Expected ')' after filter condition");
+            return false;
+        }
+
+        if (field.value == "name") {
+            for (const auto& track : tm.getTracks()) {
+                if (track.name == juce::String(value.value))
+                    ctx_.filteredTrackIds.push_back(track.id);
+            }
         }
     }
 
@@ -618,6 +652,10 @@ bool Interpreter::parseMethodChain(Tokenizer& tok) {
             success = executeNewClip(params);
         else if (methodKey == "track.set")
             success = executeSetTrack(params);
+        else if (methodKey == "track.group")
+            success = executeGroupTracks(params);
+        else if (methodKey == "track.move")
+            success = executeMoveTrack(params);
         else if (methodKey == "delete")
             success = executeDelete();
         else if (methodKey == "clip.delete")
@@ -859,6 +897,11 @@ bool Interpreter::executeSetTrack(const Params& params) {
         if (params.has("name"))
             tm.setTrackName(trackId, juce::String(params.get("name")));
 
+        if (params.has("colour"))
+            tm.setTrackColour(trackId, parseDslColour(params.get("colour")));
+        else if (params.has("color"))
+            tm.setTrackColour(trackId, parseDslColour(params.get("color")));
+
         if (params.has("volume_db")) {
             double db = params.getFloat("volume_db");
             float vol = static_cast<float>(std::pow(10.0, db / 20.0));
@@ -887,6 +930,10 @@ bool Interpreter::executeSetTrack(const Params& params) {
         juce::StringArray changes;
         if (params.has("name"))
             changes.add("name='" + juce::String(params.get("name")) + "'");
+        if (params.has("colour"))
+            changes.add("colour=" + juce::String(params.get("colour")));
+        else if (params.has("color"))
+            changes.add("color=" + juce::String(params.get("color")));
         if (params.has("volume_db"))
             changes.add("volume=" + juce::String(params.get("volume_db")) + "dB");
         if (params.has("pan"))
@@ -901,6 +948,80 @@ bool Interpreter::executeSetTrack(const Params& params) {
         return false;
     }
 
+    return true;
+}
+
+bool Interpreter::executeGroupTracks(const Params& params) {
+    std::vector<int> trackIds;
+    if (params.has("tracks")) {
+        std::stringstream ss(params.get("tracks"));
+        std::string item;
+        while (std::getline(ss, item, ',')) {
+            juce::String token(item);
+            const int oneBasedIndex = token.trim().getIntValue();
+            const int trackId = trackIndexToId(oneBasedIndex);
+            if (trackId < 0) {
+                ctx_.setError("Track " + juce::String(oneBasedIndex) + " not found");
+                return false;
+            }
+            if (std::find(trackIds.begin(), trackIds.end(), trackId) == trackIds.end())
+                trackIds.push_back(trackId);
+        }
+    } else if (ctx_.inFilterContext) {
+        trackIds = ctx_.filteredTrackIds;
+    } else if (ctx_.currentTrackId >= 0) {
+        trackIds.push_back(ctx_.currentTrackId);
+    }
+
+    if (trackIds.size() < 2) {
+        ctx_.setError("track.group requires at least two tracks");
+        return false;
+    }
+
+    const auto name = juce::String(params.get("name", "Group"));
+    auto groupCmd = std::make_unique<GroupTracksCommand>(trackIds, name);
+    auto* groupCmdPtr = groupCmd.get();
+    api_.undo().executeCommand(std::move(groupCmd));
+    const auto groupId = groupCmdPtr->getCreatedGroupId();
+    if (groupId == INVALID_TRACK_ID) {
+        ctx_.setError("Failed to group tracks");
+        return false;
+    }
+
+    ctx_.currentTrackId = groupId;
+    ctx_.inFilterContext = false;
+    ctx_.filteredTrackIds.clear();
+    api_.selection().selectTrack(groupId);
+    ctx_.addResult("Grouped " + juce::String(static_cast<int>(trackIds.size())) + " track(s) as '" +
+                   name + "'");
+    return true;
+}
+
+bool Interpreter::executeMoveTrack(const Params& params) {
+    if (!params.has("index")) {
+        ctx_.setError("track.move requires index=N (1-based position)");
+        return false;
+    }
+    const int position = params.getInt("index");
+
+    // Apply to the filtered set or the current track. Moving every filtered
+    // track to the same slot is rarely meaningful, but we honour it in order so
+    // the final order is deterministic.
+    if (ctx_.inFilterContext) {
+        for (int trackId : ctx_.filteredTrackIds)
+            api_.undo().executeCommand(std::make_unique<MoveTrackCommand>(trackId, position));
+        ctx_.addResult("Moved " + juce::String(static_cast<int>(ctx_.filteredTrackIds.size())) +
+                       " track(s) to position " + juce::String(position));
+        return true;
+    }
+
+    if (ctx_.currentTrackId < 0) {
+        ctx_.setError("No track context for track.move (use track(id=N) first)");
+        return false;
+    }
+
+    api_.undo().executeCommand(std::make_unique<MoveTrackCommand>(ctx_.currentTrackId, position));
+    ctx_.addResult("Moved track to position " + juce::String(position));
     return true;
 }
 
@@ -1396,6 +1517,20 @@ int Interpreter::findTrackByName(const juce::String& name) const {
     return -1;
 }
 
+int Interpreter::trackIndexToId(int oneBasedIndex) const {
+    const int index = oneBasedIndex - 1;
+    if (index < 0)
+        return -1;
+
+    if (index < static_cast<int>(ctx_.trackIndexSnapshotIds.size()))
+        return ctx_.trackIndexSnapshotIds[static_cast<size_t>(index)];
+
+    auto& tm = api_.tracks();
+    if (index >= tm.getNumTracks())
+        return -1;
+    return tm.getTracks()[static_cast<size_t>(index)].id;
+}
+
 double Interpreter::barsToTime(double bar) const {
     // Convert 1-based bar number to seconds
     double bpm = 120.0;  // fallback
@@ -1459,15 +1594,26 @@ juce::String Interpreter::buildStateSnapshot(MagdaApi& api) {
 
     auto& sm = api.selection();
     auto selTrack = sm.getSelectedTrack();
-    if (selTrack != INVALID_TRACK_ID) {
+    if (selTrack == MASTER_TRACK_ID) {
+        // Master selected = operate on every track. Emit a scope marker so the
+        // LLM emits implicit-target ops (MUTE/SET/FX with no ref) that the
+        // executor fans out across all tracks, instead of a per-track id.
+        // (The master is not in getTracks(), so the index loop below would
+        // otherwise fall through and write a bogus selected_track_id.)
+        root->setProperty("scope", "all_tracks");
+    } else if (selTrack != INVALID_TRACK_ID) {
         // Find 1-based index for the selected track
         int selIndex = 1;
+        bool found = false;
         for (const auto& track : tm.getTracks()) {
-            if (track.id == selTrack)
+            if (track.id == selTrack) {
+                found = true;
                 break;
+            }
             selIndex++;
         }
-        root->setProperty("selected_track_id", selIndex);
+        if (found)
+            root->setProperty("selected_track_id", selIndex);
     }
 
     // Selected clip context
