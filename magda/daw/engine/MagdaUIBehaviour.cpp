@@ -93,6 +93,8 @@ std::unique_ptr<juce::Component> MagdaUIBehaviour::createPluginWindow(
 // PluginEditorWindow Implementation
 // =============================================================================
 
+juce::ApplicationCommandManager* PluginEditorWindow::appCommandManager = nullptr;
+
 PluginEditorWindow::PluginEditorWindow(tracktion::Plugin& plugin,
                                        tracktion::PluginWindowState& state)
     : daw::ui::FloatingHostWindow(plugin.getName()), plugin_(plugin), state_(state) {
@@ -151,6 +153,21 @@ PluginEditorWindow::PluginEditorWindow(tracktion::Plugin& plugin,
     } else {
         DBG("PluginEditorWindow: Failed to create editor for: " << plugin.getName());
     }
+
+    // Key routing for transport shortcuts is handled in keyPressed() (forwarded
+    // at event time), not via a persistent KeyListener — see that override.
+}
+
+bool PluginEditorWindow::keyPressed(const juce::KeyPress& key) {
+    // This is a separate top-level window, outside MainWindow's key chain, so
+    // without this the app's shortcuts (Space = play/stop, etc.) go dead while a
+    // plugin editor has focus. Forward keys the editor didn't consume to the app
+    // command manager at event time. Checking the injected pointer each press
+    // (and clearing it on shutdown) avoids holding a persistent KeyListener that
+    // could dangle once the command manager is destroyed.
+    if (appCommandManager != nullptr)
+        return appCommandManager->getKeyMappings()->keyPressed(key, this);
+    return false;
 }
 
 PluginEditorWindow::~PluginEditorWindow() {

@@ -57,8 +57,16 @@ class PluginEditorWindow final : public daw::ui::FloatingHostWindow {
     PluginEditorWindow(tracktion::Plugin& plugin, tracktion::PluginWindowState& state);
     ~PluginEditorWindow() override;
 
+    // Injected by the UI layer (MainWindow) so plugin editor windows can route
+    // keys they don't consume (Space = play/stop, etc.) to the app command
+    // manager. This engine library can't depend on the UI's command manager, so
+    // it's set externally and cleared on shutdown.
+    static juce::ApplicationCommandManager* appCommandManager;
+
     void closeButtonPressed() override;
     void moved() override;
+    // Forwards unconsumed keys to the app command manager (transport shortcuts).
+    bool keyPressed(const juce::KeyPress& key) override;
 
   private:
     tracktion::Plugin& plugin_;
