@@ -7,6 +7,8 @@
 #include "../../core/SelectionManager.hpp"
 #include "../../core/TrackManager.hpp"
 #include "../../core/ViewModeState.hpp"
+#include "DawProjectArchive.hpp"
+#include "NativeProjectDocumentAdapter.hpp"
 
 namespace magda {
 
@@ -73,6 +75,32 @@ bool ProjectSerializer::loadFromFile(const juce::File& file, ProjectInfo& outInf
 
     outInfo = staged.info;
     commitStaged(staged);
+    return true;
+}
+
+bool ProjectSerializer::exportToDawProject(const juce::File& file, const ProjectInfo& info) {
+    auto document = NativeProjectDocumentAdapter::captureCurrentProject(info);
+    juce::String error;
+
+    if (!DawProjectArchive::writeToFile(file, document, error)) {
+        lastError_ = error;
+        return false;
+    }
+
+    return true;
+}
+
+bool ProjectSerializer::loadDawProjectAndStage(const juce::File& file, StagedProjectData& outData,
+                                               const juce::File& audioExtractionDir) {
+    ProjectDocument document;
+    juce::String error;
+
+    if (!DawProjectArchive::readFromFile(file, document, error, audioExtractionDir)) {
+        lastError_ = error;
+        return false;
+    }
+
+    outData = NativeProjectDocumentAdapter::toStagedProjectData(document);
     return true;
 }
 
@@ -151,10 +179,40 @@ bool ProjectSerializer::loadAndStage(const juce::File& file, StagedProjectData& 
 
         if (projectObj->hasProperty("sampleRate"))
             outData.info.sampleRate = projectObj->getProperty("sampleRate");
+        if (projectObj->hasProperty("timelineLengthBars"))
+            outData.info.timelineLengthBars = projectObj->getProperty("timelineLengthBars");
+        if (projectObj->hasProperty("renderBitDepth"))
+            outData.info.renderBitDepth = projectObj->getProperty("renderBitDepth");
+        if (projectObj->hasProperty("bounceBitDepth"))
+            outData.info.bounceBitDepth = projectObj->getProperty("bounceBitDepth");
         if (projectObj->hasProperty("keyRoot"))
             outData.info.keyRoot = projectObj->getProperty("keyRoot");
         if (projectObj->hasProperty("keyQuality"))
             outData.info.keyQuality = projectObj->getProperty("keyQuality");
+
+        // Named timeline markers
+        outData.info.markers.clear();
+        auto markersVar = projectObj->getProperty("markers");
+        if (markersVar.isArray()) {
+            auto* markersArray = markersVar.getArray();
+            for (const auto& markerVar : *markersArray) {
+                if (!markerVar.isObject())
+                    continue;
+
+                auto* markerObj = markerVar.getDynamicObject();
+                ProjectTimelineMarker marker;
+                marker.id = static_cast<int>(markerObj->getProperty("id"));
+                marker.positionBeats = static_cast<double>(markerObj->getProperty("positionBeats"));
+                marker.name = markerObj->getProperty("name").toString();
+
+                auto colourString = markerObj->getProperty("colour").toString();
+                if (colourString.isNotEmpty())
+                    marker.colourArgb = stringToColour(colourString).getARGB();
+
+                if (marker.id > 0)
+                    outData.info.markers.push_back(marker);
+            }
+        }
 
         // Loop settings
         auto loopVar = projectObj->getProperty("loop");
@@ -282,8 +340,25 @@ juce::var ProjectSerializer::serializeProject(const ProjectInfo& info) {
 
     projectObj->setProperty("projectLength", info.projectLength);
     projectObj->setProperty("sampleRate", info.sampleRate);
+    projectObj->setProperty("timelineLengthBars", info.timelineLengthBars);
+    projectObj->setProperty("renderBitDepth", info.renderBitDepth);
+    projectObj->setProperty("bounceBitDepth", info.bounceBitDepth);
     projectObj->setProperty("keyRoot", info.keyRoot);
     projectObj->setProperty("keyQuality", info.keyQuality);
+
+    // Named timeline markers
+    if (!info.markers.empty()) {
+        juce::Array<juce::var> markersArray;
+        for (const auto& marker : info.markers) {
+            auto* markerObj = new juce::DynamicObject();
+            markerObj->setProperty("id", marker.id);
+            markerObj->setProperty("positionBeats", marker.positionBeats);
+            markerObj->setProperty("name", marker.name);
+            markerObj->setProperty("colour", colourToString(juce::Colour(marker.colourArgb)));
+            markersArray.add(juce::var(markerObj));
+        }
+        projectObj->setProperty("markers", juce::var(markersArray));
+    }
 
     // Loop settings
     auto* loopObj = new juce::DynamicObject();
@@ -388,10 +463,40 @@ bool ProjectSerializer::deserializeProject(const juce::var& json, ProjectInfo& o
 
     if (projectObj->hasProperty("sampleRate"))
         outInfo.sampleRate = projectObj->getProperty("sampleRate");
+    if (projectObj->hasProperty("timelineLengthBars"))
+        outInfo.timelineLengthBars = projectObj->getProperty("timelineLengthBars");
+    if (projectObj->hasProperty("renderBitDepth"))
+        outInfo.renderBitDepth = projectObj->getProperty("renderBitDepth");
+    if (projectObj->hasProperty("bounceBitDepth"))
+        outInfo.bounceBitDepth = projectObj->getProperty("bounceBitDepth");
     if (projectObj->hasProperty("keyRoot"))
         outInfo.keyRoot = projectObj->getProperty("keyRoot");
     if (projectObj->hasProperty("keyQuality"))
         outInfo.keyQuality = projectObj->getProperty("keyQuality");
+
+    // Named timeline markers
+    outInfo.markers.clear();
+    auto markersVar = projectObj->getProperty("markers");
+    if (markersVar.isArray()) {
+        auto* markersArray = markersVar.getArray();
+        for (const auto& markerVar : *markersArray) {
+            if (!markerVar.isObject())
+                continue;
+
+            auto* markerObj = markerVar.getDynamicObject();
+            ProjectTimelineMarker marker;
+            marker.id = static_cast<int>(markerObj->getProperty("id"));
+            marker.positionBeats = static_cast<double>(markerObj->getProperty("positionBeats"));
+            marker.name = markerObj->getProperty("name").toString();
+
+            auto colourString = markerObj->getProperty("colour").toString();
+            if (colourString.isNotEmpty())
+                marker.colourArgb = stringToColour(colourString).getARGB();
+
+            if (marker.id > 0)
+                outInfo.markers.push_back(marker);
+        }
+    }
 
     // Loop settings
     auto loopVar = projectObj->getProperty("loop");

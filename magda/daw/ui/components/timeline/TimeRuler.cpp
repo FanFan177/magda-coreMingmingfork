@@ -121,6 +121,13 @@ void TimeRuler::setPlayheadPosition(double positionSeconds) {
     }
 }
 
+void TimeRuler::setPlayheadHandlePosition(double positionSeconds) {
+    if (playheadHandlePosition_ != positionSeconds) {
+        playheadHandlePosition_ = positionSeconds;
+        repaint();
+    }
+}
+
 void TimeRuler::setEditCursorPosition(double positionSeconds, bool blinkVisible) {
     editCursorPosition_ = positionSeconds;
     editCursorVisible_ = blinkVisible;
@@ -305,7 +312,9 @@ void TimeRuler::mouseUp(const juce::MouseEvent& event) {
             onPhaseDragEnded(finalPhaseTime);
         }
         dragMode = DragMode::None;
-        setMouseCursor(CursorManager::getInstance().getZoomCursor());
+        setMouseCursor(event.y >= getHeight() - tickHeightMajor()
+                           ? juce::MouseCursor::IBeamCursor
+                           : CursorManager::getInstance().getZoomCursor());
         return;
     }
 
@@ -322,17 +331,25 @@ void TimeRuler::mouseUp(const juce::MouseEvent& event) {
         int deltaY = std::abs(event.y - mouseDownY);
 
         if (deltaX <= DRAG_THRESHOLD && deltaY <= DRAG_THRESHOLD) {
-            if (onPositionClicked) {
-                double time = pixelToTime(event.x);
-                if (time >= 0.0 && time <= timelineLength) {
-                    onPositionClicked(time);
+            double time = pixelToTime(event.x);
+            if (time >= 0.0 && time <= timelineLength) {
+                const bool bypassSnap = event.mods.isAltDown();
+                if (!bypassSnap)
+                    time = snapTimeToGrid(time);
+                if (event.y >= getHeight() - tickHeightMajor()) {
+                    if (onPlayheadPositionClicked)
+                        onPlayheadPositionClicked(time, bypassSnap);
+                } else if (onPositionClicked) {
+                    onPositionClicked(time, bypassSnap);
                 }
             }
         }
     }
 
     dragMode = DragMode::None;
-    setMouseCursor(CursorManager::getInstance().getZoomCursor());
+    setMouseCursor(event.y >= getHeight() - tickHeightMajor()
+                       ? juce::MouseCursor::IBeamCursor
+                       : CursorManager::getInstance().getZoomCursor());
 }
 
 void TimeRuler::mouseDoubleClick(const juce::MouseEvent& event) {
@@ -356,17 +373,26 @@ void TimeRuler::mouseDoubleClick(const juce::MouseEvent& event) {
         }
     }
 
-    // Fall through: treat as click for playhead positioning
-    if (onPositionClicked) {
-        double time = pixelToTime(event.x);
-        if (time >= 0.0 && time <= timelineLength) {
-            onPositionClicked(time);
+    // Fall through: treat as a position click using the same ruler zones as mouseUp.
+    double time = pixelToTime(event.x);
+    if (time >= 0.0 && time <= timelineLength) {
+        const bool bypassSnap = event.mods.isAltDown();
+        if (!bypassSnap)
+            time = snapTimeToGrid(time);
+        if (event.y >= getHeight() - tickHeightMajor()) {
+            if (onPlayheadPositionClicked)
+                onPlayheadPositionClicked(time, bypassSnap);
+        } else if (onPositionClicked) {
+            onPositionClicked(time, bypassSnap);
         }
     }
 }
 
 void TimeRuler::mouseMove(const juce::MouseEvent& event) {
-    juce::MouseCursor desiredCursor = CursorManager::getInstance().getZoomCursor();
+    const int tickAreaTop = getHeight() - tickHeightMajor();
+    juce::MouseCursor desiredCursor = event.y >= tickAreaTop
+                                          ? juce::MouseCursor::IBeamCursor
+                                          : CursorManager::getInstance().getZoomCursor();
 
     // Alt+hover near phase marker shows resize cursor
     if (event.mods.isAltDown() && loopEnabled && (loopPhaseVisible || loopPhaseHoverOnly)) {
@@ -381,7 +407,8 @@ void TimeRuler::mouseMove(const juce::MouseEvent& event) {
     // a few pixels above the visible strip, and previously gating on a strict
     // inLoopStrip check left the zoom cursor showing in that band even though
     // a click there got captured as a loop-region drag.
-    if (desiredCursor == CursorManager::getInstance().getZoomCursor()) {
+    if (desiredCursor == CursorManager::getInstance().getZoomCursor() ||
+        desiredCursor == juce::MouseCursor::IBeamCursor) {
         auto loopCursor = loopInteraction_.getCursor(event.x, event.y);
         if (loopCursor != juce::MouseCursor::NormalCursor)
             desiredCursor = loopCursor;
@@ -863,6 +890,25 @@ void TimeRuler::drawBarsBeatsMode(juce::Graphics& g) {
         }
     }
 
+    // Draw global playhead/edit handle in the lower strip.
+    if (playheadHandlePosition_ >= 0.0) {
+        int handleX = timeToPixel(playheadHandlePosition_);
+        if (handleX >= 0 && handleX <= width) {
+            int tickAreaTop = height - tickHeightMajor();
+            g.setColour(DarkTheme::getColour(DarkTheme::ACCENT_BLUE));
+
+            // Size the triangle to the playhead band (the tick area below the
+            // label divider) so it fills that rectangle instead of poking past
+            // the ruler bottom into the grid.
+            juce::Path triangle;
+            const float x = static_cast<float>(handleX);
+            const float yTop = static_cast<float>(tickAreaTop);
+            const float yTip = static_cast<float>(height - 1);
+            triangle.addTriangle(x - 6.0f, yTop, x + 6.0f, yTop, x, yTip);
+            g.fillPath(triangle);
+        }
+    }
+
     // Draw playhead line if playing — only when within the clip's time range
     if (playheadPosition >= 0.0 && clipLength > 0.0) {
         double relPos = playheadPosition - timeOffset;
@@ -881,7 +927,7 @@ void TimeRuler::drawBarsBeatsMode(juce::Graphics& g) {
             int playheadX = timeToPixel(displayTime);
             if (playheadX >= 0 && playheadX <= width) {
                 int tickAreaTop = height - tickHeightMajor();
-                g.setColour(juce::Colour(0xFFFF4444));
+                g.setColour(DarkTheme::getColour(DarkTheme::ACCENT_BLUE));
                 g.fillRect(playheadX - 1, tickAreaTop, 2, tickHeightMajor());
             }
         }

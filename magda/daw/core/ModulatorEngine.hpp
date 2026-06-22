@@ -6,6 +6,7 @@
 #include <functional>
 #include <memory>
 
+#include "CurveMath.hpp"
 #include "ModInfo.hpp"
 
 namespace magda {
@@ -258,6 +259,11 @@ class ModulatorEngine {
             p2 = &points.front();
         }
 
+        // Step: hold p1's value until the next point (sample & hold / steps).
+        constexpr int kStepCurveType = 2;
+        if (p1->curveType == kStepCurveType)
+            return p1->value;
+
         // Calculate interpolation t value
         float phaseSpan;
         float localPhase;
@@ -279,20 +285,64 @@ class ModulatorEngine {
 
         // Apply tension-based interpolation (same formula as CurveEditorBase)
         float tension = p1->tension;
-        if (std::abs(tension) < 0.001f) {
-            // Linear interpolation
-            return p1->value + t * (p2->value - p1->value);
-        } else {
-            float curvedT;
-            if (tension > 0) {
-                // Ease in - slow start, fast end
-                curvedT = std::pow(t, 1.0f + tension * 2.0f);
-            } else {
-                // Ease out - fast start, slow end
-                curvedT = 1.0f - std::pow(1.0f - t, 1.0f - tension * 2.0f);
+        auto applyTension = [tension](float input) {
+            if (std::abs(tension) < 0.001f)
+                return input;
+            if (tension > 0)
+                return std::pow(input, 1.0f + tension * 2.0f);
+            return 1.0f - std::pow(1.0f - input, 1.0f - tension * 2.0f);
+        };
+
+        auto getShaper = [&]() {
+            struct Shaper {
+                float t = 0.5f;
+                float value = 0.5f;
+                bool stored = false;
+            };
+
+            constexpr float kHandleEpsilon = 0.000001f;
+            const bool hasStoredShaper =
+                p2->phase > p1->phase && (std::abs(p1->outHandleX) > kHandleEpsilon ||
+                                          std::abs(p1->outHandleY) > kHandleEpsilon ||
+                                          std::abs(p2->inHandleX) > kHandleEpsilon ||
+                                          std::abs(p2->inHandleY) > kHandleEpsilon);
+
+            if (hasStoredShaper) {
+                const float shaperPhase =
+                    std::clamp(p1->phase + p1->outHandleX, p1->phase, p2->phase);
+                const float shaperT = (p2->phase - p1->phase > 0.0001f)
+                                          ? ((shaperPhase - p1->phase) / (p2->phase - p1->phase))
+                                          : 0.5f;
+                return Shaper{std::clamp(shaperT, 0.001f, 0.999f),
+                              std::clamp(p1->value + p1->outHandleY, 0.0f, 1.0f), true};
             }
-            return p1->value + curvedT * (p2->value - p1->value);
+
+            constexpr float cornerT = 0.5f;
+            return Shaper{cornerT, p1->value + applyTension(cornerT) * (p2->value - p1->value),
+                          false};
+        };
+
+        constexpr int kHardCornerCurveType = 3;
+        if (p1->curveType == kHardCornerCurveType) {
+            const auto shaper = getShaper();
+            if (t <= shaper.t) {
+                const float u = t / shaper.t;
+                return p1->value + u * (shaper.value - p1->value);
+            }
+            const float u = (t - shaper.t) / (1.0f - shaper.t);
+            return shaper.value + u * (p2->value - shaper.value);
         }
+
+        // Linear segment: shared bounded power warp so the engine output matches
+        // exactly what the curve editor draws (see core/CurveMath.hpp).
+        constexpr float kLinearHandleEps = 0.000001f;
+        const bool hasStoredShaper =
+            p2->phase > p1->phase && (std::abs(p1->outHandleX) > kLinearHandleEps ||
+                                      std::abs(p1->outHandleY) > kLinearHandleEps ||
+                                      std::abs(p2->inHandleX) > kLinearHandleEps ||
+                                      std::abs(p2->inHandleY) > kLinearHandleEps);
+        return magda::curvemath::evalSegment(p1->value, p2->value, p1->value + p1->outHandleY,
+                                             tension, hasStoredShaper, t);
     }
 
     /**

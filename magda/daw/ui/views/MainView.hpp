@@ -7,6 +7,7 @@
 #include "../components/common/DraggableValueLabel.hpp"
 #include "../components/common/GridOverlayComponent.hpp"
 #include "../components/common/SvgButton.hpp"
+#include "../components/timeline/MarkerLaneComponent.hpp"
 #include "../components/timeline/TimelineComponent.hpp"
 #include "../components/timeline/ZoomScrollBar.hpp"
 #include "../components/tracks/TrackContentPanel.hpp"
@@ -21,6 +22,11 @@ namespace magda {
 
 // Forward declaration
 class AudioEngine;
+class SongNavigatorPanel;
+class MasterAutomationHeaderPanel;
+class MasterAutomationContentPanel;
+class ClickableLabel;
+class LevelMeter;
 
 class MainView : public juce::Component,
                  public juce::ScrollBar::Listener,
@@ -122,6 +128,8 @@ class MainView : public juce::Component,
     std::unique_ptr<TimelineController> timelineController;
 
     // Timeline viewport (horizontal scroll only)
+    std::unique_ptr<juce::Viewport> markerLaneViewport;
+    std::unique_ptr<MarkerLaneComponent> markerLane;
     std::unique_ptr<juce::Viewport> timelineViewport;
     std::unique_ptr<TimelineComponent> timeline;
 
@@ -150,10 +158,19 @@ class MainView : public juce::Component,
 
     // Fixed master track row at bottom (matching track panel style)
     class MasterHeaderPanel;
-    class MasterContentPanel;
+    class MasterContentPanel;  // legacy "Master Output" placeholder (kept for easy revert)
     std::unique_ptr<MasterHeaderPanel> masterHeaderPanel;
-    std::unique_ptr<MasterContentPanel> masterContentPanel;
-    int masterStripHeight = 60;
+    // Song navigator / minimap occupying the master content strip (issue #1474).
+    std::unique_ptr<SongNavigatorPanel> masterContentPanel;
+    int masterStripHeight = 76;
+
+    // Master automation band: a pinned strip directly above the master strip
+    // hosting the master channel's automation lanes (issue #1482). Fixed-width
+    // header column + a horizontally scroll-synced content viewport.
+    std::unique_ptr<MasterAutomationHeaderPanel> masterAutomationHeaderPanel;
+    std::unique_ptr<juce::Viewport> masterAutomationViewport;
+    std::unique_ptr<MasterAutomationContentPanel> masterAutomationContentPanel;
+    int masterAutomationHeight = 0;  // computed band height; 0 collapses the band
     ViewMode currentViewMode_ = ViewMode::Arrange;
     bool masterVisible_ = true;
 
@@ -165,7 +182,7 @@ class MainView : public juce::Component,
     int auxSectionHeight = 0;
     bool auxVisible_ = false;
     static constexpr int AUX_ROW_HEIGHT = 30;
-    static constexpr int MIN_MASTER_STRIP_HEIGHT = 40;
+    static constexpr int MIN_MASTER_STRIP_HEIGHT = 76;
     static constexpr int MAX_MASTER_STRIP_HEIGHT = 150;
 
     // Cached state from controller for quick access
@@ -188,15 +205,25 @@ class MainView : public juce::Component,
     int zoomAnchorViewportX = 0;  // Viewport-relative position to keep stable
 
     // Layout - uses LayoutConfig for centralized configuration
+    int getMarkerLaneHeight() const {
+        return markerLaneVisible_ ? LayoutConfig::getInstance().markerLaneHeight : 0;
+    }
+    // The ruler height is fixed; the seconds row is one of its internal rows, so
+    // toggling it never changes the total height.
     int getTimelineHeight() const {
-        return LayoutConfig::getInstance().getTimelineHeight();
+        return getMarkerLaneHeight() + LayoutConfig::getInstance().getTimelineBodyHeight();
     }
     int trackHeaderWidth = LayoutConfig::getInstance().defaultTrackHeaderWidth;
+    bool markerLaneVisible_ = true;
+    bool secondsRulerVisible_ = false;
     static constexpr int ARRANGEMENT_SCROLLBAR_SIZE = 20;
+
+    void dispatchUserPlayheadPositionBeats(double positionBeats, bool bypassSnap);
 
     struct ArrangementLayout {
         bool swapped = false;
         juce::Rectangle<int> cornerArea;
+        juce::Rectangle<int> markerLaneArea;
         juce::Rectangle<int> timelineArea;
         juce::Rectangle<int> trackHeadersArea;
         juce::Rectangle<int> trackContentArea;
@@ -209,6 +236,8 @@ class MainView : public juce::Component,
         juce::Rectangle<int> verticalScrollBarHitArea;
         juce::Rectangle<int> masterHeaderArea;
         juce::Rectangle<int> masterContentArea;
+        juce::Rectangle<int> masterAutomationHeaderArea;
+        juce::Rectangle<int> masterAutomationContentArea;
         juce::Rectangle<int> auxHeadersArea;
         juce::Rectangle<int> auxContentArea;
     };
@@ -322,17 +351,25 @@ class MainView : public juce::Component,
     // Corner toolbar buttons (above track headers)
     std::unique_ptr<SvgButton> zoomFitButton;
     std::unique_ptr<SvgButton> zoomSelButton;
+    std::unique_ptr<SvgButton> markerLaneToggleButton;
     std::unique_ptr<SvgButton> trackSmallButton;
     std::unique_ptr<SvgButton> trackMediumButton;
     std::unique_ptr<SvgButton> trackLargeButton;
     std::unique_ptr<SvgButton> zoomLoopButton;
-    std::unique_ptr<SvgButton> addTrackButton;
+    std::unique_ptr<SvgButton> secondsRulerToggleButton;
     std::unique_ptr<SvgButton> ioToggleButton;
+    std::unique_ptr<SvgButton> addTrackButton;
+    std::unique_ptr<SvgButton> showMasterButton;
     std::unique_ptr<SvgButton> hAxisIcon;
     std::unique_ptr<SvgButton> vAxisIcon;
 
-    // Separator line position between corner toolbar rows (set during resized())
+    // Separator line positions in the corner toolbar (set during resized())
+    juce::Rectangle<int> markerLaneSeparatorLine;
     juce::Rectangle<int> cornerSeparatorLine;
+    juce::Rectangle<int> cornerBottomBorderLine;
+    // Vertical border on the marker-lane row, separating the corner gutter
+    // from the marker-lane content to its side.
+    juce::Rectangle<int> markerCornerRightBorderLine;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MainView)
 };
@@ -413,13 +450,18 @@ class MainView::MasterHeaderPanel : public juce::Component, public TrackManagerL
     void setPeakLevels(float leftPeak, float rightPeak);
 
   private:
-    std::unique_ptr<juce::DrawableButton> speakerButton;  // Speaker on/off toggle
-    std::unique_ptr<DraggableValueLabel> volumeLabel;     // Volume as draggable dB label
+    // Opens the master automation menu (mirrors the per-track automation
+    // button). Shared by the icon button and the header right-click.
+    void showMasterAutomationMenu(juce::Component* anchor);
 
-    // Horizontal stereo meter component
-    class HorizontalStereoMeter;
-    std::unique_ptr<HorizontalStereoMeter> peakMeter;
-    std::unique_ptr<juce::Label> peakValueLabel;  // Peak dB value
+    std::unique_ptr<SvgButton> speakerButton;          // Speaker on/off toggle
+    std::unique_ptr<SvgButton> automationButton;       // Show master automation lane
+    std::unique_ptr<SvgButton> hideButton;             // Hide master row in this view
+    std::unique_ptr<DraggableValueLabel> volumeLabel;  // Volume as draggable dB label
+    std::unique_ptr<ClickableLabel> peakValueLabel;    // Click to reset held peak
+    float peakValue_ = 0.0f;
+
+    std::unique_ptr<LevelMeter> peakMeter;  // Horizontal stereo peak meter
 
     void setupControls();
 

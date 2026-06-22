@@ -74,6 +74,7 @@ class AutomationCurveEditor : public CurveEditorBase,
     }
     double pixelToX(int px) const override;
     int xToPixel(double x) const override;
+    double xToPixelF(double x) const override;
 
     // Snapping (uses base class snapXToGrid)
     std::function<double(double)> snapBeatToGrid;
@@ -103,10 +104,16 @@ class AutomationCurveEditor : public CurveEditorBase,
     void onPointDragPreview(uint32_t pointId, double newX, double newY) override;
     void onPointDeleted(uint32_t pointId) override;
     void onPointSelected(uint32_t pointId) override;
+    void onPointsSelected(const std::vector<uint32_t>& pointIds) override;
     void onTensionChanged(uint32_t pointId, double tension) override;
     void onHandlesChanged(uint32_t pointId, const CurveHandleData& inHandle,
                           const CurveHandleData& outHandle) override;
+    void onSegmentShaperChanged(uint32_t leftPointId, const CurveHandleData& leftInHandle,
+                                const CurveHandleData& leftOutHandle, uint32_t rightPointId,
+                                const CurveHandleData& rightInHandle,
+                                const CurveHandleData& rightOutHandle, bool isPreview) override;
 
+    void onPointCurveTypeChanged(uint32_t pointId, CurveType newType) override;
     void onDeleteSelectedPoints(const std::set<uint32_t>& pointIds) override;
     void onStepStamped(double gridStart, double gridEnd, double y, uint32_t prevPointId,
                        double prevValue) override;
@@ -124,7 +131,7 @@ class AutomationCurveEditor : public CurveEditorBase,
     // Cached curve points (converted from AutomationPoints)
     mutable std::vector<CurvePoint> cachedPoints_;
     mutable bool pointsCacheDirty_ = true;
-    bool isRightClickPending_ = false;
+    // Note: right-click pending is tracked via CurveEditorBase::isRightClickPending_
 
     void updatePointsCache() const;
     void deleteSelectedPoints();
@@ -132,6 +139,15 @@ class AutomationCurveEditor : public CurveEditorBase,
     // CurvePointComponent right-click so the menu isn't swallowed by points.
     void showContextMenu();
     void paintOverrideOverlay(juce::Graphics& g);
+
+    // Right-click a point to type its value inline (real units).
+    uint32_t pointIdAt(int x, int y) const;
+    void showPointValueEditor(uint32_t pointId);
+    void commitPointValueEdit();
+    void hidePointValueEditor();
+    std::unique_ptr<juce::TextEditor> valueEditor_;
+    uint32_t valueEditPointId_ = INVALID_CURVE_POINT_ID;
+    int rightClickX_ = 0;  // remembered for resolving the segment under a menu
 
     // Quantize a normalized value to the parameter's natural grid when
     // the lane's snapValue flag is enabled.

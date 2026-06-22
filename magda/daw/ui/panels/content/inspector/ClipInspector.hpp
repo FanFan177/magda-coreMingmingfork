@@ -7,7 +7,9 @@
 #include "../../common/SvgButton.hpp"
 #include "../../common/TextSlider.hpp"
 #include "BaseInspector.hpp"
+#include "clip/sections/ChordProgressionSection.hpp"
 #include "clip/sections/ClipFadesSection.hpp"
+#include "clip/sections/ClipTakesSection.hpp"
 #include "core/ClipManager.hpp"
 
 namespace magda::daw::ui {
@@ -166,6 +168,12 @@ class ClipInspector : public BaseInspector, public magda::ClipManagerListener {
 
     // Fades section
     std::unique_ptr<ClipFadesSection> fadesSection_;
+
+    // Loop-record takes section
+    std::unique_ptr<ClipTakesSection> takesSection_;
+
+    // Chord-track-clip progression section
+    std::unique_ptr<ChordProgressionSection> chordProgressionSection_;
 
     // Channels section
     juce::Label channelsSectionLabel_;

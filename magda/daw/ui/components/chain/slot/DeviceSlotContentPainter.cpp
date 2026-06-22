@@ -79,23 +79,27 @@ void paintMidiUtilityHeader(juce::Graphics& g, juce::Rectangle<int> headerArea,
                                            : DarkTheme::getSecondaryTextColour();
     g.setColour(textColour);
 
-    if (state.traits.isStepSequencer && state.stepRecording.active) {
+    if ((state.traits.isStepSequencer || state.traits.isPolyStepSequencer) &&
+        state.stepRecording.active) {
+        const int maxSteps = juce::jmax(1, state.stepRecording.maxSteps);
+        const int displayPosition = juce::jlimit(0, maxSteps - 1, state.stepRecording.position);
         g.saveState();
         g.setColour(juce::Colour(0xFFCC3333).withAlpha(0.9f));
         g.fillRect(headerArea);
         g.setColour(juce::Colours::white);
         g.setFont(FontManager::getInstance().getMicrogrammaFont(9.0f));
-        g.drawText("STEP RECORDING  " + juce::String(state.stepRecording.position + 1) + "/" +
-                       juce::String(state.stepRecording.maxSteps),
+        g.drawText("STEP RECORDING  " + juce::String(displayPosition + 1) + "/" +
+                       juce::String(maxSteps),
                    textArea, juce::Justification::centredLeft);
         g.restoreState();
         return;
     }
 
     g.setFont(FontManager::getInstance().getMicrogrammaFont(9.0f));
-    const juce::String label = state.traits.isChordEngine   ? "MAGDA Chord Engine"
-                               : state.traits.isArpeggiator ? "MAGDA Arpeggiator"
-                                                            : "MAGDA Step Sequencer";
+    const juce::String label = state.traits.isChordEngine         ? "MAGDA Chord Engine"
+                               : state.traits.isArpeggiator       ? "MAGDA Arpeggiator"
+                               : state.traits.isPolyStepSequencer ? "MAGDA Poly Sequencer"
+                                                                  : "MAGDA Step Sequencer";
     g.drawText(label, textArea, juce::Justification::centredLeft);
 }
 
@@ -145,7 +149,8 @@ void paintDeviceSlotContent(juce::Graphics& g, juce::Rectangle<int> contentArea,
     if (drum_grid_slot::paintContentHeader(g, state.traits.isDrumGrid, state.bypassed, textArea))
         return;
 
-    if (state.traits.isChordEngine || state.traits.isArpeggiator || state.traits.isStepSequencer) {
+    if (state.traits.isChordEngine || state.traits.isArpeggiator || state.traits.isStepSequencer ||
+        state.traits.isPolyStepSequencer) {
         paintMidiUtilityHeader(g, headerArea, textArea, state);
     } else if (state.traits.isTracktionDevice && state.tracktionLogo != nullptr) {
         paintTracktionHeader(g, textArea, state);

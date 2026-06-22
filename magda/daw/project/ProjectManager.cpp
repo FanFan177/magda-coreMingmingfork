@@ -7,6 +7,7 @@
 
 #include "../core/AutomationManager.hpp"
 #include "../core/ClipManager.hpp"
+#include "../core/Config.hpp"
 #include "../core/TempoUtils.hpp"
 #include "../core/TrackManager.hpp"
 #include "../engine/AudioEngine.hpp"
@@ -111,6 +112,14 @@ bool ProjectManager::newProject() {
     currentProject_ = ProjectInfo();
     currentProject_.name = "Untitled";
     currentProject_.version = MAGDA_VERSION;
+    // Seed per-project settings from the global new-project defaults.
+    {
+        auto& config = Config::getInstance();
+        currentProject_.timelineLengthBars = config.getDefaultTimelineLengthBars();
+        currentProject_.sampleRate = config.getRenderSampleRate();
+        currentProject_.renderBitDepth = config.getRenderBitDepth();
+        currentProject_.bounceBitDepth = config.getBounceBitDepth();
+    }
     currentFile_ = juce::File();
     isProjectOpen_ = true;
 
@@ -265,6 +274,69 @@ bool ProjectManager::loadProject(const juce::File& file,
 
     deleteAutosaveFile();
     notifyProjectOpened();
+
+    if (onAfterLoad)
+        onAfterLoad(currentProject_);
+
+    return true;
+}
+
+bool ProjectManager::exportDawProject(const juce::File& file) {
+    if (onBeforeSave)
+        onBeforeSave();
+
+    ProjectInfo exportInfo = currentProject_;
+    if (exportInfo.name.isEmpty())
+        exportInfo.name = file.getFileNameWithoutExtension();
+    exportInfo.touch();
+
+    if (!ProjectSerializer::exportToDawProject(file, exportInfo)) {
+        DBG("Failed to export DAWproject: " + ProjectSerializer::getLastError());
+        lastError_ = ProjectSerializer::getLastError();
+        return false;
+    }
+
+    return true;
+}
+
+bool ProjectManager::importDawProject(const juce::File& file,
+                                      std::function<void(const ProjectInfo&)> onBeforeCommit) {
+    if (isDirty_ && !showUnsavedChangesDialog())
+        return false;
+
+    if (!file.existsAsFile()) {
+        lastError_ = "File does not exist: " + file.getFullPathName();
+        return false;
+    }
+
+    // Set up the project media directory first so embedded audio extracts into
+    // it (the "imported" subdir) and persists with the project, rather than into
+    // a throwaway temp folder.
+    createTempMediaDirectory();
+    ensureMediaSubdirectories(mediaDirectory_);
+
+    StagedProjectData staged;
+    if (!ProjectSerializer::loadDawProjectAndStage(file, staged, getImportedDirectory())) {
+        DBG("Failed to import DAWproject: " + ProjectSerializer::getLastError());
+        lastError_ = ProjectSerializer::getLastError();
+        return false;
+    }
+
+    resetTransportForProjectBoundary();
+
+    if (onBeforeCommit)
+        onBeforeCommit(staged.info);
+
+    ProjectSerializer::commitStaged(staged);
+
+    currentProject_ = staged.info;
+    currentProject_.filePath = {};
+    currentFile_ = juce::File();
+    isProjectOpen_ = true;
+
+    isDirty_ = true;
+    notifyProjectOpened();
+    notifyDirtyStateChanged();
 
     if (onAfterLoad)
         onAfterLoad(currentProject_);
@@ -577,14 +649,28 @@ void ProjectManager::migrateMediaFiles(const juce::File& oldDir, const juce::Fil
     auto& clipManager = ClipManager::getInstance();
     auto updateClipPaths = [&](const std::vector<ClipInfo>& clips) {
         for (const auto& clipInfo : clips) {
-            if (clipInfo.isAudio() && clipInfo.audio().source.filePath.isNotEmpty() &&
-                clipInfo.audio().source.filePath.startsWith(oldPath)) {
-                auto* clip = clipManager.getClip(clipInfo.id);
-                if (clip) {
+            if (!clipInfo.isAudio())
+                continue;
+            const bool sourceMoved = clipInfo.audio().source.filePath.isNotEmpty() &&
+                                     clipInfo.audio().source.filePath.startsWith(oldPath);
+            bool anyTakeMoved = false;
+            for (const auto& take : clipInfo.audio().takes) {
+                if (take.filePath.startsWith(oldPath)) {
+                    anyTakeMoved = true;
+                    break;
+                }
+            }
+            if (!sourceMoved && !anyTakeMoved)
+                continue;
+            auto* clip = clipManager.getClip(clipInfo.id);
+            if (clip) {
+                if (sourceMoved)
                     clip->audio().source.filePath =
                         clip->audio().source.filePath.replace(oldPath, newPath, false);
-                    updatedClipIds.push_back(clip->id);
-                }
+                for (auto& take : clip->audio().takes)
+                    if (take.filePath.startsWith(oldPath))
+                        take.filePath = take.filePath.replace(oldPath, newPath, false);
+                updatedClipIds.push_back(clip->id);
             }
         }
     };

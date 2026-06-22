@@ -13,6 +13,13 @@ ControlTargetResolver::ControlTargetResolver(TrackController& trackController,
 te::AutomatableParameter* ControlTargetResolver::resolve(const ControlTarget& target) const {
     switch (target.kind) {
         case ControlTarget::Kind::TrackVolume: {
+            // The master channel is not a te::AudioTrack; its level lives on the
+            // edit's master volume plugin.
+            if (target.devicePath.trackId == MASTER_TRACK_ID) {
+                if (auto* mvp = trackController_.getMasterVolumePlugin())
+                    return mvp->volParam.get();
+                return nullptr;
+            }
             auto* track = trackController_.getAudioTrack(target.devicePath.trackId);
             if (!track)
                 return nullptr;
@@ -61,6 +68,11 @@ te::AutomatableParameter* ControlTargetResolver::resolve(const ControlTarget& ta
         case ControlTarget::Kind::ModParam:
             return pluginManager_.findModifierParameterForAutomation(
                 target.devicePath.trackId, target.devicePath, target.modId, target.modParamIndex);
+
+        case ControlTarget::Kind::Tempo:
+            // Edit-scoped: tempo has no te::AutomatableParameter. The BPM bridge
+            // drives te::TempoSequence directly rather than through a parameter.
+            return nullptr;
     }
     return nullptr;
 }

@@ -102,6 +102,20 @@ ParameterInfo makeSyncDivisionInfo(const juce::String& name) {
     return info;
 }
 
+ParameterInfo makeTempoInfo(const juce::String& name) {
+    // Global tempo lane. Linear BPM scale covering the usual musical range;
+    // the actual write into te::TempoSequence happens in the BPM bridge epic.
+    ParameterInfo info;
+    info.paramIndex = -1;
+    info.name = name;
+    info.unit = "BPM";
+    info.minValue = 20.0f;
+    info.maxValue = 300.0f;
+    info.defaultValue = 120.0f;
+    info.scale = ParameterScale::Linear;
+    return info;
+}
+
 }  // namespace
 
 juce::String formatCustomNameWithDefault(const juce::String& name,
@@ -153,10 +167,16 @@ ParameterInfo getParameterInfoForTarget(const AutomationTarget& target) {
             auto* stored = device->findParameterByIndex(target.paramIndex);
             if (!stored)
                 break;
-            // Backstop: ensure every PluginParam info carries a working
-            // DisplayTextProvider so the lane scale labels and tooltips route
-            // display through the plugin's own valueToString.
-            if (!stored->displayText && target.devicePath.getDeviceId() != INVALID_DEVICE_ID) {
+            // Backstop: external (VST/AU) params are opaque, so route their lane
+            // labels / tooltips through the plugin's own valueToString via a
+            // DisplayTextProvider. Internal MAGDA devices own authoritative
+            // ParameterInfo (scale/unit/range), so they format natively from
+            // that instead — attaching the provider here would project the
+            // lane-normalized value through the host param's valueToString with
+            // a 0..1 teRange that doesn't match a FaderDB/log scale (e.g. the
+            // Utility gain rendering nonsense like "+80dB").
+            if (!stored->displayText && device->format != PluginFormat::Internal &&
+                target.devicePath.getDeviceId() != INVALID_DEVICE_ID) {
                 auto provider = std::make_shared<ParameterInfo::DisplayTextProvider>();
                 provider->devicePath = target.devicePath;
                 provider->deviceId = target.devicePath.getDeviceId();
@@ -179,6 +199,9 @@ ParameterInfo getParameterInfoForTarget(const AutomationTarget& target) {
             break;
         }
 
+        case ControlTarget::Kind::Tempo:
+            return makeTempoInfo("Tempo");
+
         case ControlTarget::Kind::DeviceMacro:
             break;
     }
@@ -189,14 +212,28 @@ ParameterInfo getParameterInfoForTarget(const AutomationTarget& target) {
 
 juce::String getDisplayNameForTarget(const AutomationTarget& target) {
     switch (target.kind) {
+        // The lane header watermarks the track name (e.g. "Master") on the
+        // right, so the param label stays generic instead of "Master Volume".
         case ControlTarget::Kind::TrackVolume:
             return "Track Volume";
         case ControlTarget::Kind::TrackPan:
             return "Track Pan";
         case ControlTarget::Kind::SendLevel:
             return "Send " + juce::String(target.sendBusIndex + 1);
-        case ControlTarget::Kind::PluginParam:
+        case ControlTarget::Kind::PluginParam: {
+            // Resolve the real parameter name from the owning device so lanes
+            // read "Gain" / "Cutoff" rather than the generic "Param N".
+            if (target.paramIndex >= 0) {
+                auto* device =
+                    TrackManager::getInstance().getDeviceInChainByPath(target.devicePath);
+                if (device) {
+                    if (const auto* info = device->findParameterByIndex(target.paramIndex);
+                        info && info->name.isNotEmpty())
+                        return info->name;
+                }
+            }
             return "Param " + juce::String(target.paramIndex);
+        }
         case ControlTarget::Kind::DeviceMacro: {
             auto defaultName = getMacroDefaultDisplayName(target.paramIndex);
             if (auto* macro = resolveMacroInfoForTarget(target))
@@ -209,6 +246,8 @@ juce::String getDisplayNameForTarget(const AutomationTarget& target) {
             return "Mod " + juce::String(target.modId) + " Param " +
                    juce::String(target.modParamIndex);
         }
+        case ControlTarget::Kind::Tempo:
+            return "Tempo";
     }
     return "Unknown";
 }

@@ -2,10 +2,20 @@
 
 #include <juce_core/juce_core.h>
 
+#include <cstdint>
+#include <vector>
+
 #include "../core/TempoUtils.hpp"
 #include "version.hpp"
 
 namespace magda {
+
+struct ProjectTimelineMarker {
+    int id = 0;
+    double positionBeats = 0.0;
+    juce::String name;
+    std::uint32_t colourArgb = 0xFFFFC857;
+};
 
 /**
  * @brief Project metadata and settings
@@ -21,8 +31,15 @@ struct ProjectInfo {
     double tempo = DEFAULT_BPM;
     int timeSignatureNumerator = DEFAULT_TIME_SIGNATURE_NUMERATOR;
     int timeSignatureDenominator = DEFAULT_TIME_SIGNATURE_DENOMINATOR;
-    double projectLength = 240.0;  // seconds
-    double sampleRate = 44100.0;
+    double projectLength = 240.0;  // seconds (legacy; derived from timelineLengthBars)
+    double sampleRate = 44100.0;   // project working/render sample rate
+
+    // Total timeline length (per-project; seeded from Config default for new projects)
+    int timelineLengthBars = 256;
+
+    // Render / bounce settings (per-project)
+    int renderBitDepth = 24;  // 16, 24, 32
+    int bounceBitDepth = 32;  // 16, 24, 32 (default 32-bit float for internal bounces)
 
     // Key signature
     int keyRoot = -1;    // 0=C, 1=C#, ..., 11=B; -1=none
@@ -32,6 +49,9 @@ struct ProjectInfo {
     bool loopEnabled = false;
     double loopStartBeats = 0.0;
     double loopEndBeats = 0.0;
+
+    // Named timeline markers (positions are stored in beats)
+    std::vector<ProjectTimelineMarker> markers;
 
     // Zoom/scroll state
     double horizontalZoom = -1.0;  // Pixels per beat (-1 = use default)

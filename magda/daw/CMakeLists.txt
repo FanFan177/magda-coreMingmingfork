@@ -73,8 +73,16 @@ juce_add_binary_data(MagdaAssets
     ../../assets/icons/general/drum_grid.svg
     ../../assets/icons/general/faust-text-logo.svg
     ../../assets/icons/general/script.svg
+    ../../assets/icons/general/speaker.svg
+    ../../assets/icons/general/speaker_muted.svg
     ../../assets/icons/general/speaker_on.svg
     ../../assets/icons/general/speaker_off.svg
+    ../../assets/icons/general/master_on.svg
+    ../../assets/icons/general/master_off.svg
+    ../../assets/icons/general/master_off_1.svg
+    ../../assets/icons/general/chord_on.svg
+    ../../assets/icons/general/chord_off.svg
+    ../../assets/icons/general/chord_on_1.svg
     ../../assets/BoldMGlyph.svg
     ../../assets/icons/general/headphones.svg
     ../../assets/icons/general/record-monitor.svg
@@ -88,6 +96,8 @@ juce_add_binary_data(MagdaAssets
     ../../assets/icons/midi_editor/icon-cc-boldm.svg
     ../../assets/icons/midi_editor/icon-mpe-boldm.svg
     ../../assets/icons/midi_editor/icon-chord-boldm.svg
+    ../../assets/icons/midi_editor/icon-fold-boldm.svg
+    ../../assets/icons/midi_editor/lanes.svg
     ../../assets/icons/midi_editor/stacks.svg
     # Track chain icons
     ../../assets/icons/trackchain/icon-mods-boldm.svg
@@ -171,6 +181,8 @@ juce_add_binary_data(MagdaAssets
     ../../assets/icons/toolbar/horizontal.svg
     ../../assets/icons/toolbar/vertical.svg
     ../../assets/icons/toolbar/io_routing.svg
+    ../../assets/icons/toolbar/location.svg
+    ../../assets/icons/toolbar/clock.svg
     # Footer view mode icons
     ../../assets/icons/footer/icon-session-boldm.svg
     ../../assets/icons/footer/icon-arrangement-boldm.svg
@@ -186,6 +198,7 @@ juce_add_binary_data(MagdaAssets
     ../../assets/icons/browser/icon-audio-boldm.svg
     ../../assets/icons/browser/icon-midi-boldm.svg
     ../../assets/icons/browser/icon-preset-boldm.svg
+    ../../assets/icons/browser/icon-chordtrack-boldm.svg
     # Mixer fader icons
     ../../assets/icons/fader/fader_thumb.svg
     ../../assets/icons/fader/fader_track.svg
@@ -206,6 +219,8 @@ juce_add_binary_data(MagdaAssets
     ../../assets/icons/panels/bottom_close.svg
     ../../assets/icons/panels/enter_fs.svg
     ../../assets/icons/panels/exit_fs.svg
+    ../../assets/icons/panels/collapse.svg
+    ../../assets/icons/panels/expand.svg
     # Panel tab icons (BoldM)
     ../../assets/icons/panels/icon-browser-boldm.svg
     ../../assets/icons/panels/icon-console-boldm.svg
@@ -350,6 +365,7 @@ add_subdirectory(interfaces)
 add_subdirectory(profiling)
 add_subdirectory(ui)
 add_subdirectory(media_db)
+add_subdirectory(transcription)
 
 # =============================================================================
 # Linking, compile defs, includes
@@ -392,6 +408,7 @@ target_link_libraries(magda_daw
     $<$<PLATFORM_ID:Linux>:juce::pkgconfig_JUCE_BROWSER_LINUX_DEPS>
     $<$<PLATFORM_ID:Linux>:juce::pkgconfig_JUCE_CURL_LINUX_DEPS>
     PRIVATE
+    LibXml2::LibXml2
     faust::libfaust
 )
 
@@ -401,6 +418,7 @@ target_compile_definitions(magda_daw
     JUCE_PLUGINHOST_AU=1
     JUCE_MODAL_LOOPS_PERMITTED=1
     TRACKTION_ENABLE_TIMESTRETCH_SOUNDTOUCH=1
+    MAGDA_DAWPROJECT_SCHEMA_DIR="${CMAKE_SOURCE_DIR}/third_party/dawproject"
     $<$<BOOL:${JUCE_ASIO_ENABLED}>:JUCE_ASIO=1>
 )
 
@@ -608,6 +626,27 @@ else()
     )
 endif()
 
+# Copy resources/models/ (the bundled audio-to-MIDI model, basic_pitch.onnx)
+# into the app so TranscriptionService::findBundledModel resolves it at runtime.
+# Single small file (~230 KB); always staged regardless of MAGDA_HAVE_CLAP so
+# the dev-tree fallback and packaging stay uniform.
+set(MAGDA_MODELS_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../../resources/models")
+if(APPLE)
+    add_custom_command(TARGET magda_daw_app POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${MAGDA_MODELS_SRC}"
+            "$<TARGET_BUNDLE_CONTENT_DIR:magda_daw_app>/Resources/models"
+        COMMENT "Copying bundled models to app bundle Resources"
+    )
+else()
+    add_custom_command(TARGET magda_daw_app POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${MAGDA_MODELS_SRC}"
+            "$<TARGET_FILE_DIR:magda_daw_app>/models"
+        COMMENT "Copying bundled models alongside app executable"
+    )
+endif()
+
 # Copy faustlibraries (stdfaust.lib + dependencies) into the app so libfaust's
 # `import("stdfaust.lib")` resolves at runtime. FaustPlugin passes this dir as
 # `-I` argv to the interpreter compiler. Submodule path: third_party/faust/libraries.
@@ -625,6 +664,27 @@ else()
             "${MAGDA_FAUST_LIBS_SRC}"
             "$<TARGET_FILE_DIR:magda_daw_app>/faustlibraries"
         COMMENT "Copying Faust standard libraries alongside app executable"
+    )
+endif()
+
+# Copy third_party/dawproject/ (vendored Project.xsd + MetaData.xsd) into the
+# app so DawProjectValidator can validate import/export against the schemas at
+# runtime. Without this, the build-time MAGDA_DAWPROJECT_SCHEMA_DIR source path
+# does not exist on an end-user machine and every validate call fails.
+set(MAGDA_DAWPROJECT_SCHEMA_SRC "${CMAKE_SOURCE_DIR}/third_party/dawproject")
+if(APPLE)
+    add_custom_command(TARGET magda_daw_app POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${MAGDA_DAWPROJECT_SCHEMA_SRC}"
+            "$<TARGET_BUNDLE_CONTENT_DIR:magda_daw_app>/Resources/dawproject"
+        COMMENT "Copying DAWproject schemas to app bundle Resources"
+    )
+else()
+    add_custom_command(TARGET magda_daw_app POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${MAGDA_DAWPROJECT_SCHEMA_SRC}"
+            "$<TARGET_FILE_DIR:magda_daw_app>/dawproject"
+        COMMENT "Copying DAWproject schemas alongside app executable"
     )
 endif()
 

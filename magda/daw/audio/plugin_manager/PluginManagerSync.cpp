@@ -184,7 +184,12 @@ bool savedPluginStateMatchesRequestedType(const juce::ValueTree& savedState,
 void restoreDeviceStateWithChunkOverlay(DeviceProcessor& processor, const te::Plugin::Ptr& plugin,
                                         const DeviceInfo& device) {
     processor.syncFromDeviceInfo(device);
-    applyExternalPluginChunk(plugin.get(), device.pluginState);
+    // DAWproject-imported VST3s carry their state as a .vstpreset (vst3Preset)
+    // rather than MAGDA's TE chunk; apply it as the authoritative overlay too.
+    if (device.vst3Preset.isNotEmpty())
+        applyVst3Preset(plugin.get(), device.vst3Preset);
+    else
+        applyExternalPluginChunk(plugin.get(), device.pluginState);
 }
 
 bool canOwnInstrumentWrapper(const ChainNodePath& devicePath) {
@@ -701,17 +706,13 @@ void PluginManager::syncTrackPlugins(TrackId trackId) {
     // Sync sidechain routing for plugins that support it
     syncSidechains(trackId, teTrack);
 
-    // Sidechain monitors: insert on tracks that are sidechain sources.
-    // MIDI monitor at position 0 (before instruments), audio monitor near end (after instruments).
+    // MIDI sidechain monitors sit at the front so they see MIDI before instruments consume it.
+    // Audio trigger monitors are reconciled after plugin ordering is stable below, because their
+    // correct tap point can be after a source instrument/rack.
     if (trackNeedsSidechainMonitor(trackId))
         ensureSidechainMonitor(trackId);
     else
         removeSidechainMonitor(trackId);
-
-    if (trackNeedsAudioSidechainMonitor(trackId))
-        ensureAudioSidechainMonitor(trackId);
-    else
-        removeAudioSidechainMonitor(trackId);
 
     // Create TE plugins for post-FX devices (flat list, no racks/instruments).
     // Inserted at -1 (append); the reorder pass below places them after the fx
@@ -848,8 +849,8 @@ void PluginManager::syncTrackPlugins(TrackId trackId) {
     if (pluginOrderChanged)
         requestPluginOrderGraphRestart(trackId, "track-plugin-order");
 
-    // Rebuild sidechain LFO cache so audio/MIDI threads see current state
-    rebuildSidechainLFOCache();
+    // Rebuild trigger cache and reconcile audio trigger monitors after user plugin order is stable.
+    refreshAudioSidechainMonitors();
 }
 
 // =============================================================================
@@ -1225,6 +1226,14 @@ void PluginManager::pollAsyncPluginLoad(const ChainNodePath& devicePath, te::Plu
             plugin->setEnabled(true);
             if (auto* devInfo = getDeviceInfoForPath(devicePath)) {
                 plugin->setEnabled(!devInfo->bypassed);
+            }
+
+            // Apply an imported .vstpreset (DAWproject device state) now that the
+            // VST3 instance is live; clear it once applied so a resync won't redo it.
+            if (auto* devInfo = getDeviceInfoForPath(devicePath);
+                devInfo && devInfo->vst3Preset.isNotEmpty()) {
+                if (applyVst3Preset(plugin.get(), devInfo->vst3Preset))
+                    devInfo->vst3Preset = {};
             }
 
             // Create processor now that the plugin instance is ready
@@ -1901,6 +1910,20 @@ te::Plugin::Ptr PluginManager::createPluginOnly(TrackId trackId, const DeviceInf
                 }
             }
 
+            // Final pass: by name + format only (other hosts' deviceRole is
+            // unreliable, so isInstrument can't be required); resolves an imported
+            // plugin to the installed one by name.
+            if (!found) {
+                for (const auto& knownDesc : knownPlugins.getTypes()) {
+                    if (knownDesc.name == device.name &&
+                        knownDesc.pluginFormatName == desc.pluginFormatName) {
+                        desc = knownDesc;
+                        found = true;
+                        break;
+                    }
+                }
+            }
+
             // Apply TE bug workaround (same as loadExternalPlugin)
             juce::PluginDescription descCopy = desc;
             if (descCopy.deprecatedUid != 0) {
@@ -2086,7 +2109,34 @@ te::Plugin::Ptr PluginManager::loadDeviceAsPlugin(const ChainNodePath& devicePat
                 }
             }
 
+            // Final pass: match by name + format + isInstrument, ignoring vendor
+            // and file path. DAWproject from other hosts (Bitwig) carries the
+            // plugin name and the VST3 class id, but not MAGDA's file path or the
+            // vendor, so the earlier passes can't resolve it; the name is the only
+            // portable handle to the installed plugin.
+            // Final pass: match by name + format only. Other hosts' deviceRole is
+            // unreliable (Bitwig exports Serum, an instrument, as "audioFX"), so we
+            // can't require isInstrument to agree; the name is the portable handle.
             if (!found) {
+                for (const auto& knownDesc : knownPlugins.getTypes()) {
+                    if (knownDesc.name == device.name &&
+                        knownDesc.pluginFormatName == desc.pluginFormatName) {
+                        desc = knownDesc;
+                        found = true;
+                        break;
+                    }
+                }
+            }
+
+            // Adopt the resolved plugin's instrument classification (the imported
+            // deviceRole may be wrong), so MAGDA wraps/routes it correctly.
+            if (found) {
+                if (auto* live = getDeviceInfoForPath(devicePath);
+                    live && live->isInstrument != desc.isInstrument) {
+                    live->isInstrument = desc.isInstrument;
+                    live->deviceType =
+                        desc.isInstrument ? DeviceType::Instrument : DeviceType::Effect;
+                }
             }
 
             auto result = loadExternalPlugin(trackId, desc, insertIndex);
@@ -2111,6 +2161,11 @@ te::Plugin::Ptr PluginManager::loadDeviceAsPlugin(const ChainNodePath& devicePat
                     // saved per-parameter array.)
                     if (device.pluginState.isNotEmpty()) {
                         ext->restorePluginStateFromValueTree(ext->state);
+                    }
+                    // Imported DAWproject .vstpreset state (instance is live here).
+                    if (device.vst3Preset.isNotEmpty() && applyVst3Preset(ext, device.vst3Preset)) {
+                        if (auto* devInfo = getDeviceInfoForPath(devicePath))
+                            devInfo->vst3Preset = {};
                     }
                 }
 

@@ -9,6 +9,7 @@
 #include "../dialogs/ExportMidiDialog.hpp"
 #include "../dialogs/PluginSettingsDialog.hpp"
 #include "../dialogs/PreferencesDialog.hpp"
+#include "../dialogs/ProjectSettingsDialog.hpp"
 #include "../dialogs/TrackManagerDialog.hpp"
 #include "../state/TimelineController.hpp"
 #include "../state/TimelineEvents.hpp"
@@ -18,6 +19,7 @@
 #include "MenuManager.hpp"
 #include "core/Config.hpp"
 #include "core/StringTable.hpp"
+#include "core/TechnicalText.hpp"
 #include "core/TrackCommands.hpp"
 #include "core/TrackManager.hpp"
 #include "core/TrackPropertyCommands.hpp"
@@ -36,9 +38,9 @@ namespace {
 class CollectFilesProgressWindow : public juce::ThreadWithProgressWindow {
   public:
     explicit CollectFilesProgressWindow(MediaCollector::Plan plan)
-        : ThreadWithProgressWindow(tr("collect.progress.title"), true, true),
+        : ThreadWithProgressWindow(trEllipsis("collect.progress.title"), true, true),
           plan_(std::move(plan)),
-          strCopying_(tr("collect.progress.copying")) {
+          strCopying_(trEllipsis("collect.progress.copying")) {
         setStatusMessage(strCopying_);
     }
 
@@ -94,7 +96,7 @@ void MainWindow::openProjectFile(const juce::File& file) {
         return;
 
     if (mainComponent)
-        mainComponent->showLoadingMessage(tr("dialogs.loading_project"));
+        mainComponent->showLoadingMessage(trEllipsis("dialogs.loading_project"));
 
     SelectionManager::getInstance().clearSelection();
     if (mainComponent && mainComponent->mainView)
@@ -110,7 +112,8 @@ void MainWindow::openProjectFile(const juce::File& file) {
             auto& tc = safeThis->mainComponent->mainView->getTimelineController();
             tc.restoreProjectState(info.tempo, info.timeSignatureNumerator,
                                    info.timeSignatureDenominator, info.loopEnabled,
-                                   info.loopStartBeats, info.loopEndBeats);
+                                   info.loopStartBeats, info.loopEndBeats, info.markers,
+                                   info.timelineLengthBars);
         },
         [safeThis, file](bool success, const juce::String& error) {
             if (!safeThis)
@@ -128,6 +131,36 @@ void MainWindow::openProjectFile(const juce::File& file) {
                 MenuManager::getInstance().menuItemsChanged();
             }
         });
+}
+
+void MainWindow::importDawProjectFile(const juce::File& file) {
+    if (!file.existsAsFile())
+        return;
+
+    SelectionManager::getInstance().clearSelection();
+    if (mainComponent && mainComponent->mainView)
+        mainComponent->mainView->getTimelineController().dispatch(ClearTimeSelectionEvent{});
+
+    auto& projectManager = ProjectManager::getInstance();
+    const bool ok = projectManager.importDawProject(file, [this](const ProjectInfo& info) {
+        if (!mainComponent || !mainComponent->mainView)
+            return;
+        auto& tc = mainComponent->mainView->getTimelineController();
+        tc.restoreProjectState(info.tempo, info.timeSignatureNumerator,
+                               info.timeSignatureDenominator, info.loopEnabled, info.loopStartBeats,
+                               info.loopEndBeats, info.markers, info.timelineLengthBars);
+    });
+
+    if (!ok) {
+        // Empty lastError = user cancelled the unsaved-changes prompt; stay silent.
+        const auto error = projectManager.getLastError();
+        if (error.isNotEmpty())
+            juce::AlertWindow::showMessageBoxAsync(
+                juce::AlertWindow::WarningIcon,
+                tr("action.import")
+                    .replace("{0}", magda::technicalText(magda::TechnicalTextToken::DawProject)),
+                error);
+    }
 }
 
 // ============================================================================
@@ -155,11 +188,12 @@ void MainWindow::setupMenuCallbacks() {
         } else {
             // Reset timeline/transport to defaults
             if (mainComponent && mainComponent->mainView) {
-                ProjectInfo defaults;
+                const auto& info = ProjectManager::getInstance().getCurrentProjectInfo();
                 auto& tc = mainComponent->mainView->getTimelineController();
-                tc.restoreProjectState(defaults.tempo, defaults.timeSignatureNumerator,
-                                       defaults.timeSignatureDenominator, defaults.loopEnabled,
-                                       defaults.loopStartBeats, defaults.loopEndBeats);
+                tc.restoreProjectState(info.tempo, info.timeSignatureNumerator,
+                                       info.timeSignatureDenominator, info.loopEnabled,
+                                       info.loopStartBeats, info.loopEndBeats, info.markers,
+                                       info.timelineLengthBars);
             }
             // Select master channel by default
             SelectionManager::getInstance().selectTrack(MASTER_TRACK_ID);
@@ -392,6 +426,71 @@ void MainWindow::setupMenuCallbacks() {
             false, hasLoopRegion);
     };
 
+    callbacks.onImportDawProject = [this]() {
+        if (fileChooser_ != nullptr)
+            return;
+
+        fileChooser_ = std::make_unique<juce::FileChooser>(
+            tr("action.import")
+                .replace("{0}", magda::technicalText(magda::TechnicalTextToken::DawProject)),
+            juce::File::getSpecialLocation(juce::File::userDocumentsDirectory), "*.dawproject",
+            true);
+
+        auto flags =
+            juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles;
+
+        fileChooser_->launchAsync(flags, [this](const juce::FileChooser& chooser) {
+            auto file = chooser.getResult();
+            fileChooser_.reset();
+
+            if (!file.existsAsFile())
+                return;  // User cancelled
+
+            importDawProjectFile(file);
+        });
+    };
+
+    callbacks.onExportDawProject = [this]() {
+        if (fileChooser_ != nullptr)
+            return;
+
+        auto& projectManager = ProjectManager::getInstance();
+        auto currentFile = projectManager.getCurrentProjectFile();
+        auto initialDir = currentFile.existsAsFile()
+                              ? currentFile.getParentDirectory()
+                              : juce::File::getSpecialLocation(juce::File::userDocumentsDirectory);
+
+        fileChooser_ = std::make_unique<juce::FileChooser>(
+            tr("action.export")
+                .replace("{0}", magda::technicalText(magda::TechnicalTextToken::DawProject)),
+            initialDir, "*.dawproject", true);
+
+        auto flags = juce::FileBrowserComponent::saveMode |
+                     juce::FileBrowserComponent::canSelectFiles |
+                     juce::FileBrowserComponent::warnAboutOverwriting;
+
+        fileChooser_->launchAsync(flags, [this](const juce::FileChooser& chooser) {
+            auto file = chooser.getResult();
+            fileChooser_.reset();
+
+            if (!file.getFullPathName().isNotEmpty())
+                return;  // User cancelled
+
+            if (!file.hasFileExtension(".dawproject"))
+                file = file.withFileExtension(".dawproject");
+
+            auto& projectManager = ProjectManager::getInstance();
+            if (!projectManager.exportDawProject(file)) {
+                juce::AlertWindow::showMessageBoxAsync(
+                    juce::AlertWindow::WarningIcon,
+                    tr("action.export")
+                        .replace("{0}",
+                                 magda::technicalText(magda::TechnicalTextToken::DawProject)),
+                    tr("dialogs.error.export_failed") + " " + projectManager.getLastError());
+            }
+        });
+    };
+
     callbacks.onQuit = [this]() { closeButtonPressed(); };
 
     // Edit menu callbacks
@@ -464,6 +563,8 @@ void MainWindow::setupMenuCallbacks() {
     };
 
     callbacks.onPreferences = [this]() { PreferencesDialog::showDialog(this); };
+
+    callbacks.onProjectSettings = [this]() { ProjectSettingsDialog::showDialog(this); };
 
     callbacks.onAISettings = [this]() { AISettingsDialog::showDialog(this); };
 
@@ -590,6 +691,10 @@ void MainWindow::setupMenuCallbacks() {
         MenuManager::getInstance().menuItemsChanged();
         if (mainComponent && mainComponent->mainView) {
             mainComponent->mainView->resized();
+            // The header column swaps sides, but MainView::paint() draws
+            // side-dependent backgrounds; without a repaint the old side keeps
+            // its painted pixels (the stale grid / song-map fragment).
+            mainComponent->mainView->repaint();
         }
     };
 
@@ -636,6 +741,22 @@ void MainWindow::setupMenuCallbacks() {
         }
     };
 
+    callbacks.onAddMarker = [this]() {
+        if (mainComponent)
+            mainComponent->getCommandManager().invokeDirectly(CommandIDs::addMarker, false);
+    };
+
+    callbacks.onGoToPreviousMarker = [this]() {
+        if (mainComponent)
+            mainComponent->getCommandManager().invokeDirectly(CommandIDs::goToPreviousMarker,
+                                                              false);
+    };
+
+    callbacks.onGoToNextMarker = [this]() {
+        if (mainComponent)
+            mainComponent->getCommandManager().invokeDirectly(CommandIDs::goToNextMarker, false);
+    };
+
     // Track menu callbacks - all track operations go through the undo system
     callbacks.onAddTrack = []() {
         auto cmd = std::make_unique<CreateTrackCommand>(TrackType::Audio);
@@ -649,6 +770,14 @@ void MainWindow::setupMenuCallbacks() {
 
     callbacks.onAddAuxTrack = []() {
         auto cmd = std::make_unique<CreateTrackCommand>(TrackType::Aux);
+        UndoManager::getInstance().executeCommand(std::move(cmd));
+    };
+
+    callbacks.onAddChordTrack = []() {
+        // Chord track is a strict singleton; only create when none exists.
+        if (TrackManager::getInstance().hasChordTrack())
+            return;
+        auto cmd = std::make_unique<CreateTrackCommand>(TrackType::Chord);
         UndoManager::getInstance().executeCommand(std::move(cmd));
     };
 

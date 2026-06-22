@@ -118,7 +118,7 @@ class NodeComponent : public juce::Component,
     std::function<void()> onLayoutChanged;         // Called when size changes (e.g., panel toggle)
     std::function<void()> onSelected;              // Called when node is clicked/selected
     std::function<void(bool)> onCollapsedChanged;  // Called when collapsed state changes
-    std::function<void(float)> onZoomDelta;        // Called for Cmd+scroll zoom (delta amount)
+    std::function<void(float)> onZoomDelta;        // Called for Alt/Cmd+scroll zoom (delta amount)
 
     // Toggle side panel visibility programmatically
     void setModPanelVisible(bool visible);
@@ -352,6 +352,9 @@ class NodeComponent : public juce::Component,
     }
     virtual void onModAudioAttackChangedInternal(int /*modIndex*/, float /*ms*/) {}
     virtual void onModAudioReleaseChangedInternal(int /*modIndex*/, float /*ms*/) {}
+    virtual void onModEnvelopeChangedInternal(int /*modIndex*/, const magda::ModInfo& /*mod*/) {}
+    virtual void onModRandomChangedInternal(int /*modIndex*/, const magda::ModInfo& /*mod*/) {}
+    virtual void onModFollowerChangedInternal(int /*modIndex*/, const magda::ModInfo& /*mod*/) {}
     virtual void onModCurveChangedInternal(int /*modIndex*/) {}
     // Contextual link callbacks (when param is selected and mod amount slider is used)
     virtual void onModLinkAmountChangedInternal(int /*modIndex*/, magda::ControlTarget /*target*/,

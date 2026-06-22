@@ -85,6 +85,23 @@ StepSequencerPlugin::~StepSequencerPlugin() {
     state.removeListener(&paramSyncListener_);
 }
 
+void StepSequencerPlugin::ParamSyncListener::valueTreePropertyChanged(juce::ValueTree&,
+                                                                      const juce::Identifier& p) {
+    owner.syncParamFromProperty(p);
+}
+
+void StepSequencerPlugin::ParamSyncListener::valueTreeChildAdded(juce::ValueTree&,
+                                                                 juce::ValueTree& child) {
+    if (child.hasType(SeqIDs::stepTree) && !owner.suppressStepStateReload_)
+        owner.loadStepsFromState();
+}
+
+void StepSequencerPlugin::ParamSyncListener::valueTreeChildRemoved(juce::ValueTree&,
+                                                                   juce::ValueTree& child, int) {
+    if (child.hasType(SeqIDs::stepTree) && !owner.suppressStepStateReload_)
+        owner.loadStepsFromState();
+}
+
 void StepSequencerPlugin::syncParamFromProperty(const juce::Identifier& property) {
     if (property == SeqIDs::rate && rateParam)
         rateParam->setParameterFromHost(static_cast<float>(rate.get()), juce::dontSendNotification);
@@ -147,14 +164,17 @@ void StepSequencerPlugin::restorePluginStateFromValueTree(const juce::ValueTree&
 
     // Copy step children from the incoming tree into our state
     // (copyPropertiesToCachedValues only copies properties, not children)
-    for (int i = state.getNumChildren() - 1; i >= 0; --i) {
-        if (state.getChild(i).hasType(SeqIDs::stepTree))
-            state.removeChild(i, nullptr);
-    }
-    for (int i = 0; i < v.getNumChildren(); ++i) {
-        auto child = v.getChild(i);
-        if (child.hasType(SeqIDs::stepTree))
-            state.appendChild(child.createCopy(), nullptr);
+    {
+        const juce::ScopedValueSetter<bool> suppressReload(suppressStepStateReload_, true);
+        for (int i = state.getNumChildren() - 1; i >= 0; --i) {
+            if (state.getChild(i).hasType(SeqIDs::stepTree))
+                state.removeChild(i, nullptr);
+        }
+        for (int i = 0; i < v.getNumChildren(); ++i) {
+            auto child = v.getChild(i);
+            if (child.hasType(SeqIDs::stepTree))
+                state.appendChild(child.createCopy(), nullptr);
+        }
     }
 
     loadStepsFromState();
@@ -235,6 +255,36 @@ void StepSequencerPlugin::randomizePattern() {
     saveStepsToState();
 }
 
+void StepSequencerPlugin::clearPattern() {
+    auto* um = getUndoManager();
+    if (um != nullptr)
+        um->beginNewTransaction();
+
+    steps_.fill(Step{});
+    const juce::ScopedValueSetter<bool> suppressReload(suppressStepStateReload_, true);
+
+    // Remove existing step children via undo manager so the operation is undoable
+    for (int i = state.getNumChildren() - 1; i >= 0; --i) {
+        if (state.getChild(i).hasType(SeqIDs::stepTree))
+            state.removeChild(i, um);
+    }
+
+    // Write default steps back so the ValueTree reflects the cleared state
+    int count = juce::jlimit(1, MAX_STEPS, numSteps.get());
+    for (int i = 0; i < count; ++i) {
+        const auto& s = steps_[static_cast<size_t>(i)];
+        juce::ValueTree stepVT(SeqIDs::stepTree);
+        stepVT.setProperty(SeqIDs::stepIndex, i, nullptr);
+        stepVT.setProperty(SeqIDs::stepNote, s.noteNumber, nullptr);
+        stepVT.setProperty(SeqIDs::stepOctave, s.octaveShift, nullptr);
+        stepVT.setProperty(SeqIDs::stepGate, s.gate, nullptr);
+        stepVT.setProperty(SeqIDs::stepAccent, s.accent, nullptr);
+        stepVT.setProperty(SeqIDs::stepGlide, s.glide, nullptr);
+        stepVT.setProperty(SeqIDs::stepTie, s.tie, nullptr);
+        state.appendChild(stepVT, um);
+    }
+}
+
 void StepSequencerPlugin::setPattern(const std::vector<Step>& steps, bool cueOnBar) {
     int count = std::min(static_cast<int>(steps.size()), MAX_STEPS);
 
@@ -262,6 +312,8 @@ int StepSequencerPlugin::resolveNote(const Step& step) {
 // =============================================================================
 
 void StepSequencerPlugin::saveStepsToState() {
+    const juce::ScopedValueSetter<bool> suppressReload(suppressStepStateReload_, true);
+
     // Remove existing step children
     for (int i = state.getNumChildren() - 1; i >= 0; --i) {
         if (state.getChild(i).hasType(SeqIDs::stepTree))
@@ -355,7 +407,10 @@ void StepSequencerPlugin::applyToBuffer(const te::PluginRenderContext& fc) {
                         setStepNote(capturedPos, note);
                         setStepGate(capturedPos, true);
                     });
-                    stepRecordPosition_.store(pos + 1, std::memory_order_relaxed);
+                    const int nextPos = pos + 1;
+                    stepRecordPosition_.store(nextPos, std::memory_order_relaxed);
+                    if (nextPos >= maxSteps)
+                        stepRecording_.store(false, std::memory_order_relaxed);
                 }
             }
         }
@@ -375,6 +430,8 @@ void StepSequencerPlugin::applyToBuffer(const te::PluginRenderContext& fc) {
         stepClock_.reset();
         currentPlayStep_.store(-1, std::memory_order_relaxed);
         silentBlockCount_ = 0;
+        for (auto& msg : thruMessages)
+            midi.addMidiMessage(msg, msg.getTimeStamp(), te::MPESourceID{});
         return;
     }
 

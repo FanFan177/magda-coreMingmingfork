@@ -10,6 +10,7 @@
 #include "../../themes/SmallButtonLookAndFeel.hpp"
 #include "audio/AudioBridge.hpp"
 #include "audio/AudioThumbnailManager.hpp"
+#include "audio/CompService.hpp"
 #include "core/ClipCommands.hpp"
 #include "core/ClipDisplayInfo.hpp"
 #include "core/ClipPropertyCommands.hpp"
@@ -21,6 +22,26 @@
 #include "engine/AudioEngine.hpp"
 
 namespace magda::daw::ui {
+
+namespace {
+// Route clip timeline-seconds through the position-aware tempo facade when
+// wired (message thread); fall back to the constant-tempo bpm before injection.
+double facadeTimelineStart(const magda::ClipInfo& c, double bpm) {
+    if (auto* tc = magda::TimelineController::getCurrent(); tc && tc->tempoMap())
+        return c.getTimelineStart(*tc->tempoMap());
+    return c.getTimelineStart(bpm);
+}
+double facadeTimelineLength(const magda::ClipInfo& c, double bpm) {
+    if (auto* tc = magda::TimelineController::getCurrent(); tc && tc->tempoMap())
+        return c.getTimelineLength(*tc->tempoMap());
+    return c.getTimelineLength(bpm);
+}
+double facadeTimelineEnd(const magda::ClipInfo& c, double bpm) {
+    if (auto* tc = magda::TimelineController::getCurrent(); tc && tc->tempoMap())
+        return c.getTimelineEnd(*tc->tempoMap());
+    return c.getTimelineEnd(bpm);
+}
+}  // namespace
 
 // ============================================================================
 // ScrollNotifyingViewport - Custom viewport that notifies on scroll
@@ -120,8 +141,8 @@ class WaveformEditorContent::PlayheadOverlay : public juce::Component {
 
         const auto& di = owner_.cachedDisplayInfo_;
         const double projectBpm = owner_.timeRuler_ ? owner_.timeRuler_->getTempo() : 120.0;
-        const double clipStart = clip->getTimelineStart(projectBpm);
-        const double clipEnd = clip->getTimelineEnd(projectBpm);
+        const double clipStart = facadeTimelineStart(*clip, projectBpm);
+        const double clipEnd = facadeTimelineEnd(*clip, projectBpm);
 
         // The editor shows source file content — convert arrangement time
         // to source-file position. Only show cursors when the arrangement
@@ -568,6 +589,26 @@ WaveformEditorContent::WaveformEditorContent() {
     gridComponent_->onSliceWarpMarkersToDrumGrid = [this]() { sliceWarpMarkersToDrumGrid(); };
     gridComponent_->onSliceAtGridToDrumGrid = [this]() { sliceAtGridToDrumGrid(); };
 
+    // Loop-record takes: a lane click fronts that take as the clip's source and
+    // re-syncs (ClipSynchronizer rebuilds the TE clip + re-attaches the takes).
+    gridComponent_->onTakeSelected = [this](int takeIndex) {
+        magda::ClipManager::getInstance().setAudioClipCurrentTake(editingClipId_, takeIndex);
+    };
+
+    // Comping: a swipe across a take lane assigns that range of the comp to the
+    // swiped take. CompService edits the comp section list and re-renders.
+    gridComponent_->onCompSectionSet = [this](double startSeconds, double endSeconds,
+                                              int takeIndex) {
+        magda::CompService::getInstance().setSection(editingClipId_, startSeconds, endSeconds,
+                                                     takeIndex);
+    };
+    gridComponent_->onCompClear = [this]() {
+        magda::CompService::getInstance().clearComp(editingClipId_);
+    };
+    gridComponent_->onTakeDelete = [this](int takeIndex) {
+        magda::ClipManager::getInstance().deleteClipTake(editingClipId_, takeIndex);
+    };
+
     // Zoom drag on waveform body, resolved through GestureRouter.
     gridComponent_->onZoomDrag = [this](int deltaX, int deltaY, int anchorX,
                                         const juce::ModifierKeys& mods) {
@@ -864,8 +905,8 @@ void WaveformEditorContent::clipPropertyChanged(magda::ClipId clipId) {
             double currentBpm = 120.0;
             if (auto* tc = magda::TimelineController::getCurrent())
                 currentBpm = tc->getState().tempo.bpm;
-            const double clipStart = clip->getTimelineStart(currentBpm);
-            const double clipLength = clip->getTimelineLength(currentBpm);
+            const double clipStart = facadeTimelineStart(*clip, currentBpm);
+            const double clipLength = facadeTimelineLength(*clip, currentBpm);
 
             // Update clip boundaries (needed for resize)
             // and display info (offset marker, loop markers).
@@ -936,8 +977,8 @@ void WaveformEditorContent::transientsChanged(const juce::String& filePath) {
         if (auto* controller = magda::TimelineController::getCurrent())
             bpm = controller->getState().tempo.bpm;
 
-        const double clipStart = clip->getTimelineStart(bpm);
-        const double clipLength = clip->getTimelineLength(bpm);
+        const double clipStart = facadeTimelineStart(*clip, bpm);
+        const double clipLength = facadeTimelineLength(*clip, bpm);
         gridComponent_->setClip(editingClipId_);
         gridComponent_->updateClipPosition(clipStart, clipLength);
         timeRuler_->setClipLength(clipLength);
@@ -1024,8 +1065,8 @@ void WaveformEditorContent::timelineStateChanged(const TimelineState& state, Cha
         if (editingClipId_ != magda::INVALID_CLIP_ID) {
             const auto* clip = magda::ClipManager::getInstance().getClip(editingClipId_);
             if (clip) {
-                const double clipLength = clip->getTimelineLength(newBpm);
-                const double clipStart = clip->getTimelineStart(newBpm);
+                const double clipLength = facadeTimelineLength(*clip, newBpm);
+                const double clipStart = facadeTimelineStart(*clip, newBpm);
                 timeRuler_->setClipLength(clipLength);
                 if (gridComponent_)
                     gridComponent_->updateClipPosition(clipStart, clipLength);
@@ -1065,8 +1106,8 @@ void WaveformEditorContent::setClip(magda::ClipId clipId) {
             timeRuler_->setTempo(bpm);
             // Issue #1157: read through the accessors so autoTempo clips get
             // a length/start derived live from beats × bpm.
-            const double clipStart = clip->getTimelineStart(bpm);
-            const double clipLength = clip->getTimelineLength(bpm);
+            const double clipStart = facadeTimelineStart(*clip, bpm);
+            const double clipLength = facadeTimelineLength(*clip, bpm);
             gridComponent_->updateClipPosition(clipStart, clipLength);
             timeRuler_->setTimeOffset(0.0);
             timeRuler_->setClipLength(clipLength);
@@ -1133,7 +1174,7 @@ void WaveformEditorContent::setRelativeTimeMode(bool relative) {
         double bpm = cachedBpm_ > 0.0 ? cachedBpm_ : 120.0;
         updateDisplayInfo(*clip);
         timeRuler_->setTimeOffset(0.0);
-        timeRuler_->setClipLength(clip->getTimelineLength(bpm));
+        timeRuler_->setClipLength(facadeTimelineLength(*clip, bpm));
         timeRuler_->setBarOrigin(0.0);
     }
 
@@ -1152,6 +1193,25 @@ void WaveformEditorContent::setSnapEnabledFromUI(bool enabled) {
         gridComponent_->setSnapEnabled(enabled);
     if (timeRuler_)
         timeRuler_->setSnapEnabled(enabled);
+}
+
+bool WaveformEditorContent::editingClipHasMultipleTakes() const {
+    const auto* clip = magda::ClipManager::getInstance().getClip(editingClipId_);
+    return clip && clip->isAudio() && clip->audio().takes.size() > 1;
+}
+
+bool WaveformEditorContent::areTakesExpanded() const {
+    const auto* clip = magda::ClipManager::getInstance().getClip(editingClipId_);
+    return clip && clip->isAudio() && clip->takesExpanded;
+}
+
+void WaveformEditorContent::setTakesExpanded(bool expanded) {
+    auto& cm = magda::ClipManager::getInstance();
+    auto* clip = cm.getClip(editingClipId_);
+    if (!clip || !clip->isAudio())
+        return;
+    clip->takesExpanded = expanded;
+    cm.forceNotifyClipPropertyChanged(editingClipId_);
 }
 
 // ============================================================================

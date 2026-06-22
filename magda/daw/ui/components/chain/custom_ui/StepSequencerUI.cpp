@@ -1,11 +1,6 @@
 #include "custom_ui/StepSequencerUI.hpp"
 
-#include <juce_llm/juce_llm.h>
-
-#include "../../../../agents/llm_client_factory.hpp"
 #include "audio/transport/StepClock.hpp"
-#include "core/Config.hpp"
-#include "ui/themes/SmallButtonLookAndFeel.hpp"
 #include "ui/themes/SmallComboBoxLookAndFeel.hpp"
 
 namespace magda::daw::ui {
@@ -19,214 +14,6 @@ juce::String StepSequencerUI::noteNameShort(int noteNumber) {
         return "-";
     int octave = (noteNumber / 12) - 2;
     return juce::String(NOTE_NAMES[noteNumber % 12]) + juce::String(octave);
-}
-
-// =============================================================================
-// AIResultDisplay
-// =============================================================================
-
-StepSequencerUI::AIResultDisplay::AIResultDisplay() {}
-
-void StepSequencerUI::AIResultDisplay::setStreamingText(const juce::String& text) {
-    mode_ = Mode::Streaming;
-    text_ = text;
-    description_ = {};
-    previewSteps_.clear();
-    scrollOffset_ = 0;
-    autoScroll_ = true;
-    spinnerAngle_ = 0.0f;
-    startTimerHz(30);
-    repaint();
-}
-
-void StepSequencerUI::AIResultDisplay::timerCallback() {
-    spinnerAngle_ += 0.15f;
-    if (spinnerAngle_ > juce::MathConstants<float>::twoPi)
-        spinnerAngle_ -= juce::MathConstants<float>::twoPi;
-    repaint();
-}
-
-void StepSequencerUI::AIResultDisplay::appendStreamingToken(const juce::String& token) {
-    mode_ = Mode::Streaming;
-    stopTimer();
-    if (text_ == "Thinking...")
-        text_ = "";
-    text_ += token;
-
-    // Try to extract description early from partial JSON
-    if (description_.isEmpty()) {
-        auto descIdx = text_.indexOf("\"description\"");
-        if (descIdx >= 0) {
-            auto colonIdx = text_.indexOf(descIdx, ":");
-            if (colonIdx >= 0) {
-                auto quoteStart = text_.indexOf(colonIdx, "\"");
-                if (quoteStart >= 0) {
-                    auto quoteEnd = text_.indexOf(quoteStart + 1, "\"");
-                    if (quoteEnd > quoteStart)
-                        description_ = text_.substring(quoteStart + 1, quoteEnd);
-                }
-            }
-        }
-    }
-
-    // Try to parse complete step objects from partial JSON for live preview
-    // Look for complete {...} objects within the steps array
-    previewSteps_.clear();
-    auto stepsIdx = text_.indexOf("\"steps\"");
-    if (stepsIdx >= 0) {
-        auto arrayStart = text_.indexOf(stepsIdx, "[");
-        if (arrayStart >= 0) {
-            // Find each complete step object
-            int searchFrom = arrayStart;
-            while (true) {
-                auto objStart = text_.indexOf(searchFrom, "{");
-                if (objStart < 0)
-                    break;
-                auto objEnd = text_.indexOf(objStart, "}");
-                if (objEnd < 0)
-                    break;  // Incomplete object — stop
-
-                auto objText = text_.substring(objStart, objEnd + 1);
-                auto parsed = juce::JSON::parse(objText);
-                if (parsed.isObject()) {
-                    audio::StepSequencerPlugin::Step step;
-                    step.noteNumber = juce::jlimit(0, 127, (int)parsed.getProperty("note", 60));
-                    step.octaveShift = juce::jlimit(-2, 2, (int)parsed.getProperty("octave", 0));
-                    step.gate = (bool)parsed.getProperty("gate", true);
-                    step.accent = (bool)parsed.getProperty("accent", false);
-                    step.glide = (bool)parsed.getProperty("glide", false);
-                    step.tie = (bool)parsed.getProperty("tie", false);
-                    previewSteps_.push_back(step);
-                }
-                searchFrom = objEnd + 1;
-            }
-        }
-    }
-
-    repaint();
-}
-
-void StepSequencerUI::AIResultDisplay::showResult(const juce::String& description, int) {
-    stopTimer();
-    mode_ = Mode::Streaming;
-    description_ = description;
-    previewSteps_.clear();
-    text_ = {};
-    repaint();
-}
-
-void StepSequencerUI::AIResultDisplay::showError(const juce::String& message) {
-    stopTimer();
-    mode_ = Mode::Streaming;
-    text_ = message;
-    description_ = {};
-    previewSteps_.clear();
-    scrollOffset_ = 0;
-    repaint();
-}
-
-void StepSequencerUI::AIResultDisplay::clear() {
-    stopTimer();
-    mode_ = Mode::Empty;
-    text_ = {};
-    description_ = {};
-    previewSteps_.clear();
-    scrollOffset_ = 0;
-    autoScroll_ = true;
-    repaint();
-}
-
-void StepSequencerUI::AIResultDisplay::paint(juce::Graphics& g) {
-    auto bounds = getLocalBounds().toFloat();
-    if (bounds.isEmpty())
-        return;
-
-    g.setFont(FontManager::getInstance().getUIFont(9.0f));
-    g.setColour(DarkTheme::getSecondaryTextColour());
-
-    if (mode_ == Mode::Streaming) {
-        auto area = bounds.reduced(2, 0);
-        constexpr float lineH = 11.0f;
-
-        // Description header (always visible, not scrolled)
-        if (description_.isNotEmpty()) {
-            g.setColour(DarkTheme::getColour(DarkTheme::TEXT_PRIMARY));
-            g.drawText(description_, area.removeFromTop(lineH), juce::Justification::centredLeft,
-                       true);
-            area.removeFromTop(2);
-        } else if (previewSteps_.empty()) {
-            // Draw spinner + text centered
-            constexpr float spinnerSize = 10.0f;
-            float textW = g.getCurrentFont().getStringWidthFloat(text_);
-            float totalW = spinnerSize + 4.0f + textW;
-            float cx = area.getCentreX() - totalW * 0.5f;
-            float cy = area.getCentreY();
-
-            // Spinning arc
-            juce::Path arc;
-            arc.addArc(cx, cy - spinnerSize * 0.5f, spinnerSize, spinnerSize, spinnerAngle_,
-                       spinnerAngle_ + juce::MathConstants<float>::pi * 1.5f, true);
-            g.setColour(DarkTheme::getColour(DarkTheme::ACCENT_GREEN).withAlpha(0.7f));
-            g.strokePath(arc, juce::PathStrokeType(1.5f));
-
-            // Text
-            g.setColour(DarkTheme::getSecondaryTextColour());
-            g.drawText(text_,
-                       juce::Rectangle<float>(cx + spinnerSize + 4.0f, area.getY(), textW + 4.0f,
-                                              area.getHeight()),
-                       juce::Justification::centredLeft, false);
-            return;
-        }
-
-        // Auto-scroll: keep latest steps visible
-        int visibleLines = static_cast<int>(area.getHeight() / lineH);
-        int totalLines = static_cast<int>(previewSteps_.size());
-        int maxScroll = std::max(0, totalLines - visibleLines);
-        if (autoScroll_)
-            scrollOffset_ = maxScroll;
-        scrollOffset_ = juce::jlimit(0, maxScroll, scrollOffset_);
-
-        // Step list
-        g.setFont(FontManager::getInstance().getMonoFont(8.5f));
-        int startIdx = scrollOffset_;
-        int endIdx = std::min(totalLines, startIdx + visibleLines);
-        for (int i = startIdx; i < endIdx; ++i) {
-            auto& s = previewSteps_[static_cast<size_t>(i)];
-            int note = s.noteNumber + s.octaveShift * 12;
-            juce::String noteName = noteNameShort(note);
-
-            juce::String flags;
-            if (!s.gate)
-                flags = "rest";
-            else {
-                if (s.accent)
-                    flags += "acc ";
-                if (s.glide)
-                    flags += "gld ";
-                if (s.tie)
-                    flags += "tie ";
-                if (flags.isEmpty())
-                    flags = "-";
-                else
-                    flags = flags.trim();
-            }
-
-            auto line = juce::String(i + 1).paddedLeft('0', 2) + "  " +
-                        noteName.paddedRight(' ', 4) + " " + flags;
-
-            g.setColour(s.gate ? DarkTheme::getSecondaryTextColour()
-                               : DarkTheme::getColour(DarkTheme::BORDER));
-            g.drawText(line, area.removeFromTop(lineH), juce::Justification::centredLeft, true);
-        }
-    }
-}
-
-void StepSequencerUI::AIResultDisplay::mouseWheelMove(const juce::MouseEvent&,
-                                                      const juce::MouseWheelDetails& wheel) {
-    int delta = wheel.deltaY > 0 ? -2 : 2;
-    scrollOffset_ += delta;
-    autoScroll_ = false;
-    repaint();
 }
 
 // =============================================================================
@@ -380,116 +167,16 @@ StepSequencerUI::StepSequencerUI() {
             plugin_->quantizeSub = juce::roundToInt(value);
     };
 
-    // --- MIDI controls ---
-    midiThruButton_ = std::make_unique<magda::SvgButton>("MidiThru", BinaryData::compare_svg,
-                                                         BinaryData::compare_svgSize);
-    midiThruButton_->setOriginalColor(juce::Colour(0xFFB3B3B3));
-    midiThruButton_->setNormalColor(DarkTheme::getColour(DarkTheme::ACCENT_GREEN));
-    midiThruButton_->setTooltip("MIDI thru: pass input to downstream instruments");
-    midiThruButton_->setToggleable(true);
-    midiThruButton_->setActive(false);
-    midiThruButton_->onClick = [this] {
-        if (plugin_) {
-            bool newState = !midiThruButton_->isActive();
-            midiThruButton_->setActive(newState);
-            plugin_->midiThru = newState;
-        }
-    };
-    addAndMakeVisible(midiThruButton_.get());
-
-    stepRecordButton_ = std::make_unique<magda::SvgButton>(
-        "StepRecord", BinaryData::record_circle_svg, BinaryData::record_circle_svgSize);
-    stepRecordButton_->setOriginalColor(juce::Colour(0xFFB3B3B3));
-    stepRecordButton_->setNormalColor(juce::Colour(0xFFCC3333));
-    stepRecordButton_->setTooltip("Step record: play a note to record on the current step");
-    stepRecordButton_->setToggleable(true);
-    stepRecordButton_->onClick = [this] {
-        if (plugin_) {
-            bool newState = !stepRecordButton_->isActive();
-            stepRecordButton_->setActive(newState);
-            plugin_->setStepRecording(newState);
-            repaint();  // Redraw banner
-        }
-    };
-    addAndMakeVisible(stepRecordButton_.get());
-
-    // --- Pattern generation: [RND] [prompt input] [Generate] ---
-    randomButton_ = std::make_unique<magda::SvgButton>("Random", BinaryData::random_svg,
-                                                       BinaryData::random_svgSize);
-    randomButton_->setOriginalColor(juce::Colour(0xFFB3B3B3));
-    randomButton_->setNormalColor(DarkTheme::getColour(DarkTheme::ACCENT_BLUE));
-    randomButton_->setTooltip("Randomize pattern");
-    randomButton_->onClick = [this] {
-        if (plugin_) {
-            plugin_->randomizePattern();
-            repaint();
-        }
-    };
-    addAndMakeVisible(randomButton_.get());
-
-    aiPromptEditor_.setMultiLine(false);
-    aiPromptEditor_.setTextToShowWhenEmpty("describe a pattern...",
-                                           DarkTheme::getColour(DarkTheme::TEXT_DIM));
-    aiPromptEditor_.setColour(juce::TextEditor::backgroundColourId,
-                              DarkTheme::getColour(DarkTheme::BACKGROUND).brighter(0.1f));
-    aiPromptEditor_.setColour(juce::TextEditor::textColourId, DarkTheme::getTextColour());
-    aiPromptEditor_.setColour(juce::TextEditor::outlineColourId,
-                              DarkTheme::getColour(DarkTheme::BORDER));
-    aiPromptEditor_.setColour(juce::TextEditor::focusedOutlineColourId,
-                              DarkTheme::getColour(DarkTheme::ACCENT_GREEN));
-    aiPromptEditor_.setFont(FontManager::getInstance().getUIFont(9.0f));
-    aiPromptEditor_.onReturnKey = [this] {
-        generateAIPattern();
-        giveAwayKeyboardFocus();
-    };
-    aiPromptEditor_.onEscapeKey = [this] { giveAwayKeyboardFocus(); };
-    addAndMakeVisible(aiPromptEditor_);
-
-    aiButton_.setButtonText("Generate");
-    aiButton_.setLookAndFeel(&SmallButtonLookAndFeel::getInstance());
-    aiButton_.setColour(juce::TextButton::buttonColourId,
-                        DarkTheme::getColour(DarkTheme::BACKGROUND).brighter(0.1f));
-    aiButton_.setColour(juce::TextButton::textColourOffId, DarkTheme::getTextColour());
-    aiButton_.setTooltip("Generate pattern with AI");
-    aiButton_.onClick = [this] { generateAIPattern(); };
-    addAndMakeVisible(aiButton_);
-
-    addAndMakeVisible(aiResultDisplay_);
-
-    // AI model indicator
-    aiIcon_ =
-        std::make_unique<magda::SvgButton>("AIIcon", BinaryData::ai_svg, BinaryData::ai_svgSize);
-    aiIcon_->setOriginalColor(juce::Colour(0xFFB3B3B3));
-    aiIcon_->setNormalColor(DarkTheme::getColour(DarkTheme::ACCENT_PURPLE));
-    aiIcon_->setInterceptsMouseClicks(false, false);
-    addAndMakeVisible(*aiIcon_);
-
-    aiClearButton_ = std::make_unique<magda::SvgButton>("ClearAIResult", BinaryData::delete_svg,
-                                                        BinaryData::delete_svgSize);
-    aiClearButton_->setOriginalColor(juce::Colour(0xFFB3B3B3));
-    aiClearButton_->setNormalColor(DarkTheme::getColour(DarkTheme::TEXT_SECONDARY).withAlpha(0.4f));
-    aiClearButton_->setTooltip("Clear AI result");
-    aiClearButton_->onClick = [this] { aiResultDisplay_.clear(); };
-    addAndMakeVisible(aiClearButton_.get());
-
-    auto cfg = magda::Config::getInstance().getAgentLLMConfig("music");
-    auto modelName = cfg.model.empty() ? cfg.provider : cfg.model;
-    aiModelLabel_.setText(juce::String(modelName), juce::dontSendNotification);
-    aiModelLabel_.setFont(FontManager::getInstance().getUIFont(8.5f));
-    aiModelLabel_.setColour(juce::Label::textColourId, DarkTheme::getColour(DarkTheme::TEXT_DIM));
-    aiModelLabel_.setJustificationType(juce::Justification::centredLeft);
-    addAndMakeVisible(aiModelLabel_);
-
-    magda::Config::getInstance().addListener(this);
+    // MIDI thru, step record and pattern randomize live in the device-slot
+    // header (next to the AI button), owned by DeviceSlotComponent — not in
+    // this body.
 }
 
 StepSequencerUI::~StepSequencerUI() {
-    magda::Config::getInstance().removeListener(this);
     stopTimer();
     if (watchedState_.isValid())
         watchedState_.removeListener(this);
     dirCombo_.setLookAndFeel(nullptr);
-    aiButton_.setLookAndFeel(nullptr);
 }
 
 // =============================================================================
@@ -534,11 +221,24 @@ void StepSequencerUI::syncFromPlugin() {
                                 juce::dontSendNotification);
     cyclesSlider_.setValue(static_cast<double>(juce::jlimit(1, steps, plugin_->rampCycles.get())),
                            juce::dontSendNotification);
-    midiThruButton_->setActive(plugin_->midiThru.get());
     repaint();
 }
 
 void StepSequencerUI::valueTreePropertyChanged(juce::ValueTree&, const juce::Identifier&) {
+    juce::MessageManager::callAsync([safeThis = juce::Component::SafePointer(this)] {
+        if (safeThis)
+            safeThis->syncFromPlugin();
+    });
+}
+
+void StepSequencerUI::valueTreeChildAdded(juce::ValueTree&, juce::ValueTree&) {
+    juce::MessageManager::callAsync([safeThis = juce::Component::SafePointer(this)] {
+        if (safeThis)
+            safeThis->syncFromPlugin();
+    });
+}
+
+void StepSequencerUI::valueTreeChildRemoved(juce::ValueTree&, juce::ValueTree&, int) {
     juce::MessageManager::callAsync([safeThis = juce::Component::SafePointer(this)] {
         if (safeThis)
             safeThis->syncFromPlugin();
@@ -563,7 +263,9 @@ void StepSequencerUI::timerCallback() {
     // Track step record position for highlight + parent header banner
     bool isRec = plugin_->isStepRecording();
     if (isRec) {
-        int recPos = plugin_->stepRecordPosition_.load(std::memory_order_relaxed);
+        int numSteps = juce::jlimit(1, SeqPlugin::MAX_STEPS, plugin_->numSteps.get());
+        int recPos = juce::jlimit(0, numSteps - 1,
+                                  plugin_->stepRecordPosition_.load(std::memory_order_relaxed));
         if (recPos != selectedStep_) {
             selectedStep_ = recPos;
             needsRepaint = true;
@@ -579,16 +281,6 @@ void StepSequencerUI::timerCallback() {
     }
     if (needsRepaint)
         repaint();
-}
-
-void StepSequencerUI::configChanged() {
-    juce::MessageManager::callAsync([safeThis = juce::Component::SafePointer(this)] {
-        if (safeThis) {
-            auto cfg = magda::Config::getInstance().getAgentLLMConfig("music");
-            auto model = cfg.model.empty() ? cfg.provider : cfg.model;
-            safeThis->aiModelLabel_.setText(juce::String(model), juce::dontSendNotification);
-        }
-    });
 }
 
 // =============================================================================
@@ -620,12 +312,7 @@ void StepSequencerUI::resized() {
 
     // Controls row 2: SWING, GATE, Q, SUB, THRU, REC
     auto controlRow2 = bounds.removeFromTop(CONTROL_ROW_HEIGHT);
-    // Right side: THRU + REC icons
-    stepRecordButton_->setBounds(controlRow2.removeFromRight(CONTROL_ROW_HEIGHT));
-    controlRow2.removeFromRight(2);
-    midiThruButton_->setBounds(controlRow2.removeFromRight(CONTROL_ROW_HEIGHT));
-    controlRow2.removeFromRight(4);
-    // Left side: 4 controls evenly spaced
+    // THRU / REC moved to the device-slot header. The whole row is controls.
     int quarterWidth = controlRow2.getWidth() / 4;
     {
         auto cell = controlRow2.removeFromLeft(quarterWidth);
@@ -648,6 +335,10 @@ void StepSequencerUI::resized() {
     }
 
     bounds.removeFromTop(ROW_GAP + 2);
+
+    // Mini timeline / step ruler (aligned to the step-box columns)
+    timelineArea_ = bounds.removeFromTop(TIMELINE_HEIGHT).withTrimmedLeft(24);
+    bounds.removeFromTop(ROW_GAP);
 
     // Step boxes (24px left margin to align with ACC/G/T label columns)
     stepBoxArea_ = bounds.removeFromTop(STEP_BOX_SIZE).withTrimmedLeft(24);
@@ -694,30 +385,6 @@ void StepSequencerUI::resized() {
         rampRow.removeFromRight(4);
         rampCurveDisplay_.setBounds(rampRow);
     }
-
-    bounds.removeFromTop(ROW_GAP);
-
-    // Pattern generation row: [RND] [AI] modelname [prompt editor] [Generate]
-    auto buttonRow = bounds.removeFromTop(CONTROL_ROW_HEIGHT);
-    randomButton_->setBounds(buttonRow.removeFromLeft(CONTROL_ROW_HEIGHT));
-    buttonRow.removeFromLeft(2);
-    aiIcon_->setBounds(buttonRow.removeFromLeft(CONTROL_ROW_HEIGHT));
-    buttonRow.removeFromLeft(2);
-    aiModelLabel_.setBounds(buttonRow.removeFromLeft(90));
-    buttonRow.removeFromLeft(2);
-    aiClearButton_->setBounds(buttonRow.removeFromRight(CONTROL_ROW_HEIGHT));
-    buttonRow.removeFromRight(2);
-    aiButton_.setBounds(buttonRow.removeFromRight(60));
-    buttonRow.removeFromRight(4);
-    aiPromptEditor_.setBounds(buttonRow);
-
-    // Horizontal separator between generation row and streaming area
-    streamSeparatorY_ = bounds.getY() + 1;
-
-    // AI status row (streaming response / result description) — fill remaining space
-    bounds.removeFromTop(4);
-    if (bounds.getHeight() > 0)
-        aiResultDisplay_.setBounds(bounds);
 }
 
 // =============================================================================
@@ -725,17 +392,54 @@ void StepSequencerUI::resized() {
 // =============================================================================
 
 void StepSequencerUI::paint(juce::Graphics& g) {
+    drawTimeline(g, timelineArea_);
     drawStepBoxes(g, stepBoxArea_);
     drawAccentRow(g, accentArea_);
     drawGlideTieRow(g, glideTieArea_);
     drawOctaveArrow(g, octaveDownArea_, true);
     drawKeyboard(g, keyboardArea_);
     drawOctaveArrow(g, octaveUpArea_, false);
+}
 
-    // Horizontal separator above streaming area
-    if (streamSeparatorY_ > 0)
-        g.drawHorizontalLine(streamSeparatorY_, static_cast<float>(PADDING),
-                             static_cast<float>(getWidth() - PADDING));
+// Step ruler above the grid: a tick per step, heavier + numbered every 4, with
+// the playing step highlighted. Columns align with the step boxes below.
+void StepSequencerUI::drawTimeline(juce::Graphics& g, juce::Rectangle<int> area) {
+    if (!plugin_ || area.isEmpty())
+        return;
+
+    const int count = juce::jlimit(1, SeqPlugin::MAX_STEPS, plugin_->numSteps.get());
+    const float colW = static_cast<float>(area.getWidth()) / static_cast<float>(count);
+    const float top = static_cast<float>(area.getY());
+    const float bottom = static_cast<float>(area.getBottom());
+
+    g.setColour(DarkTheme::getColour(DarkTheme::BACKGROUND).brighter(0.04f));
+    g.fillRect(area);
+
+    // Highlight the playing step.
+    if (currentPlayStep_ >= 0 && currentPlayStep_ < count) {
+        g.setColour(DarkTheme::getColour(DarkTheme::ACCENT_GREEN).withAlpha(0.45f));
+        g.fillRect(
+            juce::Rectangle<float>(area.getX() + currentPlayStep_ * colW, top, colW, bottom - top));
+    }
+
+    g.setFont(FontManager::getInstance().getUIFont(8.0f));
+    for (int i = 0; i < count; ++i) {
+        const float x = area.getX() + i * colW;
+        const bool group = (i % 4 == 0);
+        g.setColour(DarkTheme::getColour(DarkTheme::BORDER).withAlpha(group ? 0.5f : 0.2f));
+        g.drawVerticalLine(juce::roundToInt(x), group ? top : top + 4.0f, bottom);
+        if (group) {
+            g.setColour(DarkTheme::getSecondaryTextColour());
+            g.drawText(
+                juce::String(i + 1),
+                juce::Rectangle<float>(x + 2.0f, top, colW - 2.0f, bottom - top).toNearestInt(),
+                juce::Justification::centredLeft);
+        }
+    }
+
+    g.setColour(DarkTheme::getColour(DarkTheme::BORDER).withAlpha(0.4f));
+    g.drawHorizontalLine(area.getBottom() - 1, static_cast<float>(area.getX()),
+                         static_cast<float>(area.getRight()));
 }
 
 void StepSequencerUI::drawStepBoxes(juce::Graphics& g, juce::Rectangle<int> area) {
@@ -1158,160 +862,6 @@ int StepSequencerUI::getKeyboardNoteAtPosition(juce::Point<int> pos,
 }
 
 // =============================================================================
-// AI pattern generation
-// =============================================================================
-
-void StepSequencerUI::generateAIPattern() {
-    if (!plugin_)
-        return;
-
-    auto prompt = aiPromptEditor_.getText().trim();
-    if (prompt.isEmpty())
-        return;
-
-    int numSteps = juce::jlimit(1, SeqPlugin::MAX_STEPS, plugin_->numSteps.get());
-
-    // Build JSON schema for structured output
-    auto stepSchema = llm::Schema::object({
-        {"note", llm::Schema::integer()},
-        {"octave", llm::Schema::integer()},
-        {"gate", llm::Schema::boolean()},
-        {"accent", llm::Schema::boolean()},
-        {"glide", llm::Schema::boolean()},
-        {"tie", llm::Schema::boolean()},
-    });
-    auto stepsArraySchema = llm::Schema::array(stepSchema);
-    if (auto* obj = stepsArraySchema.getDynamicObject()) {
-        obj->setProperty("minItems", numSteps);
-        obj->setProperty("maxItems", numSteps);
-    }
-    auto responseSchema = llm::Schema::object({
-        {"description", llm::Schema::string()},
-        {"steps", stepsArraySchema},
-    });
-
-    auto systemPrompt =
-        juce::String("You are a music pattern generator for a 303-style step sequencer.\n"
-                     "Generate a JSON object with:\n"
-                     "  - description: a short label for the pattern (e.g. \"Acid C minor\", "
-                     "\"Funky bassline\")\n"
-                     "  - steps: array of step objects\n"
-                     "Each step has:\n"
-                     "  - note: MIDI note number (0-127, e.g. 60=C4, 48=C3, 36=C2)\n"
-                     "  - octave: octave shift (-2 to +2, applied on top of note)\n"
-                     "  - gate: true if the step plays, false for rest\n"
-                     "  - accent: true for accented (louder) steps\n"
-                     "  - glide: true for portamento slide to next note\n"
-                     "  - tie: true to extend previous note without retriggering\n"
-                     "Generate exactly " +
-                     juce::String(numSteps) +
-                     " steps. Return only 1 pattern.\n"
-                     "Keep octave at 0 unless the user asks for wide range.\n"
-                     "For acid bass lines, use lots of glides and accents on root/fifth notes.");
-
-    // Disable controls and show thinking indicator
-    aiButton_.setEnabled(false);
-    aiButton_.setButtonText("...");
-    aiPromptEditor_.setEnabled(false);
-    aiResultDisplay_.setStreamingText("Thinking...");
-
-    auto safeThis = juce::Component::SafePointer<StepSequencerUI>(this);
-
-    // Run LLM call on background thread with streaming
-    std::thread([safeThis, prompt, systemPrompt, responseSchema, numSteps]() {
-        auto agentConfig = magda::Config::getInstance().getAgentLLMConfig("music");
-        auto client = magda::createLLMClient(agentConfig, "music");
-
-        llm::Request request;
-        request.systemPrompt = systemPrompt;
-        request.userMessage = prompt;
-        request.temperature = 0.7f;
-        request.schema = responseSchema;
-
-        DBG("AI pattern request - user: " + prompt);
-
-        // Stream tokens to the status label for live feedback
-        auto response = client->sendStreamingRequest(request, [&](const juce::String& token) {
-            auto tokenCopy = token;
-            juce::MessageManager::callAsync([safeThis, tokenCopy]() {
-                if (!safeThis)
-                    return;
-                safeThis->aiResultDisplay_.appendStreamingToken(tokenCopy);
-            });
-            return true;
-        });
-
-        DBG("AI pattern response - success: " + juce::String(response.success ? "true" : "false"));
-        if (!response.success)
-            DBG("AI pattern response - error: " + response.error);
-        DBG("AI pattern response - text: " + response.text);
-
-        juce::MessageManager::callAsync([safeThis, response, prompt, numSteps]() {
-            if (!safeThis)
-                return;
-
-            // Re-enable controls
-            safeThis->aiButton_.setEnabled(true);
-            safeThis->aiButton_.setButtonText("Generate");
-            safeThis->aiPromptEditor_.setEnabled(true);
-
-            if (!response.success || response.text.isEmpty()) {
-                DBG("AI pattern generation failed: " + response.error);
-                safeThis->aiResultDisplay_.showError(response.error.isNotEmpty()
-                                                         ? "Error: " + response.error
-                                                         : "Error: no response");
-                return;
-            }
-
-            // Parse JSON response — strip markdown fences if present
-            auto text = response.text.trim();
-            if (text.startsWith("```")) {
-                auto firstNewline = text.indexOf("\n");
-                auto lastFence = text.lastIndexOf("```");
-                if (firstNewline >= 0 && lastFence > firstNewline)
-                    text = text.substring(firstNewline + 1, lastFence).trim();
-            }
-
-            auto json = juce::JSON::parse(text);
-            // Try "steps" key first, then treat root as array
-            auto* stepsArray = json.getProperty("steps", {}).getArray();
-            if (!stepsArray)
-                stepsArray = json.getArray();
-            if (!stepsArray) {
-                DBG("AI response missing 'steps' array: " + text.substring(0, 200));
-                safeThis->aiResultDisplay_.showError("Error: failed to parse response");
-                return;
-            }
-
-            std::vector<SeqPlugin::Step> steps;
-            for (int i = 0; i < std::min((int)stepsArray->size(), numSteps); ++i) {
-                auto s = (*stepsArray)[i];
-                SeqPlugin::Step step;
-                step.noteNumber = juce::jlimit(0, 127, (int)s.getProperty("note", 60));
-                step.octaveShift = juce::jlimit(-2, 2, (int)s.getProperty("octave", 0));
-                step.gate = (bool)s.getProperty("gate", true);
-                step.accent = (bool)s.getProperty("accent", false);
-                step.glide = (bool)s.getProperty("glide", false);
-                step.tie = (bool)s.getProperty("tie", false);
-                steps.push_back(step);
-            }
-
-            if (safeThis->plugin_ && !steps.empty()) {
-                safeThis->plugin_->setPattern(steps, true);
-
-                // Show the description in the status label
-                auto description = json.getProperty("description", {}).toString().trim();
-                safeThis->aiResultDisplay_.showResult(
-                    description.isNotEmpty() ? description : "Pattern generated",
-                    static_cast<int>(steps.size()));
-
-                safeThis->repaint();
-            }
-        });
-    }).detach();
-}
-
-// =============================================================================
 // Context menu
 // =============================================================================
 
@@ -1329,6 +879,8 @@ void StepSequencerUI::showStepContextMenu(int stepIndex) {
     menu.addItem(1, step.gate ? "Mute Step" : "Unmute Step");
     menu.addItem(2, "Copy to All Steps");
     menu.addItem(3, "Clear Step");
+    menu.addSeparator();
+    menu.addItem(4, "Clear Pattern");
 
     menu.showMenuAsync(juce::PopupMenu::Options(), [this, stepIndex, count](int result) {
         if (!plugin_)
@@ -1355,6 +907,9 @@ void StepSequencerUI::showStepContextMenu(int stepIndex) {
             }
             case 3:
                 plugin_->clearStep(stepIndex);
+                break;
+            case 4:
+                plugin_->clearPattern();
                 break;
             default:
                 return;

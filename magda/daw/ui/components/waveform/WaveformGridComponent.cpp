@@ -23,6 +23,19 @@ double currentTimelineBpm() {
         return controller->getState().tempo.bpm;
     return magda::DEFAULT_BPM;
 }
+
+// Route clip timeline-seconds through the position-aware tempo facade when
+// wired (message thread); fall back to the constant-tempo bpm before injection.
+double facadeTimelineStart(const magda::ClipInfo& c, double bpm) {
+    if (auto* tc = magda::TimelineController::getCurrent(); tc && tc->tempoMap())
+        return c.getTimelineStart(*tc->tempoMap());
+    return c.getTimelineStart(bpm);
+}
+double facadeTimelineLength(const magda::ClipInfo& c, double bpm) {
+    if (auto* tc = magda::TimelineController::getCurrent(); tc && tc->tempoMap())
+        return c.getTimelineLength(*tc->tempoMap());
+    return c.getTimelineLength(bpm);
+}
 }  // namespace
 
 WaveformGridComponent::WaveformGridComponent() {
@@ -105,6 +118,15 @@ void WaveformGridComponent::paintWaveform(juce::Graphics& g, const magda::ClipIn
     auto layout = computeWaveformLayout(clip);
     if (layout.rect.isEmpty())
         return;
+
+    // Loop-record takes: when expanded, show each pass as its own stacked lane
+    // instead of the single active-take waveform. Editing overlays
+    // (warp/transients) are not drawn in this mode. Collapsed falls through to
+    // the normal single-waveform view.
+    if (clip.audio().takes.size() > 1 && clip.takesExpanded) {
+        paintTakeLanes(g, clip, layout);
+        return;
+    }
 
     paintWaveformBackground(g, clip, layout);
     paintWaveformThumbnail(g, clip, layout);
@@ -303,6 +325,119 @@ void WaveformGridComponent::paintWaveformThumbnail(juce::Graphics& g, const magd
                                           visFileEnd, dimColour, vertZoom, useHighRes);
             if (clip.isReversed)
                 g.restoreState();
+        }
+    }
+}
+
+int WaveformGridComponent::takeLaneAtY(int y, const WaveformLayout& layout, int takeCount) const {
+    if (takeCount <= 0)
+        return -1;
+    const auto& rect = layout.rect;
+    if (y < rect.getY() || y >= rect.getBottom())
+        return -1;
+    const int laneH = juce::jmax(1, rect.getHeight() / takeCount);
+    return juce::jlimit(0, takeCount - 1, (y - rect.getY()) / laneH);
+}
+
+void WaveformGridComponent::paintTakeLanes(juce::Graphics& g, const magda::ClipInfo& clip,
+                                           const WaveformLayout& layout) {
+    const auto& takes = clip.audio().takes;
+    const int n = static_cast<int>(takes.size());
+    if (n <= 0)
+        return;
+
+    auto& thumbnailManager = magda::AudioThumbnailManager::getInstance();
+    updateWaveformLoadListener(clip.audio().source.filePath);
+    const bool useHighRes = !interactionActive_;
+    const float gainLinear = juce::Decibels::decibelsToGain(clip.volumeDB + clip.gainDB);
+    const auto vertZoom = static_cast<float>(verticalZoom_) * gainLinear;
+
+    const auto rect = layout.rect;
+    const int laneH = juce::jmax(1, rect.getHeight() / n);
+    const int clipStartX = timeToPixel(getDisplayStartTime());
+    const auto localBounds = getLocalBounds();
+    const bool compActive = clip.audio().compActive;
+    const int activeIndex = clip.audio().currentTakeIndex;
+
+    for (int i = 0; i < n; ++i) {
+        const int laneY = rect.getY() + i * laneH;
+        const bool active = (i == activeIndex) && !compActive;
+        juce::Rectangle<int> laneRect(rect.getX(), laneY, rect.getWidth(), laneH);
+
+        // Lane background + active emphasis (the active-take accent only applies
+        // when not comping; with a comp there is no single active take).
+        g.setColour(clip.colour.darker(active ? 0.4f : 0.72f));
+        g.fillRect(laneRect.getIntersection(localBounds));
+        if (active) {
+            g.setColour(clip.colour.brighter(0.3f));
+            g.fillRect(laneRect.getX(), laneY, 3, laneH);
+        }
+
+        // Each take drawn at its natural length from the clip start.
+        const double dur = takes[i].durationSeconds > 0.0 ? takes[i].durationSeconds : 0.0;
+        if (dur > 0.0) {
+            const int takeEndX = clipStartX + static_cast<int>(std::round(dur * horizontalZoom_));
+            const int visX0 = juce::jmax(clipStartX, localBounds.getX());
+            const int visX1 = juce::jmin(takeEndX, localBounds.getRight());
+            if (visX1 > visX0) {
+                juce::Rectangle<int> drawRect(visX0, laneY, visX1 - visX0, laneH);
+                drawRect = drawRect.reduced(0, juce::jmin(4, laneH / 4));
+                if (!drawRect.isEmpty()) {
+                    const double tStart = (visX0 - clipStartX) / horizontalZoom_;
+                    const double tEnd = (visX1 - clipStartX) / horizontalZoom_;
+                    const auto waveColour =
+                        active ? juce::Colours::black : juce::Colours::black.withAlpha(0.45f);
+                    thumbnailManager.drawWaveform(
+                        g, drawRect, takes[i].filePath, juce::jlimit(0.0, dur, tStart),
+                        juce::jlimit(0.0, dur, tEnd), waveColour, vertZoom, useHighRes);
+                }
+            }
+        }
+
+        // Comp: shade the regions of this take that are used in the comp, so the
+        // assembled composite reads across the lanes.
+        if (compActive) {
+            for (const auto& sec : clip.audio().comp) {
+                if (sec.takeIndex != i)
+                    continue;
+                const int sx0 =
+                    clipStartX + static_cast<int>(std::round(sec.startSeconds * horizontalZoom_));
+                const int sx1 =
+                    clipStartX + static_cast<int>(std::round(sec.endSeconds * horizontalZoom_));
+                juce::Rectangle<int> band(sx0, laneY, juce::jmax(1, sx1 - sx0), laneH);
+                band = band.getIntersection(localBounds);
+                if (band.isEmpty())
+                    continue;
+                g.setColour(clip.colour.withAlpha(0.30f));
+                g.fillRect(band);
+                g.setColour(clip.colour.brighter(0.4f));
+                g.drawRect(band, 1);
+            }
+        }
+
+        // Lane label + separator.
+        g.setColour(active ? juce::Colours::white : juce::Colours::white.withAlpha(0.55f));
+        g.setFont(juce::Font(juce::FontOptions(11.0f)));
+        g.drawText("Take " + juce::String(i + 1),
+                   juce::Rectangle<int>(clipStartX + 6, laneY + 2, 80, 14),
+                   juce::Justification::centredLeft, true);
+        g.setColour(clip.colour.darker(0.9f));
+        g.drawHorizontalLine(laneY + laneH - 1, static_cast<float>(localBounds.getX()),
+                             static_cast<float>(localBounds.getRight()));
+    }
+
+    // In-progress comp swipe selection on the active lane.
+    if (takeSwiping_ && takeSwipeLane_ >= 0 && takeSwipeLane_ < n) {
+        const int laneY = rect.getY() + takeSwipeLane_ * laneH;
+        const int sx0 = juce::jmin(takeSwipeStartX_, takeSwipeCurrentX_);
+        const int sx1 = juce::jmax(takeSwipeStartX_, takeSwipeCurrentX_);
+        juce::Rectangle<int> sel(sx0, laneY, juce::jmax(1, sx1 - sx0), laneH);
+        sel = sel.getIntersection(localBounds);
+        if (!sel.isEmpty()) {
+            g.setColour(juce::Colours::white.withAlpha(0.25f));
+            g.fillRect(sel);
+            g.setColour(juce::Colours::white.withAlpha(0.7f));
+            g.drawRect(sel, 1);
         }
     }
 }
@@ -751,8 +886,8 @@ void WaveformGridComponent::setClip(magda::ClipId clipId) {
     const auto* clip = getClip();
     if (clip) {
         double bpm = timeRuler_ ? timeRuler_->getTempo() : 120.0;
-        clipStartTime_ = clip->getTimelineStart(bpm);
-        clipLength_ = clip->getTimelineLength(bpm);
+        clipStartTime_ = facadeTimelineStart(*clip, bpm);
+        clipLength_ = facadeTimelineLength(*clip, bpm);
     } else {
         clipStartTime_ = 0.0;
         clipLength_ = 0.0;
@@ -1007,6 +1142,21 @@ void WaveformGridComponent::mouseDown(const juce::MouseEvent& event) {
         return;
     }
 
+    // Loop-record takes: a click on a lane selects the active take; a horizontal
+    // swipe assigns that range of the comp to the swiped take. Begin the gesture
+    // here; it resolves in mouseUp.
+    if (clip->audio().takes.size() > 1 && clip->takesExpanded) {
+        auto layout = computeWaveformLayout(*clip);
+        int lane = takeLaneAtY(event.y, layout, static_cast<int>(clip->audio().takes.size()));
+        if (lane >= 0) {
+            takeSwipeLane_ = lane;
+            takeSwipeStartX_ = x;
+            takeSwipeCurrentX_ = x;
+            takeSwiping_ = false;
+            return;
+        }
+    }
+
     // Warp mode interaction
     if (warpMode_) {
         bool altHeld = event.mods.isAltDown();
@@ -1137,9 +1287,9 @@ void WaveformGridComponent::mouseDown(const juce::MouseEvent& event) {
     dragStartX_ = x;
     dragStartAudioOffset_ = clip->loopEnabled ? clip->loopStart : clip->offset;
     const double projectBpm = currentTimelineBpm();
-    dragStartStartTime_ = clip->getTimelineStart(projectBpm);
+    dragStartStartTime_ = facadeTimelineStart(*clip, projectBpm);
     dragStartSpeedRatio_ = clip->speedRatio;
-    dragStartClipLength_ = clip->getTimelineLength(projectBpm);
+    dragStartClipLength_ = facadeTimelineLength(*clip, projectBpm);
 
     if (dragMode_ == DragMode::PhaseMarker) {
         double phase = clip->offset - clip->loopStart;
@@ -1157,7 +1307,7 @@ void WaveformGridComponent::mouseDown(const juce::MouseEvent& event) {
     // length if the file extent isn't known (no thumbnail yet).
     dragStartLength_ = displayInfo_.fileExtentTimeline();
     if (dragStartLength_ <= 0.0) {
-        dragStartLength_ = clip->getTimelineLength(projectBpm);
+        dragStartLength_ = facadeTimelineLength(*clip, projectBpm);
     }
 
     // Cache file duration for trim clamping
@@ -1170,6 +1320,15 @@ void WaveformGridComponent::mouseDown(const juce::MouseEvent& event) {
 }
 
 void WaveformGridComponent::mouseDrag(const juce::MouseEvent& event) {
+    // Take-lane swipe (comping): track the drag and draw the selection.
+    if (takeSwipeLane_ >= 0) {
+        takeSwipeCurrentX_ = event.x;
+        if (std::abs(event.x - takeSwipeStartX_) > 3)
+            takeSwiping_ = true;
+        repaint();
+        return;
+    }
+
     if (dragMode_ == DragMode::None) {
         return;
     }
@@ -1370,8 +1529,8 @@ void WaveformGridComponent::mouseDrag(const juce::MouseEvent& event) {
     {
         double bpm = timeRuler_ ? timeRuler_->getTempo() : 120.0;
         displayInfo_ = magda::ClipDisplayInfo::from(*clip, bpm, dragStartFileDuration_);
-        clipLength_ = clip->getTimelineLength(bpm);
-        clipStartTime_ = clip->getTimelineStart(bpm);
+        clipLength_ = facadeTimelineLength(*clip, bpm);
+        clipStartTime_ = facadeTimelineStart(*clip, bpm);
     }
 
     // Use fast paint during drag
@@ -1393,7 +1552,37 @@ void WaveformGridComponent::mouseDrag(const juce::MouseEvent& event) {
     }
 }
 
-void WaveformGridComponent::mouseUp(const juce::MouseEvent& /*event*/) {
+void WaveformGridComponent::mouseUp(const juce::MouseEvent& event) {
+    // Resolve a take-lane gesture: a swipe assigns a comp section, a plain click
+    // selects the active take.
+    if (takeSwipeLane_ >= 0) {
+        const int lane = takeSwipeLane_;
+        const bool swiped = takeSwiping_;
+        const int x0 = takeSwipeStartX_;
+        const int x1 = takeSwipeCurrentX_;
+        takeSwipeLane_ = -1;
+        takeSwiping_ = false;
+
+        const auto* clip = getClip();
+        if (clip && clip->isAudio()) {
+            if (swiped && onCompSectionSet) {
+                const double startSec = getDisplayStartTime();
+                double a = pixelToTime(juce::jmin(x0, x1)) - startSec;
+                double b = pixelToTime(juce::jmax(x0, x1)) - startSec;
+                if (snapEnabled_) {
+                    a = snapTimeToGrid(a);
+                    b = snapTimeToGrid(b);
+                }
+                if (b > a)
+                    onCompSectionSet(a, b, lane);
+            } else if (!swiped && onTakeSelected && lane != clip->audio().currentTakeIndex) {
+                onTakeSelected(lane);
+            }
+        }
+        repaint();
+        return;
+    }
+
     if (dragMode_ == DragMode::Zoom) {
         dragMode_ = DragMode::None;
         return;
@@ -1431,6 +1620,16 @@ void WaveformGridComponent::mouseMove(const juce::MouseEvent& event) {
     if (!clip || clip->audio().source.filePath.isEmpty()) {
         setMouseCursor(juce::MouseCursor::NormalCursor);
         return;
+    }
+
+    // Take lanes (multi-take clip): click selects a take, swipe comps a range.
+    // Use an I-beam so the waveform zoom cursor doesn't bleed over the lanes.
+    if (clip->audio().takes.size() > 1 && clip->takesExpanded) {
+        auto layout = computeWaveformLayout(*clip);
+        if (takeLaneAtY(event.y, layout, static_cast<int>(clip->audio().takes.size())) >= 0) {
+            setMouseCursor(juce::MouseCursor::IBeamCursor);
+            return;
+        }
     }
 
     int x = event.x;
@@ -1656,7 +1855,21 @@ void WaveformGridComponent::showContextMenu(const juce::MouseEvent& event) {
     menu.addItem(7, "Slice at Grid In Place", canSliceAtGrid);
     menu.addItem(9, "Slice at Grid to Drum Grid", canSliceAtGrid);
 
-    menu.showMenuAsync(juce::PopupMenu::Options(), [this, markerIndex](int result) {
+    int deleteLane = -1;
+    if (const auto* clip = getClip(); clip && clip->isAudio() && clip->audio().takes.size() > 1) {
+        menu.addSeparator();
+        menu.addItem(11, clip->takesExpanded ? "Collapse Takes" : "Expand Takes");
+        if (clip->audio().compActive)
+            menu.addItem(10, "Clear Comp");
+        if (clip->takesExpanded) {
+            deleteLane = takeLaneAtY(event.y, computeWaveformLayout(*clip),
+                                     static_cast<int>(clip->audio().takes.size()));
+            if (deleteLane >= 0)
+                menu.addItem(12, "Delete Take " + juce::String(deleteLane + 1));
+        }
+    }
+
+    menu.showMenuAsync(juce::PopupMenu::Options(), [this, markerIndex, deleteLane](int result) {
         if (result == 2) {
             if (timeRuler_)
                 timeRuler_->setBarOrigin(0.0);
@@ -1677,6 +1890,18 @@ void WaveformGridComponent::showContextMenu(const juce::MouseEvent& event) {
             onSliceWarpMarkersToDrumGrid();
         } else if (result == 9 && onSliceAtGridToDrumGrid) {
             onSliceAtGridToDrumGrid();
+        } else if (result == 10 && onCompClear) {
+            onCompClear();
+        } else if (result == 12 && deleteLane >= 0 && onTakeDelete) {
+            onTakeDelete(deleteLane);
+        } else if (result == 11) {
+            if (auto* clip = magda::ClipManager::getInstance().getClip(editingClipId_);
+                clip && clip->isAudio()) {
+                clip->takesExpanded = !clip->takesExpanded;
+                updateGridSize();
+                magda::ClipManager::getInstance().forceNotifyClipPropertyChanged(editingClipId_);
+                repaint();
+            }
         }
     });
 }

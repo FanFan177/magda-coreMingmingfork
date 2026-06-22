@@ -11,6 +11,8 @@
 #include "../engine/PluginWindowManager.hpp"
 #include "../profiling/PerformanceProfiler.hpp"
 #include "AudioThumbnailManager.hpp"
+#include "Vst3Preset.hpp"
+#include "modifiers/ADSRDebugLog.hpp"
 #include "session/SessionMonitorPlugin.hpp"
 
 namespace magda {
@@ -94,6 +96,7 @@ AudioBridge::AudioBridge(te::Engine& engine, te::Edit& edit)
     // Start timer for metering updates (30 FPS for smooth UI)
     startTimerHz(30);
 
+    MAGDA_ADSR_AUDIO_LOG("AudioBridge initialized");
     DBG("AudioBridge initialized");
 }
 
@@ -165,6 +168,32 @@ AudioBridge::~AudioBridge() {
     }
 
     DBG("AudioBridge destroyed");
+}
+
+void AudioBridge::resetTestState() {
+    juce::ScopedLock lock(mappingLock_);
+
+    DeviceMeteringManager::unregisterForEdit(edit_);
+    deviceMetering_.clear();
+    DeviceMeteringManager::registerForEdit(edit_, &deviceMetering_);
+
+    trackController_.withTrackMapping([this](const auto& trackMapping) {
+        for (auto& [trackId, track] : trackMapping) {
+            juce::ignoreUnused(track);
+            trackController_.removeMeterClient(trackId);
+        }
+    });
+
+    for (auto& [trackId, entry] : inputMeterClients_) {
+        juce::ignoreUnused(trackId);
+        if (entry.measurer)
+            entry.measurer->removeClient(entry.client);
+    }
+    inputMeterClients_.clear();
+
+    automationPlayback_.clearAllLanes();
+    trackController_.clearAllMappings();
+    pluginManager_.clearAllMappings();
 }
 
 // =============================================================================
@@ -328,6 +357,8 @@ void AudioBridge::deviceAdded(const ChainNodePath& devicePath, const DeviceInfo&
 }
 
 void AudioBridge::deviceModifiersChanged(TrackId trackId) {
+    MAGDA_ADSR_AUDIO_LOG("deviceModifiersChanged trackId=" << trackId);
+
     // Skip the modifier resync when this notify is the playback engine
     // echoing a baked curve value (e.g. LFO rate) back into MAGDA state.
     // TE already drove the modifier param on the audio thread; resyncing
@@ -336,7 +367,9 @@ void AudioBridge::deviceModifiersChanged(TrackId trackId) {
         return;
 
     // Modifier properties changed (rate, waveform, sync, trigger mode) - resync only modifiers
+    MAGDA_ADSR_AUDIO_LOG("follower-bridge resync-start trackId=" << trackId);
     pluginManager_.resyncDeviceModifiers(trackId);
+    MAGDA_ADSR_AUDIO_LOG("follower-bridge resync-done trackId=" << trackId);
 
     // Mod-rate lanes are mode-aware: tempoSync flips swap the bake target
     // between TE's `rate` (Hz) and `rateType` (sync division). Force a rebake
@@ -355,9 +388,11 @@ void AudioBridge::deviceModifiersChanged(TrackId trackId) {
     // Re-check sidechain monitors on this track and all other tracks
     // (a sidechain source change on this track may affect the source track's monitor)
     sidechainRouting_.refreshAllSourceMonitors();
+    MAGDA_ADSR_AUDIO_LOG("follower-bridge monitor-refresh-done trackId=" << trackId);
 
     // Re-check MIDI routing in case trigger mode changed to/from MIDI
     updateMidiRoutingForSelection();
+    MAGDA_ADSR_AUDIO_LOG("follower-bridge midi-refresh-done trackId=" << trackId);
 }
 
 void AudioBridge::audioSidechainTriggered(TrackId /*sourceTrackId*/) {
@@ -608,9 +643,6 @@ namespace {
 te::ExternalPlugin* asExternalPlugin(te::Plugin::Ptr plugin) {
     return dynamic_cast<te::ExternalPlugin*>(plugin.get());
 }
-}  // namespace
-
-namespace {
 
 // Loads / saves a .vstpreset blob via JUCE's VST3Client extension. Two-mode
 // visitor: when `dataIn` is non-empty we apply it as a preset; otherwise we
@@ -632,6 +664,23 @@ struct Vst3PresetVisitor : juce::ExtensionsVisitor {
 };
 
 }  // namespace
+
+juce::String AudioBridge::getVst3DeviceId(const ChainNodePath& devicePath) const {
+    auto* ext = asExternalPlugin(pluginManager_.getPlugin(devicePath));
+    if (ext == nullptr)
+        return {};
+    auto* pi = ext->getAudioPluginInstance();
+    if (pi == nullptr)
+        return {};
+    // Pull the current state as a .vstpreset; its header carries the 32-char
+    // class id. Visitor stays empty for non-VST3 plugins.
+    Vst3PresetVisitor visitor;
+    visitor.save = true;
+    pi->getExtensions(visitor);
+    if (!visitor.ok)
+        return {};  // not a VST3 plugin
+    return vst3::classIdFromPreset(visitor.dataOut);
+}
 
 int AudioBridge::getPluginNumPrograms(const ChainNodePath& devicePath) const {
     if (auto* ext = asExternalPlugin(pluginManager_.getPlugin(devicePath))) {

@@ -33,6 +33,7 @@
 #include "core/LinkModeManager.hpp"
 #include "core/ModulatorEngine.hpp"
 #include "core/StringTable.hpp"
+#include "core/TechnicalText.hpp"
 #include "core/TrackCommands.hpp"
 #include "core/TrackManager.hpp"
 #include "core/UndoManager.hpp"
@@ -105,7 +106,7 @@ class MainWindow::MainComponent::LoadingOverlay : public juce::Component, privat
     }
 
   private:
-    juce::String message_ = tr("main_window.loading.initializing");
+    juce::String message_ = trEllipsis("main_window.loading.initializing");
     float alpha_ = 1.0f;
     int spinnerFrame_ = 0;
 
@@ -570,6 +571,10 @@ MainWindow::MainComponent::MainComponent(AudioEngine* externalEngine) {
     };
     mainView->onPlayheadPositionChanged = [this](double position) {
         transportPanel->setPlayheadPosition(position);
+        // Follow the tempo curve: show the BPM at the playhead, not a static
+        // scalar. Walks the tempo map (constant tempo -> unchanged readout).
+        if (const auto* tm = mainView->getTimelineController().tempoMap())
+            transportPanel->setLiveTempoDisplay(tm->bpmAt(tm->timeToBeat(position)));
     };
     mainView->onTimeSelectionChanged = [this](double start, double end, bool hasTimeSelection) {
         transportPanel->setTimeSelection(start, end, hasTimeSelection);
@@ -828,6 +833,10 @@ void MainWindow::MainComponent::setupAudioEngineCallbacks(AudioEngine* engine) {
     // This enables the observer pattern: UI -> TimelineController -> AudioEngine
     mainView->getTimelineController().addAudioEngineListener(engine);
 
+    // Inject the position-aware tempo facade (engine -> UI). All beats<->seconds
+    // conversions go through this, backed by the engine's tempo sequence.
+    mainView->getTimelineController().setTempoMap(engine->tempoMap());
+
     // Create position timer for playhead updates (AudioEngine -> UI)
     // Timer runs continuously and detects play/stop state changes
     positionTimer_ =
@@ -1001,7 +1010,10 @@ void MainWindow::MainComponent::setupDeviceLoadingCallback() {
     if (teWrapper) {
         // Show notification and disable transport if devices are still loading
         if (teWrapper->isDevicesLoading()) {
-            loadingOverlay_->setMessage(tr("main_window.loading.scanning_devices"));
+            loadingOverlay_->setMessage(
+                trEllipsis("main_window.loading.scanning_devices")
+                    .replace("{0}", magda::technicalText(magda::TechnicalTextToken::Audio))
+                    .replace("{1}", magda::technicalText(magda::TechnicalTextToken::Midi)));
             loadingOverlay_->showWithFade();
             loadingOverlay_->toFront(false);
             transportPanel->setTransportEnabled(false);

@@ -149,6 +149,47 @@ TEST_CASE("AutomationManager::restoreLane skips duplicate targets", "[automation
     REQUIRE(mgr.getLane(first + 1000) == nullptr);
 }
 
+TEST_CASE("AutomationManager owns an untethered edit-scoped Tempo lane",
+          "[automation][editscoped]") {
+    resetState();
+    auto trackId = makeTrack("T");
+    auto& mgr = AutomationManager::getInstance();
+
+    auto trackLane = mgr.createLane(volumeTarget(trackId), AutomationLaneType::Absolute);
+    auto tempoLane = mgr.createLane(ControlTarget::tempo(), AutomationLaneType::Absolute);
+
+    REQUIRE(tempoLane != INVALID_AUTOMATION_LANE_ID);
+    REQUIRE(tempoLane != trackLane);
+
+    // The tempo lane is global: it does not appear under the real track...
+    REQUIRE(mgr.getLanesForTrack(trackId).size() == 1);
+    REQUIRE(mgr.getLanesForTrack(trackId).front() == trackLane);
+
+    // ...and is surfaced through the edit-scoped accessor instead.
+    auto editScoped = mgr.getEditScopedLanes();
+    REQUIRE(editScoped.size() == 1);
+    REQUIRE(editScoped.front() == tempoLane);
+}
+
+TEST_CASE("AutomationManager: Tempo lane is a singleton and survives post-fx guard",
+          "[automation][editscoped]") {
+    resetState();
+    auto& mgr = AutomationManager::getInstance();
+
+    auto first = mgr.createLane(ControlTarget::tempo(), AutomationLaneType::Absolute);
+    auto second = mgr.createLane(ControlTarget::tempo(), AutomationLaneType::Absolute);
+
+    REQUIRE(first != INVALID_AUTOMATION_LANE_ID);
+    REQUIRE(first == second);  // at most one lane per edit-scoped target
+    REQUIRE(mgr.getEditScopedLanes().size() == 1);
+
+    // Edit-scoped targets seed an initial point at the default tempo, not the
+    // 0.5 range-midpoint fallback used for unresolved targets.
+    const auto* lane = mgr.getLane(first);
+    REQUIRE(lane != nullptr);
+    REQUIRE(lane->absolutePoints.size() == 1);
+}
+
 TEST_CASE("DuplicateAutomationTimeSelectionCommand duplicates visible absolute lane points",
           "[automation][commands][duplicate]") {
     resetState();
@@ -218,4 +259,29 @@ TEST_CASE("DuplicateAutomationTimeSelectionCommand duplicates visible absolute l
     REQUIRE(mgr.getLane(volumeLaneId)->absolutePoints.size() == 4);
     REQUIRE(findPointAt(mgr.getLane(volumeLaneId), 5.0) == nullptr);
     REQUIRE(findPointAt(mgr.getLane(volumeLaneId), 7.0) == nullptr);
+}
+
+TEST_CASE("A Linear segment's shaper handle bends the evaluated value", "[automation][singleton]") {
+    // Regression: the shaper bends a Linear segment via bezier handles, but
+    // value evaluation used to read only the tension scalar -> the curve was
+    // visible but played back straight (inaudible).
+    resetState();
+    auto& mgr = AutomationManager::getInstance();
+    auto trackId = makeTrack("Vol");
+    auto laneId = mgr.getOrCreateLane(volumeTarget(trackId), AutomationLaneType::Absolute);
+    auto p0 = mgr.addPoint(laneId, 0.0, 0.0, AutomationCurveType::Linear);
+    mgr.addPoint(laneId, 4.0, 1.0, AutomationCurveType::Linear);
+
+    // Straight segment: the midpoint is the linear average.
+    REQUIRE(mgr.getValueAtBeat(laneId, 2.0) == Catch::Approx(0.5).margin(0.01));
+
+    // Bend it: a shaper apex below the line (outHandle on the left point).
+    BezierHandle in;
+    BezierHandle out;
+    out.beatOffset = 2.0;  // apex at the segment midpoint
+    out.value = 0.1;       // apex value 0.1 -> well below the 0.5 straight line
+    mgr.setPointHandles(laneId, p0, in, out);
+
+    // The midpoint must now follow the bend, not the straight line.
+    REQUIRE(mgr.getValueAtBeat(laneId, 2.0) < 0.45);
 }

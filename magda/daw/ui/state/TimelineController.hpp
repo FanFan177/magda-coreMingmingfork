@@ -5,9 +5,11 @@
 #include <memory>
 #include <vector>
 
+#include "../../project/ProjectInfo.hpp"
 #include "TimelineEvents.hpp"
 #include "TimelineState.hpp"
 #include "TransportStateListener.hpp"
+#include "core/TempoMap.hpp"
 #include "utils/ScopedListener.hpp"
 
 namespace magda {
@@ -26,6 +28,7 @@ enum class ChangeFlags : uint32_t {
     Sections = 1 << 7,
     Timeline = 1 << 8,
     Punch = 1 << 9,
+    Markers = 1 << 10,
     All = 0xFFFFFFFF
 };
 
@@ -102,6 +105,28 @@ class TimelineController {
         return state;
     }
 
+    // ===== Tempo Map (beats<->seconds facade) =====
+
+    /**
+     * Inject the position-aware tempo facade (backed by the engine's tempo
+     * sequence). Wired once at startup from the audio engine. The controller
+     * does not own it; the engine keeps it alive.
+     */
+    void setTempoMap(const TempoMap* tempoMap) {
+        tempoMap_ = tempoMap;
+        // The state snapshot routes its beats<->seconds conversions through the
+        // same facade. `state` is never wholesale-reassigned, so this sticks.
+        state.tempoMap = tempoMap;
+    }
+
+    /**
+     * The tempo facade for beats<->seconds conversion, or nullptr if not yet
+     * injected (early startup / headless contexts). Callers must null-check.
+     */
+    const TempoMap* tempoMap() const {
+        return tempoMap_;
+    }
+
     // ===== Event Dispatching =====
 
     /**
@@ -143,7 +168,9 @@ class TimelineController {
      * and UI are always synced, even if values haven't changed in TC state.
      */
     void restoreProjectState(double tempo, int timeSigNum, int timeSigDen, bool loopEnabled,
-                             double loopStartBeats, double loopEndBeats);
+                             double loopStartBeats, double loopEndBeats,
+                             const std::vector<ProjectTimelineMarker>& markers = {},
+                             int timelineLengthBars = -1);
 
     // Backward-compatible alias for ChangeFlags (now at namespace scope)
     using ChangeFlags = magda::ChangeFlags;
@@ -151,6 +178,10 @@ class TimelineController {
   private:
     // The authoritative state snapshot. Mutate only through dispatched events.
     TimelineState state;
+
+    // Position-aware beats<->seconds facade. Injected by the audio engine; not
+    // owned here. May be null before injection.
+    const TempoMap* tempoMap_ = nullptr;
 
     // Listeners
     std::vector<TimelineStateListener*> listeners;
@@ -222,6 +253,15 @@ class TimelineController {
     ChangeFlags handleEvent(const ResizeSectionBeatsEvent& e);
     ChangeFlags handleEvent(const ResizeSectionEvent& e);
     ChangeFlags handleEvent(const SelectSectionEvent& e);
+
+    ChangeFlags handleEvent(const AddMarkerBeatsEvent& e);
+    ChangeFlags handleEvent(const AddMarkerEvent& e);
+    ChangeFlags handleEvent(const UpdateMarkerEvent& e);
+    ChangeFlags handleEvent(const RemoveMarkerEvent& e);
+    ChangeFlags handleEvent(const SelectMarkerEvent& e);
+    ChangeFlags handleEvent(const GoToMarkerEvent& e);
+    ChangeFlags handleEvent(const GoToNextMarkerEvent& e);
+    ChangeFlags handleEvent(const GoToPreviousMarkerEvent& e);
 
     ChangeFlags handleEvent(const ViewportResizedEvent& e);
     ChangeFlags handleEvent(const SetTimelineLengthBeatsEvent& e);

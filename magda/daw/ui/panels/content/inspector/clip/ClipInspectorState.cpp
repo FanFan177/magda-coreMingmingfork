@@ -212,11 +212,21 @@ void ClipInspector::updateFromSelectedClip() {
             swatch->setColour(clip->colour);
 
         // File path label: show source filename for library-backed audio/MIDI clips.
+        // For loop-record takes/comps the raw render filename is meaningless, so
+        // show a take/comp label instead.
         if (!isMulti && clip->view != magda::ClipView::Session && clip->isAudio() &&
             clip->audio().source.filePath.isNotEmpty()) {
-            juce::File sourceFile(clip->audio().source.filePath);
-            clipFilePathLabel_.setText(sourceFile.getFileName(), juce::dontSendNotification);
-            clipFilePathLabel_.setTooltip(clip->audio().source.filePath);
+            const auto& audio = clip->audio();
+            juce::String label;
+            if (audio.compActive)
+                label = "Comp";
+            else if (audio.takes.size() > 1)
+                label = "Take " + juce::String(audio.currentTakeIndex + 1) + " / " +
+                        juce::String(static_cast<int>(audio.takes.size()));
+            else
+                label = juce::File(audio.source.filePath).getFileName();
+            clipFilePathLabel_.setText(label, juce::dontSendNotification);
+            clipFilePathLabel_.setTooltip(audio.source.filePath);
         } else if (!isMulti && clip->view != magda::ClipView::Session && clip->isMidi() &&
                    clip->midi().sourceFilePath.isNotEmpty()) {
             juce::File sourceFile(clip->midi().sourceFilePath);
@@ -229,11 +239,36 @@ void ClipInspector::updateFromSelectedClip() {
 
         // Update type icon based on clip type
         bool isAudioClip = (clip->isAudio());
+        const auto* clipTrack = magda::TrackManager::getInstance().getTrack(clip->trackId);
+        const bool isChordClip = clipTrack && clipTrack->type == magda::TrackType::Chord;
         bool showAudioProps = isAudioClip && !audioPropsCollapsed_;
         audioPropsCollapseToggle_.setVisible(isAudioClip);
         audioPropsLabel_.setVisible(isAudioClip);
 
-        if (isAudioClip) {
+        // The audio source name now lives inside the Audio Properties section, so
+        // hide it when that section is collapsed (MIDI keeps it above).
+        if (isAudioClip)
+            clipFilePathLabel_.setVisible(showAudioProps);
+
+        // Loop-record takes section (shared component). Audio shows it inside
+        // the expanded Audio Properties section; MIDI has no such section, so
+        // show it at top level whenever the MIDI clip has takes.
+        if (takesSection_) {
+            takesSection_->setSelectedClips(selectedClipIds_);
+            const bool showMidiTakes = !isAudioClip && takesSection_->hasContent();
+            takesSection_->setVisible(showAudioProps || showMidiTakes);
+        }
+
+        if (chordProgressionSection_) {
+            chordProgressionSection_->setSelectedClips(selectedClipIds_);
+            chordProgressionSection_->setVisible(chordProgressionSection_->hasContent());
+        }
+
+        if (isChordClip) {
+            clipTypeIcon_->updateSvgData(BinaryData::iconchordtrackboldm_svg,
+                                         BinaryData::iconchordtrackboldm_svgSize);
+            clipTypeIcon_->setTooltip("Chord progression");
+        } else if (isAudioClip) {
             clipTypeIcon_->updateSvgData(BinaryData::iconaudioboldm_svg,
                                          BinaryData::iconaudioboldm_svgSize);
             clipTypeIcon_->setTooltip("Audio clip");
@@ -318,6 +353,9 @@ void ClipInspector::updateFromSelectedClip() {
         } else if (clip->isMidi() && !isMulti) {
             clipKeyLabel_.setVisible(false);
             clipKeyRootCombo_.setVisible(false);
+            // Progressions (chord-track clips) round-trip their chords through
+            // the library now (saved as a kind='progression' .mid with CHORD:
+            // markers), so the button is enabled for them like any MIDI clip.
             saveLibraryButton_.setVisible(true);
             saveLibraryButton_.setEnabled(
                 magda::ClipManager::getInstance().canSaveClipToLibrary(pid));
@@ -523,12 +561,13 @@ void ClipInspector::updateFromSelectedClip() {
             }
         }
 
-        // Groove section (MIDI clips only)
-        grooveSectionLabel_.setVisible(isMidiClip);
-        grooveTemplateButton_.setVisible(isMidiClip);
-        grooveStrengthLabel_.setVisible(isMidiClip);
-        grooveStrengthValue_->setVisible(isMidiClip);
-        if (isMidiClip) {
+        // Groove section (MIDI clips only; not chord progressions)
+        const bool showGroove = isMidiClip && !isChordClip;
+        grooveSectionLabel_.setVisible(showGroove);
+        grooveTemplateButton_.setVisible(showGroove);
+        grooveStrengthLabel_.setVisible(showGroove);
+        grooveStrengthValue_->setVisible(showGroove);
+        if (showGroove) {
             // Update button text to show current template
             grooveTemplateButton_.setButtonText(
                 clip->grooveTemplate.isNotEmpty() ? clip->grooveTemplate : "None");
@@ -665,6 +704,8 @@ void ClipInspector::showClipControls(bool show) {
         followActionLoopCountSlider_.setVisible(false);
         if (fadesSection_)
             fadesSection_->setVisible(false);
+        if (takesSection_)
+            takesSection_->setVisible(false);
 
         // New sections
         pitchSectionLabel_.setVisible(false);

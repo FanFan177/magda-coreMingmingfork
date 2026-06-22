@@ -8,11 +8,14 @@
 
 #include "../project/ProjectManager.hpp"
 #include "ClipOperations.hpp"
+#include "CompSectionMath.hpp"
 #include "Config.hpp"
 #include "MidiFileWriter.hpp"
 #include "TempoUtils.hpp"
 #include "TrackManager.hpp"
+#include "UndoManager.hpp"
 #include "audio/AudioThumbnailManager.hpp"
+#include "audio/CompService.hpp"
 #include "media_db/MediaDbContext.hpp"
 #include "media_db/MediaDbIndexer.hpp"
 #include "media_db/MediaDbMetadata.hpp"
@@ -419,6 +422,17 @@ ClipId ClipManager::createMidiClipBeats(TrackId trackId, double startBeats, doub
     clip.setMidiContent();
     clip.view = view;
     clip.name = generateClipName(ClipType::MIDI);
+    // Chord-track clips are chord progressions, not generic MIDI clips.
+    if (const auto* nameTrack = TrackManager::getInstance().getTrack(trackId);
+        nameTrack && nameTrack->type == TrackType::Chord) {
+        int n = 1;
+        for (const auto& [id, c] : clips_) {
+            const auto* t = TrackManager::getInstance().getTrack(c.trackId);
+            if (t && t->type == TrackType::Chord)
+                n++;
+        }
+        clip.name = "Progression " + juce::String(n);
+    }
     if (Config::getInstance().getClipColourMode() == 0) {
         const auto* track = TrackManager::getInstance().getTrack(trackId);
         clip.colour = track ? track->colour : juce::Colour(Config::getDefaultColour(0));
@@ -503,8 +517,287 @@ void ClipManager::forceNotifyClipsChanged() {
     notifyClipsChanged();
 }
 
+namespace {
+// Undoable snapshot of a clip's full state, used for take/comp operations
+// (select take, comp section, clear comp, delete take). The state is already
+// `after` when constructed, so the first execute() (from executeCommand) is a
+// no-op; undo restores `before`, redo re-applies `after`.
+class ClipStateSnapshotCommand : public UndoableCommand {
+  public:
+    ClipStateSnapshotCommand(juce::String desc, ClipInfo before, ClipInfo after)
+        : desc_(std::move(desc)), before_(std::move(before)), after_(std::move(after)) {}
+
+    void execute() override {
+        if (skipFirst_) {
+            skipFirst_ = false;
+            return;
+        }
+        ClipManager::getInstance().replaceClipState(after_);
+    }
+    void undo() override {
+        ClipManager::getInstance().replaceClipState(before_);
+    }
+    juce::String getDescription() const override {
+        return desc_;
+    }
+
+  private:
+    juce::String desc_;
+    ClipInfo before_;
+    ClipInfo after_;
+    bool skipFirst_ = true;
+};
+
+// Capture the post-mutation state and push an undoable snapshot (before -> after).
+void pushClipStateSnapshot(const juce::String& desc, const ClipInfo& before) {
+    auto* after = ClipManager::getInstance().getClip(before.id);
+    if (after == nullptr)
+        return;
+    UndoManager::getInstance().executeCommand(
+        std::make_unique<ClipStateSnapshotCommand>(desc, before, *after));
+}
+}  // namespace
+
+void ClipManager::pushClipTakeUndo(const juce::String& desc, const ClipInfo& before) {
+    pushClipStateSnapshot(desc, before);
+}
+
+void ClipManager::replaceClipState(const ClipInfo& clipInfo) {
+    auto it = clips_.find(clipInfo.id);
+    if (it == clips_.end())
+        return;
+    it->second = clipInfo;
+    // Audio comps carry a render that the snapshot's source.filePath may not
+    // reflect (it is regenerated async); regenerate it from the restored sections.
+    if (it->second.isAudio() && it->second.audio().compActive && !it->second.audio().comp.empty())
+        CompService::getInstance().renderComp(clipInfo.id);
+    // Listeners (AudioBridge -> ClipSynchronizer) re-push notes/source to TE.
+    forceNotifyClipPropertyChanged(clipInfo.id);
+}
+
 void ClipManager::forceNotifyClipPropertyChanged(ClipId clipId) {
     notifyClipPropertyChanged(clipId);
+}
+
+void ClipManager::setMidiClipCurrentTake(ClipId clipId, int takeIndex) {
+    auto* clip = getClip(clipId);
+    if (clip == nullptr || !clip->isMidi())
+        return;
+    if (takeIndex < 0 || takeIndex >= static_cast<int>(clip->midi().takes.size()))
+        return;
+    // Picking a take exits any active comp and fronts that take.
+    auto& midi = clip->midi();
+    if (takeIndex == midi.currentTakeIndex && !midi.compActive)
+        return;  // genuine no-op
+    ClipInfo before = *clip;
+    midi.compActive = false;
+    midi.comp.clear();
+    clip->frontMidiTake(takeIndex);
+    // Listeners (AudioBridge -> ClipSynchronizer) re-push the new notes to TE.
+    forceNotifyClipPropertyChanged(clipId);
+    pushClipStateSnapshot("Select Take", before);
+}
+
+void ClipManager::setAudioClipCurrentTake(ClipId clipId, int takeIndex) {
+    auto* clip = getClip(clipId);
+    if (clip == nullptr || !clip->isAudio())
+        return;
+    auto& a = clip->audio();
+    if (takeIndex < 0 || takeIndex >= static_cast<int>(a.takes.size()))
+        return;
+    if (takeIndex == a.currentTakeIndex && !a.compActive)
+        return;
+    ClipInfo before = *clip;
+    a.compActive = false;
+    a.comp.clear();
+    a.currentTakeIndex = takeIndex;
+    a.source.filePath = a.takes[static_cast<size_t>(takeIndex)].filePath;
+    forceNotifyClipPropertyChanged(clipId);
+    pushClipStateSnapshot("Select Take", before);
+}
+
+namespace {
+// Assemble a clip's active event vectors from its comp sections + take note
+// sets: each section [startBeat, endBeat) contributes the events of its take
+// whose start beat falls in that range.
+void rebuildMidiComp(ClipInfo& clip) {
+    auto& midi = clip.midi();
+    std::vector<MidiNote> notes;
+    std::vector<MidiCCData> cc;
+    std::vector<MidiPitchBendData> pb;
+
+    const int numTakes = static_cast<int>(midi.takes.size());
+    for (const auto& sec : midi.comp) {
+        if (sec.takeIndex < 0 || sec.takeIndex >= numTakes)
+            continue;
+        const auto& take = midi.takes[static_cast<size_t>(sec.takeIndex)];
+        for (const auto& n : take.notes)
+            if (n.startBeat >= sec.startBeat && n.startBeat < sec.endBeat)
+                notes.push_back(n);
+        for (const auto& c : take.cc)
+            if (c.beatPosition >= sec.startBeat && c.beatPosition < sec.endBeat)
+                cc.push_back(c);
+        for (const auto& p : take.pitchBend)
+            if (p.beatPosition >= sec.startBeat && p.beatPosition < sec.endBeat)
+                pb.push_back(p);
+    }
+
+    clip.midiNotes = std::move(notes);
+    clip.midiCCData = std::move(cc);
+    clip.midiPitchBendData = std::move(pb);
+}
+
+// Persist edits to the active take: mirror the clip's live event vectors back
+// into takes[currentTakeIndex] so per-take edits survive switching takes. Skips
+// comping (the active content is an assembled composite, not one take).
+void syncActiveMidiTake(ClipInfo& clip) {
+    if (!clip.isMidi())
+        return;
+    auto& m = clip.midi();
+    if (m.compActive || m.takes.empty())
+        return;
+    const int idx = m.currentTakeIndex;
+    if (idx < 0 || idx >= static_cast<int>(m.takes.size()))
+        return;
+    auto& take = m.takes[static_cast<size_t>(idx)];
+    take.notes = clip.midiNotes;
+    take.cc = clip.midiCCData;
+    take.pitchBend = clip.midiPitchBendData;
+}
+}  // namespace
+
+void ClipManager::setMidiCompSection(ClipId clipId, double startBeat, double endBeat,
+                                     int takeIndex) {
+    auto* clip = getClip(clipId);
+    if (clip == nullptr || !clip->isMidi())
+        return;
+    auto& midi = clip->midi();
+    if (midi.takes.size() < 2)
+        return;
+    if (takeIndex < 0 || takeIndex >= static_cast<int>(midi.takes.size()))
+        return;
+
+    // Comp length is the loop length the passes share (clip content length).
+    const double compLen = clip->placement.lengthBeats;
+    if (compLen <= 0.0)
+        return;
+
+    ClipInfo before = *clip;
+    std::vector<CompSpan> spans;
+    spans.reserve(midi.comp.size());
+    for (const auto& s : midi.comp)
+        spans.push_back({s.startBeat, s.endBeat, s.takeIndex});
+
+    const auto out =
+        assignCompSections(spans, compLen, midi.currentTakeIndex, startBeat, endBeat, takeIndex);
+
+    midi.comp.clear();
+    for (const auto& s : out)
+        midi.comp.push_back({s.start, s.end, s.takeIndex});
+    midi.compActive = true;
+
+    rebuildMidiComp(*clip);
+    forceNotifyClipPropertyChanged(clipId);
+    pushClipStateSnapshot("Comp Section", before);
+}
+
+void ClipManager::clearMidiComp(ClipId clipId) {
+    auto* clip = getClip(clipId);
+    if (clip == nullptr || !clip->isMidi())
+        return;
+    auto& midi = clip->midi();
+    if (!midi.compActive && midi.comp.empty())
+        return;
+    ClipInfo before = *clip;
+    midi.comp.clear();
+    midi.compActive = false;
+    clip->frontMidiTake(midi.currentTakeIndex);
+    forceNotifyClipPropertyChanged(clipId);
+    pushClipStateSnapshot("Clear Comp", before);
+}
+
+namespace {
+// Adjust the active take index after take `deleted` is removed from `count`
+// takes (post-erase size).
+int activeAfterDelete(int current, int deleted, int newSize) {
+    int next = current;
+    if (current == deleted)
+        next = std::min(deleted, newSize - 1);
+    else if (current > deleted)
+        next = current - 1;
+    return std::clamp(next, 0, std::max(0, newSize - 1));
+}
+}  // namespace
+
+void ClipManager::deleteClipTake(ClipId clipId, int takeIndex) {
+    auto* clip = getClip(clipId);
+    if (clip == nullptr)
+        return;
+
+    if (clip->isAudio()) {
+        auto& a = clip->audio();
+        const int n = static_cast<int>(a.takes.size());
+        if (n <= 1 || takeIndex < 0 || takeIndex >= n)
+            return;
+        ClipInfo before = *clip;
+        a.takes.erase(a.takes.begin() + takeIndex);
+        const int newSize = static_cast<int>(a.takes.size());
+        const int newCurrent = activeAfterDelete(a.currentTakeIndex, takeIndex, newSize);
+
+        std::vector<CompSpan> spans;
+        for (const auto& s : a.comp)
+            spans.push_back({s.startSeconds, s.endSeconds, s.takeIndex});
+        remapCompSpansAfterDelete(spans, takeIndex, newCurrent);
+        a.comp.clear();
+        for (const auto& s : spans)
+            a.comp.push_back({s.start, s.end, s.takeIndex});
+
+        a.currentTakeIndex = newCurrent;
+        if (newSize < 2) {
+            a.comp.clear();
+            a.compActive = false;
+        }
+        if (a.compActive && !a.comp.empty()) {
+            CompService::getInstance().renderComp(clipId);  // re-renders + notifies
+        } else {
+            if (newCurrent < newSize)
+                a.source.filePath = a.takes[static_cast<size_t>(newCurrent)].filePath;
+            forceNotifyClipPropertyChanged(clipId);
+        }
+        pushClipStateSnapshot("Delete Take", before);
+        return;
+    }
+
+    if (clip->isMidi()) {
+        auto& m = clip->midi();
+        const int n = static_cast<int>(m.takes.size());
+        if (n <= 1 || takeIndex < 0 || takeIndex >= n)
+            return;
+        ClipInfo before = *clip;
+        m.takes.erase(m.takes.begin() + takeIndex);
+        const int newSize = static_cast<int>(m.takes.size());
+        const int newCurrent = activeAfterDelete(m.currentTakeIndex, takeIndex, newSize);
+
+        std::vector<CompSpan> spans;
+        for (const auto& s : m.comp)
+            spans.push_back({s.startBeat, s.endBeat, s.takeIndex});
+        remapCompSpansAfterDelete(spans, takeIndex, newCurrent);
+        m.comp.clear();
+        for (const auto& s : spans)
+            m.comp.push_back({s.start, s.end, s.takeIndex});
+
+        m.currentTakeIndex = newCurrent;
+        if (newSize < 2) {
+            m.comp.clear();
+            m.compActive = false;
+        }
+        if (m.compActive && !m.comp.empty())
+            rebuildMidiComp(*clip);
+        else
+            clip->frontMidiTake(newCurrent);
+        forceNotifyClipPropertyChanged(clipId);
+        pushClipStateSnapshot("Delete Take", before);
+    }
 }
 
 void ClipManager::forceNotifyMultipleClipPropertiesChanged(const std::vector<ClipId>& clipIds) {
@@ -898,16 +1191,6 @@ ClipId ClipManager::splitClipAtBeat(ClipId clipId, double splitBeat, double temp
         if (!rightClip.autoTempo)
             rightClip.loopStartBeats = rightClip.loopStart * srcBpm / 60.0;
         rightClip.loopLengthBeats = rightClip.loopLength * srcBpm / 60.0;
-    }
-
-    // Time-stretched clips (autoTempo/warp): add small anti-click fades at the
-    // split boundary.  The stretcher's overlapping analysis windows bleed audio
-    // from beyond the boundary, which sounds like a doubled transient.  A short
-    // fade masks this startup/shutdown artifact without being audible.
-    if (clip->isAudio()) {
-        constexpr double kSplitFadeSeconds = 0.005;  // 5 ms
-        clip->fadeOut = kSplitFadeSeconds;
-        rightClip.fadeIn = kSplitFadeSeconds;
     }
 
     // Add right clip to the clip pool
@@ -1337,8 +1620,10 @@ bool ClipManager::canSaveClipToLibrary(ClipId clipId) const {
         return false;
     }
     if (clip->isMidi()) {
+        // Chord-track progressions can be all-chords with their voicings
+        // implied, so annotations alone make a clip worth saving.
         return !clip->midiNotes.empty() || !clip->midiCCData.empty() ||
-               !clip->midiPitchBendData.empty();
+               !clip->midiPitchBendData.empty() || !clip->chordAnnotations.empty();
     }
     if (!clip->isAudio()) {
         return false;
@@ -1366,7 +1651,20 @@ bool ClipManager::saveClipToLibrary(ClipId clipId,
             return false;
         }
 
-        const juce::File midiDir(juce::String(ctx.midiClipsDir().string()));
+        // Chord-track clips are progressions: persist their chords as CHORD:
+        // markers and save under the progressions dir so the indexer models
+        // them as kind='progression'. A plain MIDI clip saves its notes only.
+        const bool isProgression = TrackManager::getInstance().getChordTrackId() == clip->trackId;
+
+        std::vector<magda::daw::ChordMarker> chordMarkers;
+        if (isProgression) {
+            for (const auto& ann : clip->chordAnnotations) {
+                chordMarkers.push_back({ann.beatPosition, ann.lengthBeats, ann.chordName});
+            }
+        }
+
+        const auto dir = isProgression ? ctx.progressionsDir() : ctx.midiClipsDir();
+        const juce::File midiDir(juce::String(dir.string()));
         if (!midiDir.createDirectory()) {
             return false;
         }
@@ -1374,7 +1672,8 @@ bool ClipManager::saveClipToLibrary(ClipId clipId,
         const auto outFile = midiLibraryFileForClip(*clip, midiDir);
         const double tempo = currentProjectTempoOrDefault();
         if (!magda::daw::MidiFileWriter::writeToFile(outFile, clip->midiNotes, clip->midiCCData,
-                                                     clip->midiPitchBendData, tempo, clip->name)) {
+                                                     clip->midiPitchBendData, tempo, clip->name,
+                                                     chordMarkers)) {
             return false;
         }
 
@@ -2346,6 +2645,11 @@ void ClipManager::notifyClipsChanged() {
 }
 
 void ClipManager::notifyClipPropertyChanged(ClipId clipId) {
+    // Keep the active take in sync with piano-roll edits before notifying, so
+    // per-take edits are preserved across take switches (#1465/#1466).
+    if (auto* clip = getClip(clipId))
+        syncActiveMidiTake(*clip);
+
     if (batchDepth_ > 0) {
         // Coalesce: record once, fire at end of outermost batch.
         if (std::find(batchedClipIds_.begin(), batchedClipIds_.end(), clipId) ==
@@ -2386,6 +2690,17 @@ void ClipManager::endBatch() {
             listener->clipPropertiesChanged(ids);
         }
     }
+}
+
+ClipManager::ScopedListenerMuteForTests::ScopedListenerMuteForTests() {
+    auto& manager = ClipManager::getInstance();
+    savedListeners_ = std::move(manager.listeners_);
+    manager.listeners_.clear();
+}
+
+ClipManager::ScopedListenerMuteForTests::~ScopedListenerMuteForTests() {
+    auto& manager = ClipManager::getInstance();
+    manager.listeners_ = std::move(savedListeners_);
 }
 
 void ClipManager::notifyClipSelectionChanged(ClipId clipId) {
@@ -2608,6 +2923,9 @@ std::vector<ClipId> ClipManager::pasteFromClipboard(double pasteTime, TrackId ta
 
         // Determine target track
         TrackId newTrackId = (targetTrackId != INVALID_TRACK_ID) ? targetTrackId : clipData.trackId;
+        if (newTrackId == INVALID_TRACK_ID) {
+            continue;
+        }
 
         // Create new clip based on type, using targetView instead of clipData.view
         ClipId newClipId = INVALID_CLIP_ID;
@@ -2628,7 +2946,12 @@ std::vector<ClipId> ClipManager::pasteFromClipboard(double pasteTime, TrackId ta
             auto* newClip = getClip(newClipId);
             if (newClip) {
                 newClip->name = clipData.name + " (copy)";
-                newClip->colour = clipData.colour;
+                if (clipData.trackId != INVALID_TRACK_ID) {
+                    newClip->colour = clipData.colour;
+                } else if (const auto* targetTrack =
+                               TrackManager::getInstance().getTrack(newTrackId)) {
+                    newClip->colour = targetTrack->colour;
+                }
                 newClip->loopEnabled = clipData.loopEnabled;
 
                 // Copy MIDI data
@@ -2783,9 +3106,49 @@ bool ClipManager::hasClipsInClipboard() const {
     return !clipboard_.empty();
 }
 
+bool ClipManager::clipboardRequiresTargetTrack() const {
+    return std::any_of(clipboard_.begin(), clipboard_.end(),
+                       [](const auto& clip) { return clip.trackId == INVALID_TRACK_ID; });
+}
+
 void ClipManager::clearClipboard() {
     clipboard_.clear();
     clipboardReferenceTime_ = 0.0;
+}
+
+void ClipManager::setMidiClipClipboard(std::vector<MidiNote> notes, juce::String name,
+                                       double lengthBeats) {
+    clipboard_.clear();
+    clipboardReferenceTime_ = 0.0;
+
+    if (notes.empty()) {
+        return;
+    }
+
+    double minBeat = notes.front().startBeat;
+    double maxEndBeat = notes.front().startBeat + notes.front().lengthBeats;
+    for (const auto& note : notes) {
+        minBeat = std::min(minBeat, note.startBeat);
+        maxEndBeat = std::max(maxEndBeat, note.startBeat + note.lengthBeats);
+    }
+
+    const double noteOffset = lengthBeats > 0.0 ? 0.0 : minBeat;
+    for (auto& note : notes)
+        note.startBeat -= noteOffset;
+
+    ClipInfo clip;
+    clip.setMidiContent();
+    clip.name = std::move(name);
+    clip.trackId = INVALID_TRACK_ID;
+    clip.view = ClipView::Arrangement;
+    clip.midiNotes = std::move(notes);
+    const double inferredLength = maxEndBeat - noteOffset;
+    const double clipboardLength =
+        lengthBeats > 0.0 ? juce::jmax(lengthBeats, inferredLength) : inferredLength;
+    clip.setPlacementBeats(0.0, juce::jmax(0.25, clipboardLength));
+    clip.deriveTimesFromBeats(currentProjectTempoOrDefault());
+
+    clipboard_.push_back(std::move(clip));
 }
 
 // ============================================================================

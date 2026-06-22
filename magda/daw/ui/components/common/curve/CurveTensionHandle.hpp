@@ -8,11 +8,10 @@
 namespace magda {
 
 /**
- * @brief Draggable handle for adjusting curve tension between points
+ * @brief Draggable segment shaper handle between points
  *
- * Appears at the midpoint of a curve segment. Dragging up/down adjusts
- * the tension from concave (-1) through linear (0) to convex (+1).
- * With Shift held, extends to extreme range (-3 to +3).
+ * Appears on a curve segment. Dragging moves the actual Retrospect-style
+ * shaper point in X/Y; right-click toggles the segment shape.
  */
 class CurveTensionHandle : public juce::Component {
   public:
@@ -24,6 +23,7 @@ class CurveTensionHandle : public juce::Component {
     void mouseDown(const juce::MouseEvent& e) override;
     void mouseDrag(const juce::MouseEvent& e) override;
     void mouseUp(const juce::MouseEvent& e) override;
+    void mouseDoubleClick(const juce::MouseEvent& e) override;
     void mouseEnter(const juce::MouseEvent& e) override;
     void mouseExit(const juce::MouseEvent& e) override;
 
@@ -39,26 +39,42 @@ class CurveTensionHandle : public juce::Component {
         return tension_;
     }
 
-    // Set whether the curve segment goes downward (y2 < y1)
-    // When true, drag direction is inverted so "up" always bends outward
     void setSlopeGoesDown(bool goesDown) {
-        slopeGoesDown_ = goesDown;
+        juce::ignoreUnused(goesDown);
+    }
+
+    // Render as a square (vs a circle) to signal the segment is a hard corner.
+    void setHardCorner(bool isHardCorner) {
+        if (isHardCorner_ != isHardCorner) {
+            isHardCorner_ = isHardCorner;
+            repaint();
+        }
     }
 
     // Callbacks
     std::function<void(uint32_t, double)> onTensionChanged;
     std::function<void(uint32_t, double)> onTensionDragPreview;
+    std::function<void(uint32_t, double, double)> onShaperChanged;
+    std::function<void(uint32_t, double, double)> onShaperDragPreview;
+    std::function<void(uint32_t)> onRightClick;
+    std::function<void(uint32_t)> onReset;  // double-click: flatten the segment
 
-    static constexpr int HANDLE_SIZE = 10;
+    static constexpr int HANDLE_SIZE = 9;
 
   private:
     uint32_t pointId_;
     double tension_ = 0.0;
     bool isDragging_ = false;
     bool isHovered_ = false;
-    bool slopeGoesDown_ = false;  // True if curve segment goes downward
-    int dragStartY_ = 0;          // Parent-relative Y at drag start
+    bool isHardCorner_ = false;
+    double dragOffsetX_ = 0.0;
+    double dragOffsetY_ = 0.0;
     double dragStartTension_ = 0.0;
+    // Last cursor-driven shaper position from the drag. Committed on mouseUp so
+    // the curve keeps the full (possibly past-the-border) bend, rather than the
+    // handle's own clamped on-curve position.
+    double lastShaperX_ = 0.0;
+    double lastShaperY_ = 0.0;
 };
 
 }  // namespace magda

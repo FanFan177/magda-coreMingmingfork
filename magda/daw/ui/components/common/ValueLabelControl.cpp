@@ -4,6 +4,7 @@
 
 #include "../../themes/DarkTheme.hpp"
 #include "../../themes/FontManager.hpp"
+#include "../../themes/LocalizedText.hpp"
 
 namespace magda::daw::ui {
 
@@ -48,6 +49,13 @@ void ValueLabelControl::setTextOverride(juce::String text) {
 void ValueLabelControl::clearTextOverride() {
     textOverride_.clear();
     repaint();
+}
+
+void ValueLabelControl::setFillExponent(double exponent) {
+    if (fillExponent_ != exponent) {
+        fillExponent_ = exponent;
+        repaint();
+    }
 }
 
 void ValueLabelControl::setFillMode(FillMode mode) {
@@ -219,9 +227,9 @@ void ValueLabelControl::paint(juce::Graphics& g) {
     }
 
     if (showFillIndicator_) {
-        auto fillBase = customFillColour_.value_or(DarkTheme::getColour(DarkTheme::ACCENT_BLUE));
-        const float fillAlpha = customFillColour_ ? fillBase.getFloatAlpha() : 0.3f;
-        g.setColour(fillBase.withAlpha(fillAlpha * alpha));
+        auto fillBase =
+            customFillColour_.value_or(DarkTheme::getColour(DarkTheme::CONTROL_VALUE_FILL));
+        g.setColour(fillBase.withMultipliedAlpha(alpha));
 
         if (fillMode_ == FillMode::PanCentre) {
             const float centreX = bounds.getCentreX();
@@ -237,16 +245,19 @@ void ValueLabelControl::paint(juce::Graphics& g) {
                 g.fillRect(centreX, bounds.getY(), fillWidth, bounds.getHeight());
             }
         } else if (fillMode_ == FillMode::BottomToTop && maxValue_ > minValue_) {
-            const double norm =
-                juce::jlimit(0.0, 1.0, (value_ - minValue_) / (maxValue_ - minValue_));
+            double norm = juce::jlimit(0.0, 1.0, (value_ - minValue_) / (maxValue_ - minValue_));
+            if (fillExponent_ != 1.0)
+                norm = std::pow(norm, fillExponent_);
             if (norm > 0.0) {
                 float fillH = static_cast<float>(bounds.getHeight() * norm);
                 g.fillRoundedRectangle(bounds.getX(), bounds.getBottom() - fillH, bounds.getWidth(),
                                        fillH, 2.0f);
             }
         } else if (maxValue_ > minValue_) {
-            const double normalizedValue =
+            double normalizedValue =
                 juce::jlimit(0.0, 1.0, (value_ - minValue_) / (maxValue_ - minValue_));
+            if (fillExponent_ != 1.0)
+                normalizedValue = std::pow(normalizedValue, fillExponent_);
 
             if (normalizedValue > 0.0) {
                 auto fillBounds =
@@ -261,27 +272,27 @@ void ValueLabelControl::paint(juce::Graphics& g) {
                                         ? juce::Colour(DarkTheme::TEXT_DISABLED)
                                         : juce::Colour(DarkTheme::ACCENT_PURPLE);
 
-    if (hasTint && drawBackground_) {
+    if (hasTint) {
+        // Automation highlight: a self-contained overlay (fill + outline) drawn
+        // whenever the control is bound to active automation, independent of the
+        // base style — so it shows even on borderless / transparent labels.
         g.setColour(tintColour.withAlpha(0.18f * alpha));
         g.fillRoundedRectangle(bounds, 2.0f);
-    }
-
-    if (drawBorder_) {
-        juce::Colour borderColour;
-        if (hasTint)
-            borderColour = tintColour;
-        else if (dragging_ || coEditing_)
-            borderColour = DarkTheme::getColour(DarkTheme::ACCENT_BLUE);
-        else
-            borderColour = DarkTheme::getColour(DarkTheme::BORDER);
-
+        g.setColour(tintColour.withMultipliedAlpha(alpha));
+        g.drawRoundedRectangle(bounds.reduced(0.5f), 2.0f, 1.5f);
+    } else if (drawBorder_) {
+        const juce::Colour borderColour = (dragging_ || coEditing_)
+                                              ? DarkTheme::getColour(DarkTheme::ACCENT_BLUE)
+                                              : DarkTheme::getColour(DarkTheme::BORDER);
         g.setColour(borderColour.withMultipliedAlpha(alpha));
-        g.drawRoundedRectangle(bounds.reduced(0.5f), 2.0f, hasTint ? 1.5f : 1.0f);
+        g.drawRoundedRectangle(bounds.reduced(0.5f), 2.0f, 1.0f);
     }
 
     if (!editor_ && showText_) {
-        g.setColour(customTextColour_.value_or(DarkTheme::getColour(DarkTheme::TEXT_PRIMARY))
-                        .withMultipliedAlpha(alpha));
+        const auto textColour =
+            customTextColour_.value_or(DarkTheme::getColour(DarkTheme::TEXT_PRIMARY))
+                .withMultipliedAlpha(alpha);
+        g.setColour(textColour);
         g.setFont(font_);
         const auto text = textOverride_.isNotEmpty() ? textOverride_ : displayText_;
         if (vertical_) {
@@ -291,10 +302,12 @@ void ValueLabelControl::paint(juce::Graphics& g) {
             auto rotBounds = juce::Rectangle<float>(bounds.getCentreX() - bounds.getHeight() * 0.5f,
                                                     bounds.getCentreY() - bounds.getWidth() * 0.5f,
                                                     bounds.getHeight(), bounds.getWidth());
-            g.drawText(text, rotBounds.reduced(2.0f, 1.0f), justification_, false);
+            drawLocalizedText(g, text, rotBounds.reduced(2.0f, 1.0f), justification_, textColour,
+                              false);
             g.restoreState();
         } else {
-            g.drawText(text, bounds.reduced(2.0f, 0.0f), justification_, false);
+            drawLocalizedText(g, text, bounds.reduced(2.0f, 0.0f), justification_, textColour,
+                              false);
         }
     }
 }

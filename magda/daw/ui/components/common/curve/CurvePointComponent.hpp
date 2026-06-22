@@ -15,7 +15,8 @@ class CurveEditorBase;
 /**
  * @brief A single draggable point on an editable curve
  *
- * 8px circle normally, 10px when selected. Shows bezier handles when selected.
+ * Retrospect-style anchor point. Smooth anchors are circles; hard-angle
+ * anchors are squares. Shows bezier handles when selected.
  * Drag to move position.
  */
 class CurvePointComponent : public juce::Component {
@@ -70,10 +71,13 @@ class CurvePointComponent : public juce::Component {
     std::function<void(uint32_t, const CurveHandleData&, const CurveHandleData&)> onHandlesChanged;
     std::function<void(uint32_t, bool)> onPointHovered;  // id, isHovered
 
-    // Size constants
-    static constexpr int POINT_SIZE = 6;
-    static constexpr int POINT_SIZE_SELECTED = 8;
-    static constexpr int HIT_SIZE = 16;
+    // Size constants. POINT_SIZE/POINT_SIZE_SELECTED are the base (inline)
+    // diameters; they are scaled up by pointScale() in the large popped-out
+    // editor. HIT_SIZE is the fixed component footprint, sized to contain the
+    // largest scaled anchor (incl. its selection ring) without clipping.
+    static constexpr int POINT_SIZE = 5;
+    static constexpr int POINT_SIZE_SELECTED = 6;
+    static constexpr int HIT_SIZE = 18;
 
   private:
     uint32_t pointId_;
@@ -92,6 +96,10 @@ class CurvePointComponent : public juce::Component {
 
     std::unique_ptr<CurveBezierHandle> inHandle_;
     std::unique_ptr<CurveBezierHandle> outHandle_;
+
+    // Scale anchors with the editor height so the popped-out (external) editor
+    // gets bigger, easier-to-grab points than the small inline preview.
+    float pointScale() const;
 
     void createHandles();
     void updateHandlePositions();

@@ -1,6 +1,7 @@
 # Test sources
 set(TEST_SOURCES
     test_audio_bridge.cpp
+    test_vst3_preset.cpp
     test_audiobridge_track_limit_bug.cpp
     test_audiobridge_plugin_cleanup_bug.cpp
     test_auto_tempo.cpp
@@ -8,6 +9,7 @@ set(TEST_SOURCES
     test_clip_bpm_invariant.cpp
     test_audio_source_length.cpp
     test_audio_export.cpp
+    test_audio_to_midi.cpp
     test_command.cpp
     test_interfaces.cpp
     test_midi_clip_sync.cpp
@@ -39,6 +41,7 @@ set(TEST_SOURCES
     test_midi_clip_resize_left.cpp
     test_looped_waveform_tile.cpp
     test_project_serialization.cpp
+    test_project_document_adapters.cpp
     test_session_clip_playback.cpp
     test_sidechain_triggers.cpp
     test_curve_snapshot.cpp
@@ -141,6 +144,7 @@ set(TEST_SOURCES
     test_media_db_query.cpp
     # Media database (issue #1319) — CLAP zero-shot tagging
     test_media_db_zero_shot_tags.cpp
+    test_limiter_dsp.cpp
 )
 
 # Create test executable
@@ -169,6 +173,10 @@ target_compile_definitions(magda_tests
     PRIVATE
     MAGDA_REPO_ROOT="${CMAKE_SOURCE_DIR}"
     MAGDA_AUDIO_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures/audio"
+    # The shared test engine must NOT auto-wire the live Tempo lane sync: it
+    # attaches to the AutomationManager singleton and would perturb other tests.
+    # TempoLaneSync is tested directly in test_tempo_lane_sync_juce.cpp instead.
+    MAGDA_NO_AUTO_TEMPO_LANE_SYNC=1
 )
 
 # Add the test to CTest
@@ -205,6 +213,9 @@ target_sources(magda_juce_tests PRIVATE
     test_multiband_curve_view_juce.cpp
     test_timeline_extreme_zoom_paint_juce.cpp
     test_arrange_beat_native_juce.cpp
+    test_tempo_map_juce.cpp
+    test_tempo_lane_bridge_juce.cpp
+    test_tempo_lane_sync_juce.cpp
     ../magda/daw/ui/components/chain/compiled/CompiledMultibandCurveView.cpp
     ../magda/daw/ui/dialogs/ParameterConfigDialog.cpp
     ../magda/daw/ui/panels/content/inspector/clip/ClipInspectorInit.cpp
@@ -213,7 +224,9 @@ target_sources(magda_juce_tests PRIVATE
     ../magda/daw/ui/panels/content/inspector/clip/ClipInspectorLayout.cpp
     ../magda/daw/ui/panels/content/inspector/clip/ClipInspectorSelection.cpp
     ../magda/daw/ui/panels/content/inspector/clip/ClipInspectorState.cpp
+    ../magda/daw/ui/panels/content/inspector/clip/sections/ChordProgressionSection.cpp
     ../magda/daw/ui/panels/content/inspector/clip/sections/ClipFadesSection.cpp
+    ../magda/daw/ui/panels/content/inspector/clip/sections/ClipTakesSection.cpp
     ../magda/daw/ui/components/common/BarsBeatsTicksLabel.cpp
     ../magda/daw/ui/components/common/ValueLabelControl.cpp
     ../magda/daw/ui/components/common/DraggableValueLabel.cpp
@@ -224,6 +237,8 @@ target_sources(magda_juce_tests PRIVATE
     test_automation_modes_juce.cpp
     test_arrangement_transport_loop_juce.cpp
     test_external_plugin_state_restore_juce.cpp
+    test_chord_progression_converter_juce.cpp
+    ../magda/daw/ui/components/chain/slot/StepSequencerClipExport.cpp
 )
 
 # Link required libraries for JUCE tests
@@ -242,7 +257,8 @@ target_link_libraries(magda_juce_tests
     $<$<PLATFORM_ID:Linux>:juce::pkgconfig_JUCE_CURL_LINUX_DEPS>
 )
 
-target_compile_definitions(magda_juce_tests PRIVATE MAGDA_ENABLE_TEST_HOOKS=1)
+target_compile_definitions(magda_juce_tests PRIVATE MAGDA_ENABLE_TEST_HOOKS=1
+    MAGDA_NO_AUTO_TEMPO_LANE_SYNC=1)
 
 # Include directories for JUCE tests
 target_include_directories(magda_juce_tests
@@ -273,6 +289,15 @@ add_test(NAME timeline_extreme_zoom_paint_juce
 add_test(NAME arrange_beat_native_juce
          COMMAND magda_juce_tests "Arrange Beat Native Tests")
 
+add_test(NAME tempo_map_juce
+         COMMAND magda_juce_tests "Tempo Map Tests")
+
+add_test(NAME tempo_lane_bridge_juce
+         COMMAND magda_juce_tests "Tempo Lane Bridge Tests")
+
+add_test(NAME tempo_lane_sync_juce
+         COMMAND magda_juce_tests "Tempo Lane Sync Tests")
+
 add_test(NAME midi_bridge_note_events_juce
          COMMAND magda_juce_tests "MidiBridge Note Events Tests")
 
@@ -281,3 +306,24 @@ add_test(NAME external_plugin_state_restore_juce
 
 add_test(NAME section_scoped_device_ids_juce
          COMMAND magda_juce_tests "Section-Scoped Device IDs")
+
+add_test(NAME chord_progression_converter_juce
+         COMMAND magda_juce_tests "Chord Progression Converter Tests")
+
+# Both test executables link magda_daw, which links ONNX Runtime. On Windows the
+# loader only searches the exe's directory, the cwd, and PATH, so without a copy
+# next to the test exe it resolves whatever stray onnxruntime.dll happens to be
+# on the runner's PATH (a 1.17 system DLL on CI) instead of our pinned build.
+# The version mismatch makes the C++ API's GetApi() return null and the first
+# ORT call SIGSEGVs. Copy the pinned DLLs next to each test exe, mirroring the
+# app bundle step in magda/daw/CMakeLists.txt.
+if(MAGDA_HAVE_CLAP AND WIN32)
+    foreach(test_target magda_tests magda_juce_tests)
+        add_custom_command(TARGET ${test_target} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${ONNXRUNTIME_LIB_DIR}/onnxruntime.dll"
+                "${ONNXRUNTIME_LIB_DIR}/onnxruntime_providers_shared.dll"
+                "$<TARGET_FILE_DIR:${test_target}>"
+            COMMENT "Copying ONNX Runtime DLLs alongside ${test_target}")
+    endforeach()
+endif()

@@ -7,6 +7,7 @@
 
 #include "../layout/LayoutConfig.hpp"
 #include "core/ClipTypes.hpp"
+#include "core/TempoMap.hpp"
 #include "core/TempoUtils.hpp"
 #include "core/TypeIds.hpp"
 
@@ -441,6 +442,33 @@ struct ArrangementSection {
 };
 
 /**
+ * @brief Named timeline marker
+ */
+struct TimelineMarker {
+    int id = 0;
+    double positionTime = 0.0;   // seconds cache derived from beats
+    double positionBeats = 0.0;  // authoritative beat position
+    juce::String name;
+    juce::Colour colour;
+
+    TimelineMarker(int markerId = 0, double beats = 0.0, const juce::String& markerName = "Marker",
+                   juce::Colour markerColour = juce::Colour(0xFF9E9E9E))
+        : id(markerId), positionBeats(beats), name(markerName), colour(markerColour) {
+        positionTime = beats * 60.0 / DEFAULT_BPM;
+    }
+
+    void setFromBeats(double beats, double bpm) {
+        positionBeats = juce::jmax(0.0, beats);
+        positionTime = positionBeats * 60.0 / clampBpm(bpm);
+    }
+
+    void setFromSeconds(double seconds, double bpm) {
+        const double validBpm = clampBpm(bpm);
+        setFromBeats(seconds * validBpm / 60.0, validBpm);
+    }
+};
+
+/**
  * @brief Complete timeline data snapshot - the single source of truth
  *
  * This struct holds ALL timeline-related state. Components read this snapshot
@@ -473,17 +501,33 @@ struct TimelineState {
     std::vector<ArrangementSection> sections;
     int selectedSectionIndex = -1;
 
+    // Named timeline markers
+    std::vector<TimelineMarker> markers;
+    int selectedMarkerId = 0;
+    int nextMarkerId = 1;
+
     // Layout constant — use LayoutConfig::TIMELINE_LEFT_PADDING directly
+
+    // Position-aware beats<->seconds facade (engine's tempo sequence). Injected
+    // by TimelineController; not owned. Null before injection / in headless
+    // contexts, in which case conversions fall back to the constant-tempo
+    // formula below. Walks the tempo curve, so it is correct under a varying
+    // tempo where `beats * 60 / bpm` would drift.
+    const TempoMap* tempoMap = nullptr;
 
     // ===== Beat/time conversion helpers =====
 
-    /** Convert seconds to beats using current tempo */
+    /** Convert seconds to beats (position-aware via the tempo facade). */
     double secondsToBeats(double seconds) const {
+        if (tempoMap)
+            return tempoMap->timeToBeat(seconds);
         return seconds * tempo.bpm / 60.0;
     }
 
-    /** Convert beats to seconds using current tempo */
+    /** Convert beats to seconds (position-aware via the tempo facade). */
     double beatsToSeconds(double beats) const {
+        if (tempoMap)
+            return tempoMap->beatToTime(beats);
         return beats * 60.0 / tempo.bpm;
     }
 
@@ -558,9 +602,9 @@ struct TimelineState {
             // round-tripping through irrational seconds-per-beat values.
             double beatFraction = getSnapBeatFraction();
             if (beatFraction > 0) {
-                double beats = time * tempo.bpm / 60.0;
+                double beats = secondsToBeats(time);
                 double snappedBeats = std::round(beats / beatFraction) * beatFraction;
-                return snappedBeats * 60.0 / tempo.bpm;
+                return beatsToSeconds(snappedBeats);
             }
         }
 

@@ -10,6 +10,7 @@
 #include "audio/plugins/FaustPlugin.hpp"
 #include "audio/plugins/MagdaSamplerPlugin.hpp"
 #include "audio/plugins/OscilloscopePlugin.hpp"
+#include "audio/plugins/PolyStepSequencerPlugin.hpp"
 #include "audio/plugins/SpectrumAnalyzerPlugin.hpp"
 #include "core/Config.hpp"
 #include "core/InternalDeviceKind.hpp"
@@ -45,6 +46,7 @@
 #include "slot/DeviceSlotMidiUiBinding.hpp"
 #include "slot/DeviceSlotParamLayoutFactory.hpp"
 #include "slot/DeviceSlotTraits.hpp"
+#include "slot/SequencerDeviceControls.hpp"
 #include "slot/StepSequencerClipExport.hpp"
 #include "ui/dialogs/ParameterConfigDialog.hpp"
 #include "ui/themes/DarkTheme.hpp"
@@ -268,7 +270,7 @@ DeviceSlotComponent::DeviceSlotComponent(const magda::DeviceInfo& device) : devi
     gainLabel_.setRange(-60.0, 12.0, 0.0);
     gainLabel_.setValue(device_.gainDb, juce::dontSendNotification);
     gainLabel_.setFontSize(10.0f);
-    gainLabel_.setFillColour(DarkTheme::getColour(DarkTheme::ACCENT_BLUE).withAlpha(0.2f));
+    gainLabel_.setFillColour(DarkTheme::getColour(DarkTheme::CONTROL_VALUE_FILL));
     gainLabel_.onValueChange = [this]() {
         // Use TrackManager method to notify AudioBridge for audio sync
         magda::TrackManager::getInstance().setDeviceGainDb(
@@ -443,8 +445,8 @@ DeviceSlotComponent::DeviceSlotComponent(const magda::DeviceInfo& device) : devi
     };
     addAndMakeVisible(*onButton_);
 
-    // Export as MIDI clip button (step sequencer only for now)
-    if (traits_.isStepSequencer) {
+    // Export as MIDI clip button
+    if (traits_.isStepSequencer || traits_.isPolyStepSequencer) {
         exportClipButton_ = std::make_unique<magda::SvgButton>("ExportClip", BinaryData::copy_svg,
                                                                BinaryData::copy_svgSize);
         applyHeaderIconStyle(*exportClipButton_, DarkTheme::getColour(DarkTheme::ACCENT_GREEN),
@@ -452,11 +454,56 @@ DeviceSlotComponent::DeviceSlotComponent(const magda::DeviceInfo& device) : devi
         exportClipButton_->setTooltip("Click to copy pattern, drag to timeline");
         exportClipButton_->addMouseListener(this, false);
         exportClipButton_->onClick = [this]() {
-            auto* stepSeqPlugin = customUI_.getStepSeqPlugin();
-            if (stepSeqPlugin != nullptr)
-                copyStepSequencerPatternToClipboard(*stepSeqPlugin);
+            if (traits_.isPolyStepSequencer) {
+                auto* plugin = customUI_.getPolyStepSeqPlugin();
+                if (plugin != nullptr)
+                    copyPolyStepSequencerPatternToClipboard(*plugin);
+            } else {
+                auto* stepSeqPlugin = customUI_.getStepSeqPlugin();
+                if (stepSeqPlugin != nullptr)
+                    copyStepSequencerPatternToClipboard(*stepSeqPlugin);
+            }
         };
         addAndMakeVisible(*exportClipButton_);
+    }
+
+    // Randomize-pattern button in the header (next to the AI button). Lives at
+    // the slot level so it sits in the header chrome rather than the step
+    // sequencer's body. Shared by the mono and poly step sequencers.
+    if (traits_.isStepSequencer || traits_.isPolyStepSequencer) {
+        randomButton_ = std::make_unique<magda::SvgButton>("Random", BinaryData::random_svg,
+                                                           BinaryData::random_svgSize);
+        applyHeaderIconStyle(*randomButton_, DarkTheme::getColour(DarkTheme::ACCENT_BLUE),
+                             /*toggling*/ false);
+        randomButton_->setTooltip("Randomize pattern");
+        randomButton_->onClick = [this]() { randomizeSequencerPattern(traits_, customUI_); };
+        addAndMakeVisible(*randomButton_);
+
+        // MIDI-thru toggle (moved out of the sequencer body into the header).
+        midiThruButton_ = std::make_unique<magda::SvgButton>("MidiThru", BinaryData::compare_svg,
+                                                             BinaryData::compare_svgSize);
+        midiThruButton_->setOriginalColor(juce::Colour(0xFFB3B3B3));
+        midiThruButton_->setNormalColor(DarkTheme::getColour(DarkTheme::ACCENT_GREEN));
+        midiThruButton_->setTooltip("MIDI thru: pass input to downstream instruments");
+        midiThruButton_->setToggleable(true);
+        midiThruButton_->onClick = [this]() {
+            if (auto enabled = toggleSequencerMidiThru(traits_, customUI_))
+                midiThruButton_->setActive(*enabled);
+        };
+        addAndMakeVisible(*midiThruButton_);
+
+        // Step-record toggle (moved out of the sequencer body into the header).
+        stepRecordButton_ = std::make_unique<magda::SvgButton>(
+            "StepRecord", BinaryData::record_circle_svg, BinaryData::record_circle_svgSize);
+        stepRecordButton_->setOriginalColor(juce::Colour(0xFFB3B3B3));
+        stepRecordButton_->setNormalColor(juce::Colour(0xFFCC3333));
+        stepRecordButton_->setTooltip("Step record: play notes to fill steps");
+        stepRecordButton_->setToggleable(true);
+        stepRecordButton_->onClick = [this]() {
+            if (auto enabled = toggleSequencerStepRecording(traits_, customUI_))
+                stepRecordButton_->setActive(*enabled);
+        };
+        addAndMakeVisible(*stepRecordButton_);
     }
 
     // Create parameter grid (owns slots + pagination).
@@ -841,9 +888,26 @@ void DeviceSlotComponent::timerCallback() {
         }
     }
 
-    if (traits_.isArpeggiator || traits_.isStepSequencer || traits_.isChordEngine) {
+    if (traits_.isArpeggiator || traits_.isStepSequencer || traits_.isPolyStepSequencer ||
+        traits_.isChordEngine) {
         refreshDeviceSlotMidiActivity(traits_, customUI_, midiNoteStrip_, lastMidiNote_,
                                       lastChordNotes_, lastChordCount_);
+
+        // Keep the step-seq header toggles in sync with plugin state.
+        if (midiThruButton_ != nullptr || stepRecordButton_ != nullptr) {
+            const auto sequencerState = getSequencerDeviceHeaderState(traits_, customUI_);
+            if (sequencerState.available) {
+                if (midiThruButton_ != nullptr &&
+                    midiThruButton_->isActive() != sequencerState.midiThru)
+                    midiThruButton_->setActive(sequencerState.midiThru);
+                const bool recChanged = stepRecordButton_ != nullptr &&
+                                        stepRecordButton_->isActive() != sequencerState.recording;
+                if (recChanged)
+                    stepRecordButton_->setActive(sequencerState.recording);
+                if (sequencerState.recording || recChanged)
+                    repaint();
+            }
+        }
     } else {
         // Poll device peak levels for right-side meter strip
         magda::DeviceMeteringManager::DeviceMeterData data;
@@ -1503,13 +1567,7 @@ juce::Point<float> DeviceSlotComponent::getControllerIndicatorAnchor() const {
 }
 
 void DeviceSlotComponent::paintContent(juce::Graphics& g, juce::Rectangle<int> contentArea) {
-    DeviceSlotStepRecordingPaintState stepRecording;
-    if (auto* stepSeqPlugin = customUI_.getStepSeqPlugin();
-        traits_.isStepSequencer && stepSeqPlugin != nullptr && stepSeqPlugin->isStepRecording()) {
-        stepRecording.active = true;
-        stepRecording.position = stepSeqPlugin->stepRecordPosition_.load(std::memory_order_relaxed);
-        stepRecording.maxSteps = juce::jlimit(1, 32, stepSeqPlugin->numSteps.get());
-    }
+    const auto stepRecording = getSequencerDeviceHeaderState(traits_, customUI_).stepRecording;
 
     paintDeviceSlotContent(g, contentArea,
                            {.traits = traits_,
@@ -1532,6 +1590,9 @@ void DeviceSlotComponent::resizedContent(juce::Rectangle<int> contentArea) {
         compiledPanel_ != nullptr ? &compiledPanel_->component() : nullptr;
     const bool pluginPresetsAvailable =
         !collapsed_ && !traits_.isFaust && hasPluginPresetsAvailable();
+    // Chord-track devices emit no audio yet, so they show no output meter.
+    const auto* slotTrack = magda::TrackManager::getInstance().getTrack(nodePath_.trackId);
+    const bool onChordTrack = slotTrack && slotTrack->type == magda::TrackType::Chord;
     if (!prepareDeviceSlotContentFrame(
             contentArea, traits_, device_, collapsed_, isInternalDevice(), pluginPresetsAvailable,
             {.pluginPresetsButton = presetsButton_.get(),
@@ -1548,7 +1609,8 @@ void DeviceSlotComponent::resizedContent(juce::Rectangle<int> contentArea) {
              .uiButton = uiButton_.get(),
              .powerButton = stripsAnalysisChrome() ? nullptr : onButton_.get(),
              .mixKnob = mixKnob_.get()},
-            stripsAnalysisChrome() ? 0 : METER_STRIP_WIDTH, CONTENT_HEADER_HEIGHT)) {
+            (stripsAnalysisChrome() || onChordTrack) ? 0 : METER_STRIP_WIDTH,
+            CONTENT_HEADER_HEIGHT)) {
         return;
     }
 
@@ -1592,13 +1654,21 @@ void DeviceSlotComponent::resizedHeaderExtra(juce::Rectangle<int>& headerArea) {
          .uiButton = uiButton_.get(),
          .powerButton = stripsAnalysisChrome() ? nullptr : onButton_.get(),
          .presetButton = stripsAnalysisChrome() ? nullptr : presetButton_.get(),
-         .exportClipButton = exportClipButton_.get()},
+         .exportClipButton = exportClipButton_.get(),
+         .randomButton = randomButton_.get(),
+         .stepRecordButton = stepRecordButton_.get(),
+         .midiThruButton = midiThruButton_.get()},
         BUTTON_SIZE);
 }
 
 void DeviceSlotComponent::mouseDrag(const juce::MouseEvent& e) {
-    if (handleStepSequencerPatternExternalDrag(customUI_.getStepSeqPlugin(),
-                                               exportClipButton_.get(), this, e)) {
+    if (traits_.isPolyStepSequencer) {
+        if (handlePolyStepSequencerPatternExternalDrag(customUI_.getPolyStepSeqPlugin(),
+                                                       exportClipButton_.get(), this, e)) {
+            return;
+        }
+    } else if (handleStepSequencerPatternExternalDrag(customUI_.getStepSeqPlugin(),
+                                                      exportClipButton_.get(), this, e)) {
         return;
     }
 
@@ -1724,7 +1794,20 @@ void DeviceSlotComponent::onModAudioReleaseChangedInternal(int modIndex, float m
     magda::TrackManager::getInstance().setModAudioRelease(nodePath_, modIndex, ms);
 }
 
+void DeviceSlotComponent::onModEnvelopeChangedInternal(int modIndex, const magda::ModInfo& mod) {
+    magda::TrackManager::getInstance().setModEnvelope(nodePath_, modIndex, mod);
+}
+
+void DeviceSlotComponent::onModRandomChangedInternal(int modIndex, const magda::ModInfo& mod) {
+    magda::TrackManager::getInstance().setModRandom(nodePath_, modIndex, mod);
+}
+
+void DeviceSlotComponent::onModFollowerChangedInternal(int modIndex, const magda::ModInfo& mod) {
+    magda::TrackManager::getInstance().setModFollower(nodePath_, modIndex, mod);
+}
+
 void DeviceSlotComponent::onModCurveChangedInternal(int /*modIndex*/) {
+    DBG("[HardCorner] DeviceSlotComponent notifyModCurveChanged path=" << nodePath_.toString());
     // Curve points are already written directly to ModInfo by LFOCurveEditor.
     // Just notify the audio thread to pick up the new data.
     magda::TrackManager::getInstance().notifyModCurveChanged(nodePath_);
@@ -2375,6 +2458,9 @@ void DeviceSlotComponent::createCustomUI() {
                                                                   target, amount);
             updateParamModulation();
         }
+    };
+    callbacks.onShowAutomationLane = [this](int paramIndex) {
+        showAutomationLaneForParam(paramIndex);
     };
     callbacks.getNodePath = [this]() { return nodePath_; };
 

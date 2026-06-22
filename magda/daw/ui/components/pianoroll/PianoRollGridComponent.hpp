@@ -18,6 +18,8 @@
 
 namespace magda {
 
+class PitchFoldMap;
+
 /**
  * @brief Scrollable grid component containing MIDI notes
  *
@@ -91,6 +93,12 @@ class PianoRollGridComponent : public juce::Component,
         return overlayTrackIds_;
     }
 
+    // Ghost an arbitrary note set into the roll (e.g. a comp take on hover,
+    // #1466). Painted dimmed in `colour`, non-interactive, fold-aware. Cleared
+    // by clearOverlayNotes().
+    void setOverlayNotes(std::vector<MidiNote> notes, juce::Colour colour);
+    void clearOverlayNotes();
+
     // Zoom settings
     void setPixelsPerBeat(double ppb);
     double getPixelsPerBeat() const override {
@@ -101,6 +109,11 @@ class PianoRollGridComponent : public juce::Component,
     int getNoteHeight() const override {
         return noteHeight_;
     }
+
+    // Shared folded-axis map (owned by PianoRollContent, must outlive this).
+    // When folded, the grid collapses to one row per used pitch; noteNumberToY /
+    // yToNoteNumber and the row backgrounds all route through it.
+    void setFoldMap(const PitchFoldMap* map);
 
     // Left padding (for alignment with ruler if needed)
     void setLeftPadding(int padding);
@@ -159,6 +172,11 @@ class PianoRollGridComponent : public juce::Component,
     double getPlayheadPosition() const {
         return playheadPosition_;
     }
+    // Grid-local x of the playhead exactly as drawn over the note grid (incl.
+    // loop wrap / relative-mode mapping). Lets the chord lane above the grid
+    // draw a matching playhead line that stays locked while scrolling. Returns
+    // false when the playhead is out of the clip's range (nothing to draw).
+    bool getPlayheadDisplayX(int& gridLocalX) const;
 
     // Edit cursor position (for drawing blinking edit cursor line)
     void setEditCursorPosition(double positionSeconds, bool blinkVisible);
@@ -184,6 +202,7 @@ class PianoRollGridComponent : public juce::Component,
     juce::Point<int> getGridScreenPosition() const override {
         return localPointToGlobal(juce::Point<int>());
     }
+    int noteNumberByRowDelta(int startNote, int rowsUp) const override;
     void updateNotePosition(NoteComponent* note, double beat, int noteNumber,
                             double length) override;
     void setCopyDragPreview(double beat, int noteNumber, double length, juce::Colour colour,
@@ -249,6 +268,9 @@ class PianoRollGridComponent : public juce::Component,
     // Edit cursor click on grid (Alt+click) — position in seconds
     std::function<void(double)> onEditCursorSet;
 
+    // Playhead click on grid — absolute timeline position in beats
+    std::function<void(double)> onPlayheadPositionBeatsChanged;
+
     // Chord block drop — clipId, beat position, notes (noteNumber + velocity pairs), chord name,
     // length
     std::function<void(ClipId, double, double, std::vector<std::pair<int, int>>, juce::String)>
@@ -278,11 +300,22 @@ class PianoRollGridComponent : public juce::Component,
     // Tracks whose MIDI renders as a ghost overlay (paint-only, never interactive)
     std::vector<TrackId> overlayTrackIds_;
     void paintOverlayNotes(juce::Graphics& g);
+    void paintOverlayNoteSet(juce::Graphics& g);
+
+    // Ad-hoc ghost note set (comp take on hover, #1466). Painted with the rest
+    // of the overlay, dimmed in overlayNotesColour_.
+    std::vector<MidiNote> overlayNotes_;
+    juce::Colour overlayNotesColour_;
 
     // Note range
     static constexpr int MIN_NOTE = 0;    // C-2
     static constexpr int MAX_NOTE = 127;  // G9
     static constexpr int NOTE_COUNT = MAX_NOTE - MIN_NOTE + 1;
+
+    // Shared folded axis (not owned). Null = linear 0..127 axis.
+    const PitchFoldMap* foldMap_ = nullptr;
+    int foldRowCount() const;
+    int noteForRow(int row) const;
 
     // Left padding (0 by default for piano roll since keyboard provides context)
     int leftPadding_ = 0;
@@ -337,6 +370,11 @@ class PianoRollGridComponent : public juce::Component,
     juce::Point<int> dragSelectStart_;
     juce::Point<int> dragSelectEnd_;
 
+    // Plain empty-grid click mirrors the timeline playhead lane.
+    bool isPendingPlayheadClick_ = false;
+    juce::Point<int> playheadClickStart_;
+    static constexpr int PLAYHEAD_CLICK_DRAG_THRESHOLD = 5;
+
     // Shift-drag note creation state
     bool isDrawingNote_ = false;
     ClipId drawingNoteClipId_ = INVALID_CLIP_ID;
@@ -344,8 +382,11 @@ class PianoRollGridComponent : public juce::Component,
     double drawingNoteEndBeat_ = 0.0;    // clip-relative
     int drawingNoteNumber_ = 60;
     double defaultNoteLengthBeats_ = 0.0;  // <= 0 follows current grid
+    bool rememberLastNoteLength_ = false;
+    double lastAddedNoteLengthBeats_ = 0.0;
     int defaultNoteVelocity_ = 100;
     double getDefaultNoteLengthBeats() const;
+    void rememberAddedNoteLength(double lengthBeats);
     void addDefaultNoteMenuItems(juce::PopupMenu& menu) const;
     bool handleDefaultNoteMenuResult(int result);
 
@@ -461,6 +502,7 @@ class PianoRollGridComponent : public juce::Component,
     std::optional<NoteInsertPosition> getNoteInsertPosition(juce::Point<int> localPos) const;
     double displayBeatForClipBeat(ClipId clipId, double clipBeat) const;
     double clipBeatForDisplayX(ClipId clipId, int mouseX) const;
+    double absolutePlayheadBeatForDisplayX(int mouseX) const;
     void updateEmptyGridCursor(const juce::ModifierKeys& mods, int mouseX);
     bool isBlackKey(int noteNumber) const;
     juce::Colour getClipColour() const;

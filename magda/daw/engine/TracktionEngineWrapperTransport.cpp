@@ -6,6 +6,7 @@
 #include "../core/TrackManager.hpp"
 #include "../core/ViewModeController.hpp"
 #include "TracktionEngineWrapper.hpp"
+#include "TracktionTempoMap.hpp"
 
 namespace magda {
 
@@ -137,6 +138,19 @@ void TracktionEngineWrapper::record() {
             juce::Logger::writeToLog("[Record] NO playback context!");
         }
 
+        // Keep each loop pass as its own take (#1465). TE only splits a looped
+        // MIDI recording into per-pass takes when the input device is NOT
+        // merging (tracktion_MidiInputDevice: createTakes = !mergeRecordings).
+        // The flag defaults to true (merge), so turn it off on every MIDI input
+        // before recording. Harmless for non-looped records (the take-split path
+        // is gated on looping).
+        if (auto* ctx = currentEdit_->getCurrentPlaybackContext()) {
+            for (auto* input : ctx->getAllInputs()) {
+                if (auto* midiDev = dynamic_cast<tracktion::MidiInputDevice*>(&input->owner))
+                    midiDev->mergeRecordings = false;
+            }
+        }
+
         juce::Logger::writeToLog("[Record] calling transport.record(false, true)");
         currentEdit_->getTransport().record(false, /*allowRecordingIfNoInputsArmed=*/true);
         juce::Logger::writeToLog("[Record] isRecording=" +
@@ -223,10 +237,14 @@ void TracktionEngineWrapper::setTempo(double bpm) {
 
 double TracktionEngineWrapper::getTempo() const {
     if (currentEdit_) {
-        auto timePos = tracktion::TimePosition::fromSeconds(0.0);
-        return currentEdit_->tempoSequence.getTempoAt(timePos).getBpm();
+        auto beatPos = currentEdit_->getTransport().getPositionBeats();
+        return currentEdit_->tempoSequence.getBpmAtBeat(beatPos);
     }
     return DEFAULT_BPM;
+}
+
+const TempoMap* TracktionEngineWrapper::tempoMap() const {
+    return tempoMap_.get();
 }
 
 void TracktionEngineWrapper::setTimeSignature(int numerator, int denominator) {

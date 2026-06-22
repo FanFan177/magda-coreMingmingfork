@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "ClipTypes.hpp"
+#include "TempoMap.hpp"
 #include "TempoUtils.hpp"
 #include "TrackTypes.hpp"
 #include "TypeIds.hpp"
@@ -131,13 +132,97 @@ struct AudioSourceInterpretation {
     std::string keyScale;
 };
 
+/**
+ * @brief One loop-record take: a single recorded pass over the loop range.
+ *
+ * Loop recording captures each pass as its own audio file (Tracktion splits the
+ * continuous recording at the loop boundaries). filePath is the on-disk source
+ * for that pass; durationSeconds is its audio length.
+ *
+ * Takes have no per-take time offset: they are loop-aligned alternatives that
+ * all share the clip start (take 0 at t=0). Recording before the loop with Loop
+ * on therefore does not preserve the pre-loop lead-in as a take; the clip is
+ * loop-aligned. Supporting a lead-in would require a per-take offset here and in
+ * the comp model.
+ */
+struct AudioTake {
+    juce::String filePath;
+    double durationSeconds = 0.0;
+};
+
+/**
+ * @brief One comp section: the take that plays over [startSeconds, endSeconds).
+ *
+ * Comp sections tile the comp timeline (source-domain seconds, take 0 at t=0).
+ * They are kept sorted and contiguous; a comp is the ordered list of sections.
+ * takeIndex points into AudioClipModel::takes.
+ */
+struct CompSection {
+    double startSeconds = 0.0;
+    double endSeconds = 0.0;
+    int takeIndex = 0;
+};
+
 struct AudioClipModel {
     AudioSourceFacts source;
     AudioSourceInterpretation interpretation;
+
+    // Loop-record takes, one per pass. Empty for ordinary single-source clips.
+    // When non-empty, source.filePath mirrors takes[currentTakeIndex].filePath
+    // (the active take that plays back).
+    std::vector<AudioTake> takes;
+    int currentTakeIndex = 0;
+
+    // Comping. When compActive is true the clip plays a rendered composite
+    // (source.filePath points at the comp render) assembled from `comp`, which
+    // assigns a take to each region of the comp timeline. Empty comp = no comp.
+    std::vector<CompSection> comp;
+    bool compActive = false;
+};
+
+/**
+ * @brief One MIDI loop-record take: a single recorded pass over the loop range.
+ *
+ * The MIDI counterpart of AudioTake. Where audio takes are file references,
+ * MIDI takes are full note/controller snapshots — assembling a comp needs no
+ * render, just picking which take's events play. Immutable once recorded.
+ */
+struct MidiTake {
+    std::vector<MidiNote> notes;
+    std::vector<MidiCCData> cc;
+    std::vector<MidiPitchBendData> pitchBend;
+};
+
+/**
+ * @brief One MIDI comp section: the take that plays over [startBeat, endBeat).
+ *
+ * The beats-domain counterpart of CompSection. Sections tile the comp timeline
+ * (take 0 at beat 0), kept sorted and contiguous; a comp is the ordered list.
+ * takeIndex points into MidiClipModel::takes. Unlike audio there is no render —
+ * the active note list is assembled directly from the sections + take note sets.
+ */
+struct MidiCompSection {
+    double startBeat = 0.0;
+    double endBeat = 0.0;
+    int takeIndex = 0;
 };
 
 struct MidiClipModel {
     juce::String sourceFilePath;
+
+    // Loop-record takes, one per pass. Empty for ordinary single-pass clips.
+    // When non-empty, the active take's events are mirrored into the clip's
+    // authoritative ClipInfo::midiNotes / midiCCData / midiPitchBendData (the
+    // rendered, engine-synced content) — mirroring how AudioClipModel fronts
+    // takes[currentTakeIndex] into source.filePath.
+    std::vector<MidiTake> takes;
+    int currentTakeIndex = 0;
+
+    // Comping. When compActive, the authoritative event vectors are assembled
+    // from `comp` (each section assigns a take to a beat range) instead of a
+    // single take. Empty comp = no comp.
+    std::vector<MidiCompSection> comp;
+    bool compActive = false;
 };
 
 using ClipContent = std::variant<MidiClipModel, AudioClipModel>;
@@ -191,6 +276,27 @@ struct ClipInfo {
     void setMidiContent() {
         content = MidiClipModel{};
     }
+
+    /// Front MIDI take `idx`: copy its events into the authoritative active
+    /// note/CC/pitchbend vectors and mark it current. No-op unless this is a
+    /// MIDI clip with that take. Mirrors how audio fronts takes[idx] into the
+    /// clip source.
+    void frontMidiTake(int idx) {
+        if (!isMidi())
+            return;
+        auto& m = midi();
+        if (idx < 0 || idx >= static_cast<int>(m.takes.size()))
+            return;
+        m.currentTakeIndex = idx;
+        midiNotes = m.takes[static_cast<size_t>(idx)].notes;
+        midiCCData = m.takes[static_cast<size_t>(idx)].cc;
+        midiPitchBendData = m.takes[static_cast<size_t>(idx)].pitchBend;
+    }
+
+    // Transient UI: whether the loop-record take lanes are expanded in the
+    // waveform editor (collapsed = the normal single active-take waveform).
+    // Not serialized.
+    bool takesExpanded = true;
 
     // Derived timeline seconds cache. Kept only for bridge/UI call sites that
     // have not moved to beats yet; do not treat these as model authority.
@@ -596,6 +702,29 @@ struct ClipInfo {
     /// Timeline-domain end position (start + length).
     double getTimelineEnd(double projectBPM) const {
         return getTimelineStart(projectBPM) + getTimelineLength(projectBPM);
+    }
+
+    // ----- Position-aware overloads (tempo single-source-of-truth) -----
+    // These walk the tempo curve via the facade, so they stay correct under a
+    // varying tempo where `beats * 60 / bpm` would drift. Beats are
+    // authoritative; placement.startBeat / endBeat() drive the result.
+
+    /// Timeline-domain seconds for the clip's start position.
+    double getTimelineStart(const TempoMap& tempoMap) const {
+        return tempoMap.beatToTime(placement.startBeat);
+    }
+
+    /// Timeline-domain seconds for the clip's length. Position-aware: a beat
+    /// span occupies different wall-clock seconds depending on where it sits on
+    /// the tempo curve, so length = end-time minus start-time (not a direct
+    /// lengthBeats conversion).
+    double getTimelineLength(const TempoMap& tempoMap) const {
+        return tempoMap.beatToTime(placement.endBeat()) - tempoMap.beatToTime(placement.startBeat);
+    }
+
+    /// Timeline-domain end position.
+    double getTimelineEnd(const TempoMap& tempoMap) const {
+        return tempoMap.beatToTime(placement.endBeat());
     }
 
     /// Timeline-domain seconds for the looping playback span — the length the

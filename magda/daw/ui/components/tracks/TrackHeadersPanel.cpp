@@ -16,6 +16,7 @@
 #include "../../../core/RackInfo.hpp"
 #include "../../../core/SelectionManager.hpp"
 #include "../../../core/StringTable.hpp"
+#include "../../../core/TechnicalText.hpp"
 #include "../../../core/TrackCommands.hpp"
 #include "../../../core/TrackPropertyCommands.hpp"
 #include "../../../core/UndoManager.hpp"
@@ -25,7 +26,8 @@
 #include "../../themes/SmallButtonLookAndFeel.hpp"
 #include "../../utils/SelectionPolicy.hpp"
 #include "../automation/AutomationLaneComponent.hpp"
-#include "../mixer/LevelMeterBallistics.hpp"
+#include "../automation/AutomationMenu.hpp"
+#include "../mixer/LevelMeter.hpp"
 #include "../mixer/RoutingSyncHelper.hpp"
 #include "BinaryData.h"
 
@@ -93,170 +95,6 @@ std::pair<juce::String, juce::String> buildNewTrackGhostText(const juce::Dynamic
     return {"Create New Track", "Add " + name};
 }
 
-// Shared base for the automation-lane header buttons (snap beat grid / snap value
-// / arm / bypass / delete). All five share the same rounded-rect chrome —
-// same corner radius, fill, and 1px darker border as SmallButtonLookAndFeel
-// — so they read as a single unified strip. Subclasses only supply the glyph.
-// Off: SURFACE background with a neutral-grey glyph.
-// On:  activeColour background with a white glyph (high contrast reversal).
-class LaneHeaderButton : public juce::Button {
-  public:
-    LaneHeaderButton(const juce::String& name, juce::Colour activeColour)
-        : juce::Button(name), activeColour_(activeColour) {}
-
-    void paintButton(juce::Graphics& g, bool isMouseOver, bool isButtonDown) override {
-        auto bounds = getLocalBounds().toFloat().reduced(0.5f);
-        constexpr float corner = 3.0f;
-
-        const bool on = getToggleState();
-        juce::Colour bg = on ? activeColour_ : DarkTheme::getColour(DarkTheme::SURFACE);
-        if (isButtonDown)
-            bg = bg.darker(0.2f);
-        else if (isMouseOver)
-            bg = bg.brighter(0.1f);
-
-        g.setColour(bg);
-        g.fillRoundedRectangle(bounds, corner);
-        g.setColour(bg.darker(0.15f));
-        g.drawRoundedRectangle(bounds, corner, 1.0f);
-
-        // Glyph colour: white when on (reads against the coloured fill),
-        // neutral grey when off (reads as inactive against SURFACE).
-        juce::Colour glyph = on ? juce::Colours::white : juce::Colour(0xFFB3B3B3);
-        paintGlyph(g, glyph);
-    }
-
-  protected:
-    virtual void paintGlyph(juce::Graphics& g, juce::Colour colour) = 0;
-
-  private:
-    juce::Colour activeColour_;
-};
-
-// Snap toggles: show an SVG glyph. The SVG authors its shapes in #B3B3B3, so
-// we recolour-replace into whatever glyph colour the base class dictates.
-class SnapIconLaneButton : public LaneHeaderButton {
-  public:
-    SnapIconLaneButton(const juce::String& name, const void* svgData, int svgSize)
-        : LaneHeaderButton(name, DarkTheme::getColour(DarkTheme::ACCENT_BLUE)) {
-        setClickingTogglesState(true);
-        drawable_ = juce::Drawable::createFromImageData(svgData, svgSize);
-    }
-
-    void paintGlyph(juce::Graphics& g, juce::Colour colour) override {
-        if (drawable_ == nullptr)
-            return;
-        auto copy = drawable_->createCopy();
-        copy->replaceColour(juce::Colour(0xFFB3B3B3), colour);
-        copy->drawWithin(g, getLocalBounds().toFloat().reduced(1.0f),
-                         juce::RectanglePlacement::centred, 1.0f);
-    }
-
-  private:
-    std::unique_ptr<juce::Drawable> drawable_;
-};
-
-// Text-glyph variant: used for the "R" arm button and the "×" delete button.
-// Toggling behaviour is optional — the delete button fires once and doesn't
-// latch, while arm latches.
-class TextLaneButton : public LaneHeaderButton {
-  public:
-    TextLaneButton(const juce::String& name, const juce::String& glyphText,
-                   juce::Colour activeColour, float fontSize, bool toggles)
-        : LaneHeaderButton(name, activeColour), glyphText_(glyphText), fontSize_(fontSize) {
-        setClickingTogglesState(toggles);
-    }
-
-    void paintGlyph(juce::Graphics& g, juce::Colour colour) override {
-        g.setColour(colour);
-        g.setFont(FontManager::getInstance().getUIFontBold(fontSize_));
-        g.drawText(glyphText_, getLocalBounds().toFloat(), juce::Justification::centred, false);
-    }
-
-  private:
-    juce::String glyphText_;
-    float fontSize_;
-};
-
-// Delete button: always uses the reddish-purple "danger" fill whether toggled
-// or not (matches the device-header × button in NodeComponent). Overrides the
-// base background so the user immediately reads it as destructive.
-class DeleteLaneButton : public LaneHeaderButton {
-  public:
-    DeleteLaneButton()
-        : LaneHeaderButton(
-              "Delete", DarkTheme::getColour(DarkTheme::ACCENT_PURPLE)
-                            .interpolatedWith(DarkTheme::getColour(DarkTheme::STATUS_ERROR), 0.5f)
-                            .darker(0.2f)) {}
-
-    void paintButton(juce::Graphics& g, bool isMouseOver, bool isButtonDown) override {
-        auto bounds = getLocalBounds().toFloat().reduced(0.5f);
-        constexpr float corner = 3.0f;
-
-        juce::Colour bg = DarkTheme::getColour(DarkTheme::ACCENT_PURPLE)
-                              .interpolatedWith(DarkTheme::getColour(DarkTheme::STATUS_ERROR), 0.5f)
-                              .darker(0.2f);
-        if (isButtonDown)
-            bg = bg.darker(0.2f);
-        else if (isMouseOver)
-            bg = bg.brighter(0.1f);
-
-        g.setColour(bg);
-        g.fillRoundedRectangle(bounds, corner);
-        g.setColour(bg.darker(0.15f));
-        g.drawRoundedRectangle(bounds, corner, 1.0f);
-
-        paintGlyph(g, juce::Colours::white);
-    }
-
-    void paintGlyph(juce::Graphics& g, juce::Colour colour) override {
-        g.setColour(colour);
-        g.setFont(FontManager::getInstance().getUIFontBold(13.0f));
-        g.drawText(juce::String::fromUTF8("\xc3\x97"), getLocalBounds().toFloat(),
-                   juce::Justification::centred, false);
-    }
-};
-
-// Bypass button: broken-ring power glyph drawn procedurally, so we don't need
-// a separate SVG and the stroke stays crisp at the 20px button size. Off =
-// grey on SURFACE, On = white on cyan — same colour rules as snap toggles.
-class PowerGlyphButton : public LaneHeaderButton {
-  public:
-    PowerGlyphButton() : LaneHeaderButton("Bypass", DarkTheme::getColour(DarkTheme::ACCENT_BLUE)) {
-        setClickingTogglesState(true);
-    }
-
-    void paintGlyph(juce::Graphics& g, juce::Colour colour) override {
-        auto bounds = getLocalBounds().toFloat();
-        // Leave padding so the glyph doesn't kiss the border.
-        auto glyph = bounds.reduced(bounds.getWidth() * 0.22f, bounds.getHeight() * 0.22f);
-
-        const float stroke = juce::jmax(1.4f, glyph.getWidth() * 0.12f);
-        const float cx = glyph.getCentreX();
-        const float cy = glyph.getCentreY();
-        const float radius = glyph.getWidth() * 0.5f - stroke * 0.5f;
-
-        // Broken ring: arc from ~20° past top going clockwise all the way
-        // around, leaving a gap at the top where the vertical stem passes
-        // through. Angles in JUCE are radians, 0 = 12 o'clock, clockwise.
-        constexpr float gap = 0.6f;  // Half-angle of the top gap, radians.
-        juce::Path ring;
-        ring.addCentredArc(cx, cy, radius, radius, 0.0f,
-                           gap,                                      // start angle
-                           juce::MathConstants<float>::twoPi - gap,  // end angle
-                           true);
-
-        g.setColour(colour);
-        g.strokePath(ring, juce::PathStrokeType(stroke, juce::PathStrokeType::curved,
-                                                juce::PathStrokeType::rounded));
-
-        // Vertical stem through the gap.
-        const float stemTop = cy - radius - stroke * 0.3f;
-        const float stemBottom = cy - radius * 0.15f;
-        g.drawLine(cx, stemTop, cx, stemBottom, stroke);
-    }
-};
-
 // Monitor button: matches the TrackInspector's monitor button exactly so the
 // two places the button appears (mixer track header + inspector) read the
 // same way. Glyph changes per mode — "-" / "I" / "A" — and the background
@@ -311,140 +149,6 @@ float dbToMeterPos(float db) {
     // Apply power curve: y = x^3
     return std::pow(normalized, 3.0f);
 }
-
-// Simple stereo level meter component for track headers
-// Uses smooth ballistics (fast attack, exponential decay) and peak hold.
-class TrackMeter : public juce::Component, private juce::Timer {
-  public:
-    TrackMeter() = default;
-    ~TrackMeter() override {
-        stopTimer();
-    }
-
-    void setLevels(float left, float right) {
-        targetL_ = juce::jlimit(0.0f, 2.0f, left);
-        targetR_ = juce::jlimit(0.0f, 2.0f, right);
-
-        // Update peak hold
-        float leftDb = gainToDb(targetL_);
-        float rightDb = gainToDb(targetR_);
-        if (leftDb > peakLeftDb_) {
-            peakLeftDb_ = leftDb;
-            peakLeftHold_ = level_meter_ballistics::peakHoldMs;
-        }
-        if (rightDb > peakRightDb_) {
-            peakRightDb_ = rightDb;
-            peakRightHold_ = level_meter_ballistics::peakHoldMs;
-        }
-
-        if (!isTimerRunning()) {
-            lastUpdateMs_ = level_meter_ballistics::restartClock();
-            startTimerHz(60);
-        }
-    }
-
-    void paint(juce::Graphics& g) override {
-        auto bounds = getLocalBounds().toFloat();
-        const float gap = 2.0f;
-
-        // Split into L/R bars with gap
-        float barWidth = (bounds.getWidth() - gap) / 2.0f;
-        auto leftBar = bounds.withWidth(barWidth);
-        auto rightBar = bounds.withWidth(barWidth).withX(bounds.getX() + barWidth + gap);
-
-        // Background for each bar (darker background)
-        g.setColour(juce::Colour(0xFF1A1A1A));
-        g.fillRoundedRectangle(leftBar, 2.0f);
-        g.fillRoundedRectangle(rightBar, 2.0f);
-
-        // Draw border so meters are always visible
-        g.setColour(juce::Colour(0xFF404040));
-        g.drawRoundedRectangle(leftBar, 2.0f, 1.0f);
-        g.drawRoundedRectangle(rightBar, 2.0f, 1.0f);
-
-        // Draw level fills
-        drawMeterBar(g, leftBar, displayL_, peakLeftDb_);
-        drawMeterBar(g, rightBar, displayR_, peakRightDb_);
-
-        // 0dB tick mark (aligned with header separator)
-        if (nameRowY_ >= 0) {
-            float localY = static_cast<float>(nameRowY_ - getY());
-            if (localY > 0 && localY < bounds.getBottom()) {
-                g.setColour(DarkTheme::getColour(DarkTheme::BORDER).withAlpha(0.5f));
-                g.drawHorizontalLine(static_cast<int>(localY), bounds.getX(), bounds.getRight());
-            }
-        }
-    }
-
-    void setNameRowY(int y) {
-        nameRowY_ = y;
-    }
-
-  private:
-    float targetL_ = 0.0f, targetR_ = 0.0f;
-    float displayL_ = 0.0f, displayR_ = 0.0f;
-    float peakLeftDb_ = -60.0f, peakRightDb_ = -60.0f;
-    float peakLeftHold_ = 0.0f, peakRightHold_ = 0.0f;
-    int nameRowY_ = -1;
-    double lastUpdateMs_ = 0.0;
-
-    void timerCallback() override {
-        const float elapsedMs = level_meter_ballistics::getElapsedMs(lastUpdateMs_);
-        bool changed = false;
-        changed |= level_meter_ballistics::updateLevel(displayL_, targetL_, elapsedMs);
-        changed |= level_meter_ballistics::updateLevel(displayR_, targetR_, elapsedMs);
-        changed |= level_meter_ballistics::updatePeak(peakLeftDb_, peakLeftHold_,
-                                                      gainToDb(targetL_), MIN_DB, elapsedMs);
-        changed |= level_meter_ballistics::updatePeak(peakRightDb_, peakRightHold_,
-                                                      gainToDb(targetR_), MIN_DB, elapsedMs);
-        if (changed)
-            repaint();
-        else if (displayL_ < 0.001f && displayR_ < 0.001f && peakLeftDb_ <= MIN_DB &&
-                 peakRightDb_ <= MIN_DB) {
-            stopTimer();
-            lastUpdateMs_ = 0.0;
-        }
-    }
-
-    void drawMeterBar(juce::Graphics& g, juce::Rectangle<float> bounds, float level, float peakDb) {
-        if (level > 0.0f) {
-            float meterPos = dbToMeterPos(gainToDb(level));
-            float meterHeight = bounds.getHeight() * meterPos;
-            auto fillBounds = bounds;
-            auto fullBounds = bounds;
-            fillBounds = fillBounds.removeFromBottom(meterHeight);
-
-            const juce::Colour green(0xFF55AA55);
-            const juce::Colour yellow(0xFFAAAA55);
-            const juce::Colour red(0xFFAA5555);
-
-            float yellowPos = dbToMeterPos(-12.0f);
-            float redPos = dbToMeterPos(0.0f);
-            constexpr float fade = 0.03f;
-
-            juce::ColourGradient grad(green, 0.0f, fullBounds.getBottom(), red, 0.0f,
-                                      fullBounds.getY(), false);
-            grad.addColour(std::max(0.0, (double)yellowPos - fade), green);
-            grad.addColour(std::min(1.0, (double)yellowPos + fade), yellow);
-            grad.addColour(std::max(0.0, (double)redPos - fade), yellow);
-            grad.addColour(std::min(1.0, (double)redPos + fade), red);
-
-            g.setGradientFill(grad);
-            g.fillRect(fillBounds);
-        }
-
-        // Peak hold indicator
-        float peakPos = dbToMeterPos(peakDb);
-        if (peakPos > 0.01f) {
-            float peakY = bounds.getBottom() - bounds.getHeight() * peakPos;
-            auto peakColour = peakDb >= 0.0f     ? juce::Colour(0xFFAA5555)
-                              : peakDb >= -12.0f ? juce::Colour(0xFFAAAA55)
-                                                 : juce::Colour(0xFF55AA55);
-            g.setColour(peakColour.withAlpha(0.9f));
-            g.fillRect(bounds.getX(), peakY, bounds.getWidth(), 1.5f);
-        }
-    }
-};
 
 // MIDI activity indicator - small blinking dot
 class MidiActivityIndicator : public juce::Component {
@@ -573,20 +277,27 @@ TrackHeadersPanel::TrackHeader::TrackHeader(const juce::String& trackName) : nam
     // Master-only speaker mute (shown instead of the "M" button for the master),
     // matching the inspector and mixer master strips.
     {
-        auto onIcon = juce::Drawable::createFromImageData(BinaryData::speaker_on_svg,
-                                                          BinaryData::speaker_on_svgSize);
-        auto offIcon = juce::Drawable::createFromImageData(BinaryData::speaker_off_svg,
-                                                           BinaryData::speaker_off_svgSize);
-        masterMuteButton =
-            std::make_unique<juce::DrawableButton>("masterMute", juce::DrawableButton::ImageFitted);
-        masterMuteButton->setImages(onIcon.get(), nullptr, nullptr, nullptr, offIcon.get());
-        masterMuteButton->setEdgeIndent(0);
+        // Dual-icon SvgButton matching the inspector/mixer: gray speaker
+        // (master_on) when audible, orange chip (master_off) when muted.
+        // SvgButton's iconPadding + cornerRadius give the padding and rounded
+        // box a raw DrawableButton can't.
+        masterMuteButton = std::make_unique<magda::SvgButton>(
+            "masterMute", BinaryData::master_on_svg, BinaryData::master_on_svgSize,
+            BinaryData::master_off_svg, BinaryData::master_off_svgSize);
         masterMuteButton->setClickingTogglesState(true);
-        masterMuteButton->setColour(juce::DrawableButton::backgroundColourId,
-                                    juce::Colours::transparentBlack);
-        masterMuteButton->setColour(juce::DrawableButton::backgroundOnColourId,
-                                    juce::Colours::transparentBlack);
+        masterMuteButton->setBorderColor(DarkTheme::getColour(DarkTheme::BORDER));
+        masterMuteButton->setActiveBackgroundColor(DarkTheme::getColour(DarkTheme::ACCENT_ORANGE));
     }
+
+    // Chord-track audition toggle (speaker). Dual-icon with pre-baked colors:
+    // audible = blue chip with a dark speaker (chord_on), silent = gray speaker
+    // (chord_off). Matches the S / monitor chips beside it.
+    chordAuditionButton = std::make_unique<magda::SvgButton>(
+        "ChordAudition", BinaryData::chord_off_svg, BinaryData::chord_off_svgSize,
+        BinaryData::chord_on_1_svg, BinaryData::chord_on_1_svgSize);
+    chordAuditionButton->setTooltip("Preview chords on playback");
+    chordAuditionButton->setBorderColor(DarkTheme::getColour(DarkTheme::BORDER));
+    chordAuditionButton->setActiveBackgroundColor(DarkTheme::getColour(DarkTheme::ACCENT_CYAN));
 
     soloButton = std::make_unique<juce::TextButton>(tr("tracks.solo"));
     soloButton->setLookAndFeel(&magda::daw::ui::SmallButtonLookAndFeel::getInstance());
@@ -645,6 +356,9 @@ TrackHeadersPanel::TrackHeader::TrackHeader(const juce::String& trackName) : nam
     // Volume label (shows dB, draggable)
     volumeLabel = std::make_unique<DraggableValueLabel>(DraggableValueLabel::Format::Decibels);
     volumeLabel->setRange(MIN_DB, MAX_DB, 0.0);  // -60 to +6 dB, default 0 dB
+    // Curve the fill to match the level meter's power scale (consistent with the
+    // master volume and the meters elsewhere).
+    volumeLabel->setFillExponent(static_cast<double>(LevelMeter::METER_CURVE_EXPONENT));
     volumeLabel->setValue(gainToDb(volume), juce::dontSendNotification);
 
     // Pan label (shows L/C/R, draggable)
@@ -687,7 +401,7 @@ TrackHeadersPanel::TrackHeader::TrackHeader(const juce::String& trackName) : nam
     // Send labels — created dynamically in setupTrackHeaderWithId based on actual sends
 
     // Meter component (stereo level display)
-    meterComponent = std::make_unique<TrackMeter>();
+    meterComponent = std::make_unique<LevelMeter>();
     // Levels will be set by timerCallback reading from AudioBridge
 
     // MIDI activity indicator
@@ -827,7 +541,7 @@ void TrackHeadersPanel::timerCallback() {
         MeterData data;
         if (meteringBuffer.popLevels(header->trackId, data)) {
             if (header->meterComponent) {
-                static_cast<TrackMeter*>(header->meterComponent.get())
+                static_cast<LevelMeter*>(header->meterComponent.get())
                     ->setLevels(data.peakL, data.peakR);
             }
         }
@@ -1148,6 +862,7 @@ void TrackHeadersPanel::tracksChanged() {
         header->isGroup = track->isGroup() || track->hasChildren();
         header->isMultiOut = (track->type == TrackType::MultiOut);
         header->isMaster = (track->type == TrackType::Master);
+        header->isChordTrack = (track->type == TrackType::Chord);
         header->isCollapsed = track->isCollapsedIn(currentViewMode_);
         header->muted = track->muted;
         header->solo = track->soloed;
@@ -1180,6 +895,7 @@ void TrackHeadersPanel::tracksChanged() {
         addAndMakeVisible(*header->recordButton);
         addAndMakeVisible(*header->monitorButton);
         addAndMakeVisible(*header->automationButton);
+        addChildComponent(*header->chordAuditionButton);
         addAndMakeVisible(*header->volumeLabel);
         addAndMakeVisible(*header->panLabel);
         addAndMakeVisible(*header->audioInputSelector);
@@ -1309,7 +1025,7 @@ void TrackHeadersPanel::trackPropertyChanged(int trackId) {
 
         // MultiOut children: show where audio actually goes (parent's output destination)
         if (header.isMultiOut && track->hasParent()) {
-            juce::String outputName = "Master";
+            juce::String outputName = magda::technicalText(magda::TechnicalTextToken::Master);
             if (auto* parent = TrackManager::getInstance().getTrack(track->parentId)) {
                 if (parent->hasParent()) {
                     if (auto* group = TrackManager::getInstance().getTrack(parent->parentId)) {
@@ -1839,6 +1555,34 @@ void TrackHeadersPanel::setupTrackHeaderWithId(TrackHeader& header, int trackId)
     panTarget.devicePath = magda::ChainNodePath::trackLevel(trackId);
     header.panLabel->setAutomationTarget(panTarget);
 
+    // Right-click the volume / pan readouts to show (or create) their
+    // automation lane, mirroring the send-label menu in the inspector.
+    auto showAutomationLaneMenu = [](AutomationTarget target) {
+        auto& autoMgr = AutomationManager::getInstance();
+        const bool hasLane = autoMgr.getLaneForTarget(target) != magda::INVALID_AUTOMATION_LANE_ID;
+        juce::PopupMenu menu;
+        menu.addItem(1, hasLane ? "Show Automation Lane" : "Add Automation Lane");
+        if (hasLane)
+            menu.addItem(2, "Delete Automation Lane");
+        menu.showMenuAsync(juce::PopupMenu::Options(), [target](int result) {
+            auto& mgr = AutomationManager::getInstance();
+            if (result == 1) {
+                auto id = mgr.getOrCreateLane(target, AutomationLaneType::Absolute);
+                mgr.setLaneVisible(id, true);
+            } else if (result == 2) {
+                auto id = mgr.getLaneForTarget(target);
+                if (id != magda::INVALID_AUTOMATION_LANE_ID)
+                    mgr.deleteLane(id);
+            }
+        });
+    };
+    header.volumeLabel->onRightClick = [showAutomationLaneMenu, volTarget]() {
+        showAutomationLaneMenu(volTarget);
+    };
+    header.panLabel->onRightClick = [showAutomationLaneMenu, panTarget]() {
+        showAutomationLaneMenu(panTarget);
+    };
+
     // Name label callback - updates TrackManager
     header.nameLabel->onTextChange = [this, trackId]() {
         int index = getVisibleHeaderIndex(trackId);
@@ -1883,6 +1627,19 @@ void TrackHeadersPanel::setupTrackHeaderWithId(TrackHeader& header, int trackId)
             header.muted = header.masterMuteButton->getToggleState();
             UndoManager::getInstance().executeCommand(
                 std::make_unique<SetMasterMuteCommand>(header.muted));
+        }
+    };
+
+    // Chord-track speaker: toggles whether the chord voicing is audible on
+    // playback (it's just the track mute, framed as "preview chords").
+    header.chordAuditionButton->onClick = [this, trackId]() {
+        int index = getVisibleHeaderIndex(trackId);
+        if (index >= 0) {
+            auto& header = *trackHeaders[index];
+            header.muted = !header.muted;  // speaker on = audible = not muted
+            header.chordAuditionButton->setActive(!header.muted);
+            UndoManager::getInstance().executeCommand(
+                std::make_unique<SetTrackMuteCommand>(trackId, header.muted));
         }
     };
 
@@ -2064,8 +1821,15 @@ void TrackHeadersPanel::setupTrackHeaderWithId(TrackHeader& header, int trackId)
                 std::make_unique<SetTrackInputMonitorCommand>(tid, nextMode));
     };
 
-    // Automation button - show automation lane menu
+    // Automation button - show automation lane menu. Alt/Option-click is a
+    // shortcut to toggle global show/hide of ALL automation lanes (the menu's
+    // own items stay per-track).
     header.automationButton->onClick = [this, trackId, &header]() {
+        if (juce::ModifierKeys::getCurrentModifiers().isAltDown()) {
+            auto& am = AutomationManager::getInstance();
+            am.setGlobalLaneVisibility(!am.isGlobalLaneVisibilityEnabled());
+            return;
+        }
         showAutomationMenu(trackId, header.automationButton.get());
     };
 
@@ -2250,10 +2014,10 @@ void TrackHeadersPanel::layoutMeterColumn(TrackHeader& header, juce::Rectangle<i
     auto midiArea = outer.removeFrom(workArea, midiIndicatorWidth);
     outer.removeSpacing(workArea, meterPadding);
 
-    // Audio meter spans full track height
+    // Audio meter spans full track height. The chord track emits no audio yet,
+    // so hide its output meter for now (an oscilloscope may replace it later).
     header.meterComponent->setBounds(meterArea);
-    header.meterComponent->setVisible(true);
-    static_cast<TrackMeter*>(header.meterComponent.get())->setNameRowY(header.nameRowBottomY);
+    header.meterComponent->setVisible(!header.isChordTrack);
 
     // MIDI indicator in top portion, session mode button in bottom portion
     const int sessionBtnSize = 14;
@@ -2278,6 +2042,35 @@ void TrackHeadersPanel::layoutVolPanAndButtons(TrackHeader& header, juce::Rectan
     const int gap = 2;
     const int rh = 16;  // rowHeight
     const int areaWidth = area.getWidth();
+
+    // Chord track: volume + speaker (audition) + solo + monitor. The speaker
+    // toggle stands in for mute, framed as "preview chords on playback" (blue =
+    // audible, faint grey = silent). No pan / record / automation / routing.
+    if (header.isChordTrack) {
+        auto row = area.removeFromTop(24);
+        auto content = inner.removeFrom(row, areaWidth);
+        const int mixW = areaWidth * 52 / 100;
+        const int iconW = 24;
+        header.volumeLabel->setBounds(content.removeFromLeft(mixW));
+        header.volumeLabel->setVisible(true);
+        content.removeFromLeft(gap);
+        header.chordAuditionButton->setBounds(content.removeFromLeft(iconW));
+        header.chordAuditionButton->setVisible(true);
+        header.chordAuditionButton->setActive(!header.muted);
+        content.removeFromLeft(gap);
+        const int soloW = content.getWidth() - iconW - gap;
+        header.soloButton->setBounds(content.removeFromLeft(soloW));
+        header.soloButton->setVisible(true);
+        content.removeFromLeft(gap);
+        header.monitorButton->setBounds(content.removeFromLeft(iconW));
+        header.monitorButton->setVisible(true);
+        header.muteButton->setVisible(false);
+        header.masterMuteButton->setVisible(false);
+        header.panLabel->setVisible(false);
+        header.recordButton->setVisible(false);
+        header.automationButton->setVisible(false);
+        return;
+    }
 
     // Master track: volume + mute only (no solo, pan, record, monitor)
     if (header.isMaster) {
@@ -2386,6 +2179,23 @@ void TrackHeadersPanel::layoutControlArea(TrackHeader& header, juce::Rectangle<i
     // Master track: skip name row space (painted "Master" label), then volume + mute
     if (header.isMaster) {
         header.nameLabel->setVisible(false);
+        header.collapseButton->setVisible(false);
+        header.audioInputSelector->setVisible(false);
+        header.inputSelector->setVisible(false);
+        header.outputSelector->setVisible(false);
+        header.midiOutputSelector->setVisible(false);
+        header.audioColumnLabel->setVisible(false);
+        header.midiColumnLabel->setVisible(false);
+        header.inputIcon->setVisible(false);
+        header.outputIcon->setVisible(false);
+        for (auto& sendLabel : header.sendLabels)
+            sendLabel->setVisible(false);
+        layoutVolPanAndButtons(header, tcpArea, inner);
+        return;
+    }
+
+    // Chord track: keep the name, drop all routing/sends, show only Preview.
+    if (header.isChordTrack) {
         header.collapseButton->setVisible(false);
         header.audioInputSelector->setVisible(false);
         header.inputSelector->setVisible(false);
@@ -2642,8 +2452,10 @@ void TrackHeadersPanel::mouseDown(const juce::MouseEvent& event) {
         setMouseCursor(juce::MouseCursor::UpDownResizeCursor);
     } else {
         // Find which track was clicked
+        bool hitTrack = false;
         for (int i = 0; i < static_cast<int>(trackHeaders.size()); ++i) {
             if (getTrackHeaderArea(i).contains(pos)) {
+                hitTrack = true;
                 TrackId trackId = trackHeaders[i]->trackId;
 
                 // Clicks bubbled up from child components (mute / solo /
@@ -2719,6 +2531,12 @@ void TrackHeadersPanel::mouseDown(const juce::MouseEvent& event) {
                 break;
             }
         }
+
+        // Right-click on the empty area below the tracks: offer Add Track so a
+        // new track can be created without the gutter button (also the only
+        // path when the project has no tracks yet).
+        if (!hitTrack && event.mods.isPopupMenu())
+            showAddTrackContextMenu(pos);
     }
 }
 
@@ -2930,6 +2748,9 @@ void TrackHeadersPanel::showContextMenu(int trackIndex, juce::Point<int> positio
         PreferDrumGrid = 9,
         GroupSelectedTracks = 10,
         UngroupTracks = 11,
+        AddAudioTrack = 12,
+        AddGroupTrack = 13,
+        AddAuxTrack = 14,
 
         MoveToGroupBase = 100,
         AddSendBase = 500,
@@ -2941,6 +2762,16 @@ void TrackHeadersPanel::showContextMenu(int trackIndex, juce::Point<int> positio
     // Track type info
     menu.addSectionHeader(track->name);
     menu.addSeparator();
+
+    // Add Track (mirrors the Track menu / "New Track" command)
+    {
+        juce::PopupMenu addTrackMenu;
+        addTrackMenu.addItem(AddAudioTrack, "Audio Track");
+        addTrackMenu.addItem(AddGroupTrack, "Group Track");
+        addTrackMenu.addItem(AddAuxTrack, "Aux Track");
+        menu.addSubMenu("Add Track", addTrackMenu);
+        menu.addSeparator();
+    }
 
     // Group operations
     if (track->isGroup()) {
@@ -3056,31 +2887,38 @@ void TrackHeadersPanel::showContextMenu(int trackIndex, juce::Point<int> positio
 
     menu.addSeparator();
 
-    // Duplicate track
-    menu.addItem(DuplicateWithContent, tr("tracks.duplicate"));
-    menu.addItem(DuplicateNoContent, tr("tracks.duplicate_no_content"));
-    menu.addItem(DuplicateContentOnly, tr("tracks.duplicate_content_only"));
+    // Duplicate track (not for the singleton chord track)
+    if (!header.isChordTrack) {
+        menu.addItem(DuplicateWithContent, tr("tracks.duplicate"));
+        menu.addItem(DuplicateNoContent, tr("tracks.duplicate_no_content"));
+        menu.addItem(DuplicateContentOnly, tr("tracks.duplicate_content_only"));
+    }
 
     // Delete track
     menu.addItem(DeleteTrack, tr("tracks.delete"));
 
-    menu.addSeparator();
+    // The chord track has no audio I/O routing or drum-grid instrument, so it
+    // omits Prefer Drum Grid and Show/Hide I/O.
+    if (!header.isChordTrack) {
+        menu.addSeparator();
 
-    // Prefer Drum Grid for the track's primary instrument plugin. The flag
-    // lives at the plugin-identifier level (user-global), so all tracks using
-    // the same instrument get the same default editor.
-    auto* primaryInstrument = TrackManager::getInstance().getPrimaryInstrument(header.trackId);
-    if (primaryInstrument != nullptr) {
-        const auto identifier = magda::PluginPreferences::identifierForDevice(*primaryInstrument);
-        const bool prefersGrid =
-            magda::PluginPreferences::getInstance().prefersDrumGrid(identifier);
-        menu.addItem(PreferDrumGrid, "Prefer Drum Grid for " + primaryInstrument->name, true,
-                     prefersGrid);
+        // Prefer Drum Grid for the track's primary instrument plugin. The flag
+        // lives at the plugin-identifier level (user-global), so all tracks
+        // using the same instrument get the same default editor.
+        auto* primaryInstrument = TrackManager::getInstance().getPrimaryInstrument(header.trackId);
+        if (primaryInstrument != nullptr) {
+            const auto identifier =
+                magda::PluginPreferences::identifierForDevice(*primaryInstrument);
+            const bool prefersGrid =
+                magda::PluginPreferences::getInstance().prefersDrumGrid(identifier);
+            menu.addItem(PreferDrumGrid, "Prefer Drum Grid for " + primaryInstrument->name, true,
+                         prefersGrid);
+        }
+
+        // Show/Hide I/O routing
+        menu.addItem(ToggleIORouting, header.showIORouting ? tr("tracks.hide_io_routing")
+                                                           : tr("tracks.show_io_routing"));
     }
-
-    // Show/Hide I/O routing
-    menu.addItem(ToggleIORouting, header.showIORouting ? tr("tracks.hide_io_routing")
-                                                       : tr("tracks.show_io_routing"));
 
     // Show menu and handle result
     menu.showMenuAsync(
@@ -3121,6 +2959,15 @@ void TrackHeadersPanel::showContextMenu(int trackIndex, juce::Point<int> positio
             } else if (result == DeleteTrack) {
                 auto cmd = std::make_unique<DeleteTrackCommand>(trackId);
                 UndoManager::getInstance().executeCommand(std::move(cmd));
+            } else if (result == AddAudioTrack) {
+                UndoManager::getInstance().executeCommand(
+                    std::make_unique<CreateTrackCommand>(TrackType::Audio));
+            } else if (result == AddGroupTrack) {
+                UndoManager::getInstance().executeCommand(
+                    std::make_unique<CreateTrackCommand>(TrackType::Group));
+            } else if (result == AddAuxTrack) {
+                UndoManager::getInstance().executeCommand(
+                    std::make_unique<CreateTrackCommand>(TrackType::Aux));
             } else if (result == DuplicateWithContent) {
                 auto cmd = std::make_unique<DuplicateTrackCommand>(
                     trackId, /*duplicateContent=*/true, /*duplicateDevices=*/true);
@@ -3167,6 +3014,30 @@ void TrackHeadersPanel::showContextMenu(int trackIndex, juce::Point<int> positio
                     std::make_unique<AddTrackToGroupCommand>(trackId, groupId));
             }
         });
+}
+
+void TrackHeadersPanel::showAddTrackContextMenu(juce::Point<int> position) {
+    enum AddId : int { AddAudio = 1, AddGroup = 2, AddAux = 3 };
+
+    juce::PopupMenu menu;
+    menu.addItem(AddAudio, "Add Audio Track");
+    menu.addItem(AddGroup, "Add Group Track");
+    menu.addItem(AddAux, "Add Aux Track");
+
+    menu.showMenuAsync(juce::PopupMenu::Options().withTargetScreenArea(
+                           localAreaToGlobal(juce::Rectangle<int>(position.x, position.y, 1, 1))),
+                       [](int result) {
+                           juce::PopupMenu::dismissAllActiveMenus();
+                           TrackType type = TrackType::Audio;
+                           if (result == AddGroup)
+                               type = TrackType::Group;
+                           else if (result == AddAux)
+                               type = TrackType::Aux;
+                           else if (result != AddAudio)
+                               return;
+                           UndoManager::getInstance().executeCommand(
+                               std::make_unique<CreateTrackCommand>(type));
+                       });
 }
 
 void TrackHeadersPanel::toggleRouting(int trackIndex, RoutingType type) {
@@ -3504,396 +3375,7 @@ void TrackHeadersPanel::paintDropTargetGroupHighlight(juce::Graphics& g) {
 }
 
 void TrackHeadersPanel::showAutomationMenu(TrackId trackId, juce::Component* relativeTo) {
-    auto& automationManager = AutomationManager::getInstance();
-
-    juce::PopupMenu menu;
-
-    // Global show/hide toggle (id 9999) — applies to every track
-    bool globalOn = automationManager.isGlobalLaneVisibilityEnabled();
-    menu.addItem(9999, globalOn ? "Hide All Automation Lanes" : "Show All Automation Lanes");
-    menu.addSeparator();
-
-    menu.addSectionHeader("Show Automation Lane");
-    menu.addSeparator();
-
-    // Get existing lanes for this track
-    auto existingLanes = automationManager.getLanesForTrack(trackId);
-
-    // Add existing lanes first (with toggle indicator)
-    if (!existingLanes.empty()) {
-        for (auto laneId : existingLanes) {
-            const auto* lane = automationManager.getLane(laneId);
-            if (lane) {
-                juce::String name = lane->getDisplayName();
-                bool isVisible = lane->visible;
-                menu.addItem(1000 + laneId, name, true, isVisible);
-            }
-        }
-        menu.addSeparator();
-    }
-
-    // "Add New Lane" submenu with common targets
-    juce::PopupMenu addNewMenu;
-
-    // Tick a submenu item if a lane already exists for the target and is
-    // visible — mirrors the existing-lanes section above so the user can see
-    // at a glance which targets are already on screen.
-    auto isTargetShown = [&automationManager](const AutomationTarget& t) {
-        auto laneId = automationManager.getLaneForTarget(t);
-        if (laneId == INVALID_AUTOMATION_LANE_ID)
-            return false;
-        const auto* lane = automationManager.getLane(laneId);
-        return lane != nullptr && lane->visible;
-    };
-
-    // Track volume
-    {
-        AutomationTarget tvTarget;
-        tvTarget.kind = ControlTarget::Kind::TrackVolume;
-        tvTarget.devicePath = magda::ChainNodePath::trackLevel(trackId);
-        addNewMenu.addItem(1, "Track Volume", true, isTargetShown(tvTarget));
-    }
-
-    // Track pan
-    {
-        AutomationTarget tpTarget;
-        tpTarget.kind = ControlTarget::Kind::TrackPan;
-        tpTarget.devicePath = magda::ChainNodePath::trackLevel(trackId);
-        addNewMenu.addItem(2, "Track Pan", true, isTargetShown(tpTarget));
-    }
-
-    // Build device parameter targets from chain elements
-    // IDs 10+ are indices into deviceParamTargets (shared path used for
-    // send-level, device-parameter, and macro entries)
-    auto deviceParamTargets = std::make_shared<std::vector<AutomationTarget>>();
-    constexpr int kDeviceParamBase = 10;
-
-    auto* trackInfo = TrackManager::getInstance().getTrack(trackId);
-
-    // Track-scope macros + modulators — grouped right under Track Volume / Pan
-    // so they're easy to find without diving into a device's submenu.
-    if (trackInfo) {
-        ChainNodePath trackPath = ChainNodePath::trackLevel(trackId);
-
-        // Track Macros submenu
-        if (!trackInfo->macros.empty()) {
-            juce::PopupMenu trackMacrosMenu;
-            bool any = false;
-            for (int m = 0; m < static_cast<int>(trackInfo->macros.size()); ++m) {
-                const auto& macro = trackInfo->macros[static_cast<size_t>(m)];
-                if (macro.name.isEmpty())
-                    continue;
-                AutomationTarget target;
-                target.kind = ControlTarget::Kind::DeviceMacro;
-                target.devicePath.trackId = trackId;
-                target.devicePath = trackPath;
-                target.paramIndex = m;
-                int itemId = kDeviceParamBase + static_cast<int>(deviceParamTargets->size());
-                bool ticked = isTargetShown(target);
-                deviceParamTargets->push_back(target);
-                trackMacrosMenu.addItem(itemId, getDisplayNameForTarget(target), true, ticked);
-                any = true;
-            }
-            if (any)
-                addNewMenu.addSubMenu("Track Macros", trackMacrosMenu);
-        }
-
-        // Track Modulators submenu — one Rate lane per modifier; scale/labels
-        // switch on tempoSync so a single entry covers both Hz and sync-division.
-        if (!trackInfo->mods.empty()) {
-            juce::PopupMenu trackModsMenu;
-            bool any = false;
-            for (const auto& mod : trackInfo->mods) {
-                if (!mod.enabled)
-                    continue;
-                AutomationTarget target;
-                target.kind = ControlTarget::Kind::ModParam;
-                target.devicePath.trackId = trackId;
-                target.devicePath = trackPath;
-                target.modId = mod.id;
-                target.modParamIndex = 0;  // Rate
-                int itemId = kDeviceParamBase + static_cast<int>(deviceParamTargets->size());
-                bool ticked = isTargetShown(target);
-                deviceParamTargets->push_back(target);
-                trackModsMenu.addItem(itemId, getDisplayNameForTarget(target), true, ticked);
-                any = true;
-            }
-            if (any)
-                addNewMenu.addSubMenu("Track Modulators", trackModsMenu);
-        }
-    }
-
-    // Send levels — one entry per existing aux send on this track.
-    if (trackInfo && !trackInfo->sends.empty()) {
-        addNewMenu.addSeparator();
-        for (const auto& send : trackInfo->sends) {
-            AutomationTarget target;
-            target.kind = ControlTarget::Kind::SendLevel;
-            target.devicePath.trackId = trackId;
-            target.sendBusIndex = send.busIndex;
-
-            juce::String destName = "Send " + juce::String(send.busIndex + 1);
-            if (auto* destTrack = TrackManager::getInstance().getTrack(send.destTrackId)) {
-                if (!destTrack->name.isEmpty())
-                    destName = "Send: " + destTrack->name;
-            }
-
-            int itemId = kDeviceParamBase + static_cast<int>(deviceParamTargets->size());
-            deviceParamTargets->push_back(target);
-            addNewMenu.addItem(itemId, destName, true, isTargetShown(target));
-        }
-    }
-
-    if (trackInfo) {
-        addNewMenu.addSeparator();
-
-        // Recursive lambda to walk chain elements (handles nested racks)
-        std::function<void(const std::vector<ChainElement>&, const ChainNodePath&,
-                           juce::PopupMenu&)>
-            buildMenu = [&](const std::vector<ChainElement>& elements,
-                            const ChainNodePath& parentPath, juce::PopupMenu& parentMenu) {
-                for (const auto& element : elements) {
-                    if (isDevice(element)) {
-                        const auto& device = getDevice(element);
-                        if (device.parameters.empty() && device.mods.empty() &&
-                            device.macros.empty())
-                            continue;
-
-                        juce::PopupMenu deviceMenu;
-                        auto devicePath = (parentPath.getType() == ChainNodeType::None ||
-                                           parentPath.getType() == ChainNodeType::Track)
-                                              ? ChainNodePath::topLevelDevice(trackId, device.id)
-                                              : parentPath.withDevice(device.id);
-
-                        // Params submenu
-                        if (!device.parameters.empty()) {
-                            juce::PopupMenu paramsMenu;
-                            for (const auto& p : device.parameters) {
-                                AutomationTarget target;
-                                target.kind = ControlTarget::Kind::PluginParam;
-                                target.devicePath.trackId = trackId;
-                                target.devicePath = devicePath;
-                                // Address by TE index, not array position —
-                                // wrapper params live in a separate bucket so
-                                // the array no longer mirrors TE indices 1:1.
-                                target.paramIndex = p.paramIndex;
-
-                                int itemId =
-                                    kDeviceParamBase + static_cast<int>(deviceParamTargets->size());
-                                bool ticked = isTargetShown(target);
-                                deviceParamTargets->push_back(target);
-                                paramsMenu.addItem(itemId, p.name, true, ticked);
-                            }
-                            deviceMenu.addSubMenu("Params", paramsMenu);
-                        }
-
-                        // Mods submenu (device-scope MAGDA modifiers). One
-                        // "Rate" lane per modifier — its scale/labels switch
-                        // between Hz (log) and sync divisions (discrete) based
-                        // on the mod's tempoSync flag, so a single lane covers
-                        // both modes without duplicate entries.
-                        {
-                            juce::PopupMenu modsMenu;
-                            bool any = false;
-                            for (const auto& mod : device.mods) {
-                                if (!mod.enabled)
-                                    continue;
-                                AutomationTarget target;
-                                target.kind = ControlTarget::Kind::ModParam;
-                                target.devicePath.trackId = trackId;
-                                target.devicePath = devicePath;
-                                target.modId = mod.id;
-                                target.modParamIndex = 0;  // Rate
-                                int itemId =
-                                    kDeviceParamBase + static_cast<int>(deviceParamTargets->size());
-                                bool ticked = isTargetShown(target);
-                                deviceParamTargets->push_back(target);
-                                modsMenu.addItem(itemId, getDisplayNameForTarget(target), true,
-                                                 ticked);
-                                any = true;
-                            }
-                            if (any)
-                                deviceMenu.addSubMenu("Mods", modsMenu);
-                        }
-
-                        // Macros submenu (device-scope macros)
-                        {
-                            juce::PopupMenu macrosMenu;
-                            bool any = false;
-                            for (int m = 0; m < static_cast<int>(device.macros.size()); ++m) {
-                                const auto& macro = device.macros[static_cast<size_t>(m)];
-                                if (macro.name.isEmpty())
-                                    continue;
-                                AutomationTarget target;
-                                target.kind = ControlTarget::Kind::DeviceMacro;
-                                target.devicePath.trackId = trackId;
-                                target.devicePath = devicePath;
-                                target.paramIndex = m;
-
-                                int itemId =
-                                    kDeviceParamBase + static_cast<int>(deviceParamTargets->size());
-                                bool ticked = isTargetShown(target);
-                                deviceParamTargets->push_back(target);
-                                macrosMenu.addItem(itemId, getDisplayNameForTarget(target), true,
-                                                   ticked);
-                                any = true;
-                            }
-                            if (any)
-                                deviceMenu.addSubMenu("Macros", macrosMenu);
-                        }
-
-                        parentMenu.addSubMenu(device.name, deviceMenu);
-
-                    } else if (isRack(element)) {
-                        const auto& rack = getRack(element);
-                        juce::PopupMenu rackMenu;
-                        auto rackPath = ChainNodePath::rack(trackId, rack.id);
-
-                        // Mods submenu (rack-scope modifiers) — one Rate lane
-                        // per modifier; scale/labels switch on tempoSync.
-                        {
-                            juce::PopupMenu modsMenu;
-                            bool any = false;
-                            for (const auto& mod : rack.mods) {
-                                if (!mod.enabled)
-                                    continue;
-                                AutomationTarget target;
-                                target.kind = ControlTarget::Kind::ModParam;
-                                target.devicePath.trackId = trackId;
-                                target.devicePath = rackPath;
-                                target.modId = mod.id;
-                                target.modParamIndex = 0;  // Rate
-                                int itemId =
-                                    kDeviceParamBase + static_cast<int>(deviceParamTargets->size());
-                                bool ticked = isTargetShown(target);
-                                deviceParamTargets->push_back(target);
-                                modsMenu.addItem(itemId, getDisplayNameForTarget(target), true,
-                                                 ticked);
-                                any = true;
-                            }
-                            if (any)
-                                rackMenu.addSubMenu("Mods", modsMenu);
-                        }
-
-                        // Macros submenu (rack-scope macros)
-                        {
-                            juce::PopupMenu macrosMenu;
-                            bool any = false;
-                            for (int m = 0; m < static_cast<int>(rack.macros.size()); ++m) {
-                                const auto& macro = rack.macros[static_cast<size_t>(m)];
-                                if (macro.name.isEmpty())
-                                    continue;
-                                AutomationTarget target;
-                                target.kind = ControlTarget::Kind::DeviceMacro;
-                                target.devicePath.trackId = trackId;
-                                target.devicePath = rackPath;
-                                target.paramIndex = m;
-
-                                int itemId =
-                                    kDeviceParamBase + static_cast<int>(deviceParamTargets->size());
-                                bool ticked = isTargetShown(target);
-                                deviceParamTargets->push_back(target);
-                                macrosMenu.addItem(itemId, getDisplayNameForTarget(target), true,
-                                                   ticked);
-                                any = true;
-                            }
-                            if (any)
-                                rackMenu.addSubMenu("Macros", macrosMenu);
-                        }
-
-                        // Add chain device parameters
-                        for (const auto& chain : rack.chains) {
-                            auto chainPath = ChainNodePath::chain(trackId, rack.id, chain.id);
-                            if (rack.chains.size() > 1) {
-                                juce::PopupMenu chainMenu;
-                                buildMenu(chain.elements, chainPath, chainMenu);
-                                if (chainMenu.getNumItems() > 0)
-                                    rackMenu.addSubMenu(chain.name.isEmpty()
-                                                            ? "Chain " + juce::String(chain.id)
-                                                            : chain.name,
-                                                        chainMenu);
-                            } else {
-                                // Single chain rack — flatten into rack menu
-                                buildMenu(chain.elements, chainPath, rackMenu);
-                            }
-                        }
-
-                        if (rackMenu.getNumItems() > 0)
-                            parentMenu.addSubMenu(rack.name.isEmpty() ? "Rack" : rack.name,
-                                                  rackMenu);
-                    }
-                }
-            };
-
-        ChainNodePath rootPath = ChainNodePath::trackLevel(trackId);
-        buildMenu(trackInfo->chain.fxChainElements, rootPath, addNewMenu);
-    }
-
-    menu.addSubMenu("Add New Lane...", addNewMenu);
-
-    // Show menu
-    auto options = juce::PopupMenu::Options();
-    if (relativeTo) {
-        options = options.withTargetComponent(relativeTo);
-    }
-
-    menu.showMenuAsync(options, [this, trackId, deviceParamTargets](int result) {
-        if (result == 0)
-            return;
-
-        auto& automationManager = AutomationManager::getInstance();
-
-        if (result == 9999) {
-            // Global show/hide toggle
-            automationManager.setGlobalLaneVisibility(
-                !automationManager.isGlobalLaneVisibilityEnabled());
-            return;
-        }
-
-        if (result >= 1000) {
-            // Toggle existing lane visibility
-            AutomationLaneId laneId = result - 1000;
-            const auto* lane = automationManager.getLane(laneId);
-            if (lane) {
-                bool newVisible = !lane->visible;
-                juce::MessageManager::callAsync([laneId, newVisible]() {
-                    AutomationManager::getInstance().setLaneVisible(laneId, newVisible);
-                });
-            }
-        } else if (result == 1) {
-            // Create track volume automation lane
-            AutomationTarget target;
-            target.kind = ControlTarget::Kind::TrackVolume;
-            target.devicePath.trackId = trackId;
-            auto laneId = automationManager.getOrCreateLane(target, AutomationLaneType::Absolute);
-            automationManager.setLaneVisible(laneId, true);
-            if (onShowAutomationLane) {
-                onShowAutomationLane(trackId, laneId);
-            }
-        } else if (result == 2) {
-            // Create track pan automation lane
-            AutomationTarget target;
-            target.kind = ControlTarget::Kind::TrackPan;
-            target.devicePath.trackId = trackId;
-            auto laneId = automationManager.getOrCreateLane(target, AutomationLaneType::Absolute);
-            automationManager.setLaneVisible(laneId, true);
-            if (onShowAutomationLane) {
-                onShowAutomationLane(trackId, laneId);
-            }
-        } else if (result >= kDeviceParamBase) {
-            // Create device parameter / macro automation lane
-            int idx = result - kDeviceParamBase;
-            if (idx >= 0 && idx < static_cast<int>(deviceParamTargets->size())) {
-                const auto& target = (*deviceParamTargets)[static_cast<size_t>(idx)];
-                auto laneId =
-                    automationManager.getOrCreateLane(target, AutomationLaneType::Absolute);
-                automationManager.setLaneVisible(laneId, true);
-                if (onShowAutomationLane) {
-                    onShowAutomationLane(trackId, laneId);
-                }
-            }
-        }
-    });
+    magda::showAutomationMenu(trackId, relativeTo, onShowAutomationLane);
 }
 
 // ============================================================================
@@ -3931,211 +3413,7 @@ void TrackHeadersPanel::paintAutomationLaneHeaders(juce::Graphics& g, int trackI
                                            AutomationLaneComponent::RESIZE_HANDLE_HEIGHT)
                                         : AutomationLaneComponent::HEADER_HEIGHT;
 
-        // Header area for this automation lane
-        auto headerArea =
-            juce::Rectangle<int>(0, y, getWidth(), AutomationLaneComponent::HEADER_HEIGHT);
-
-        // Header background
-        g.setColour(juce::Colour(0xFF252525));
-        g.fillRect(headerArea);
-
-        // Header border
-        g.setColour(juce::Colour(0xFF333333));
-        g.drawHorizontalLine(headerArea.getBottom() - 1, static_cast<float>(headerArea.getX()),
-                             static_cast<float>(headerArea.getRight()));
-
-        // Parameter name
-        g.setColour(juce::Colour(0xFFCCCCCC));
-        g.setFont(FontManager::getInstance().getUIFont(11.0f));
-        auto nameArea = headerArea.reduced(4, 2);
-        g.drawText(lane->getDisplayName(), nameArea, juce::Justification::centredLeft);
-
-        // Value tick marks and labels in the lane content area
-        {
-            // Match CurveEditorBase's padding (5px) so ticks align with grid lines
-            constexpr int curvePadding = 5;
-            int contentTop = y + AutomationLaneComponent::HEADER_HEIGHT + curvePadding;
-            int contentBottom =
-                y + laneHeight - AutomationLaneComponent::RESIZE_HANDLE_HEIGHT - curvePadding;
-            int contentHeight = contentBottom - contentTop;
-            float rightEdge = static_cast<float>(getWidth());
-            constexpr float tickLen = 5.0f;
-
-            if (contentHeight > 20) {
-                auto paramInfo = getParameterInfoForTarget(lane->target);
-
-                // Build grid values: pairs of (normalized, label)
-                std::vector<std::pair<double, juce::String>> gridValues;
-                if (paramInfo.scale == ParameterScale::FaderDB) {
-                    const std::pair<double, const char*> dbValues[] = {
-                        {6.0, "6"},     {3.0, "3"},     {0.0, "0"},
-                        {-6.0, "-6"},   {-12.0, "-12"}, {-18.0, "-18"},
-                        {-24.0, "-24"}, {-36.0, "-36"}, {-48.0, "-48"}};
-                    for (const auto& [db, label] : dbValues) {
-                        float norm =
-                            ParameterUtils::realToNormalized(static_cast<float>(db), paramInfo);
-                        gridValues.push_back({static_cast<double>(norm), label});
-                    }
-                } else if (lane->target.kind == ControlTarget::Kind::TrackPan) {
-                    gridValues.push_back(
-                        {static_cast<double>(ParameterUtils::realToNormalized(1.0f, paramInfo)),
-                         "R"});
-                    gridValues.push_back(
-                        {static_cast<double>(ParameterUtils::realToNormalized(0.5f, paramInfo)),
-                         "50R"});
-                    gridValues.push_back(
-                        {static_cast<double>(ParameterUtils::realToNormalized(0.0f, paramInfo)),
-                         "C"});
-                    gridValues.push_back(
-                        {static_cast<double>(ParameterUtils::realToNormalized(-0.5f, paramInfo)),
-                         "50L"});
-                    gridValues.push_back(
-                        {static_cast<double>(ParameterUtils::realToNormalized(-1.0f, paramInfo)),
-                         "L"});
-                } else if (paramInfo.isBipolar()) {
-                    // Bipolar params (EQ gain, pitch, etc): symmetric labels
-                    // around zero so the 0 line lands mid-lane. Use the larger
-                    // |bound| so extremes land on both ends regardless of
-                    // asymmetry.
-                    float absMax =
-                        std::max(std::abs(paramInfo.minValue), std::abs(paramInfo.maxValue));
-                    const double realTicks[] = {absMax, absMax * 0.5, 0.0, -absMax * 0.5, -absMax};
-                    for (double real : realTicks) {
-                        float norm =
-                            ParameterUtils::realToNormalized(static_cast<float>(real), paramInfo);
-                        juce::String label;
-                        int rounded = static_cast<int>(std::round(real));
-                        if (rounded > 0)
-                            label = "+" + juce::String(rounded);
-                        else
-                            label = juce::String(rounded);
-                        label += paramInfo.unit;
-                        gridValues.push_back({static_cast<double>(norm), label});
-                    }
-                } else if (paramInfo.scale == ParameterScale::Discrete &&
-                           !paramInfo.choices.empty()) {
-                    // Discrete: use the choices array as label source. Each
-                    // index maps to a real value (0..N-1) — sample evenly so
-                    // the lane shows musical labels (e.g. "1 Bar", "1/4",
-                    // "1/8") instead of falling through to the 10% fallback.
-                    // If the parameter curated a sparse labelTicks set (e.g.
-                    // sync division skipping the triplet/dotted entries that
-                    // snap on playback), use it directly so the thinner can't
-                    // re-introduce the labels we deliberately excluded.
-                    if (!paramInfo.labelTicks.empty()) {
-                        for (const auto& [realValue, label] : paramInfo.labelTicks) {
-                            float norm = ParameterUtils::realToNormalized(realValue, paramInfo);
-                            gridValues.push_back({static_cast<double>(norm), label});
-                        }
-                    } else {
-                        int numChoices = static_cast<int>(paramInfo.choices.size());
-                        for (int i = 0; i < numChoices; ++i) {
-                            float norm =
-                                ParameterUtils::realToNormalized(static_cast<float>(i), paramInfo);
-                            gridValues.push_back({static_cast<double>(norm),
-                                                  paramInfo.choices[static_cast<size_t>(i)]});
-                        }
-                    }
-                } else if (paramInfo.unit.isNotEmpty()) {
-                    // Unipolar with unit: evenly spaced in normalized space,
-                    // labelled with the real value in the parameter's own unit.
-                    for (double norm : {0.0, 0.25, 0.5, 0.75, 1.0}) {
-                        float real =
-                            ParameterUtils::normalizedToReal(static_cast<float>(norm), paramInfo);
-                        juce::String label =
-                            juce::String(static_cast<int>(std::round(real))) + paramInfo.unit;
-                        gridValues.push_back({norm, label});
-                    }
-                } else if (paramInfo.displayText) {
-                    // displayText wraps TE's valueToString, which expects a
-                    // plugin-native value — NOT normalized [0,1]. Sample the
-                    // REAL value at each visual position so any scaleAnchor
-                    // skew is honoured (e.g. 4OSC's filterFreq pins A4 / 440
-                    // Hz to the visual centre), then project from info-range
-                    // onto the TE-native range so the provider sees what it
-                    // expects. For params whose raw range isn't 0..1 this
-                    // prevents the five-way collision (4OSC filterFreq's note
-                    // range 0..135.076 previously produced "8Hz" five times
-                    // from raw norm values); for anchored params it puts the
-                    // anchor value dead centre.
-                    const float teSpan = paramInfo.teMaxValue - paramInfo.teMinValue;
-                    const float infoSpan = paramInfo.maxValue - paramInfo.minValue;
-                    for (double norm : {0.0, 0.25, 0.5, 0.75, 1.0}) {
-                        float teRaw;
-                        if (infoSpan > 0.0f) {
-                            float real = ParameterUtils::normalizedToReal(static_cast<float>(norm),
-                                                                          paramInfo);
-                            float normInInfo = (real - paramInfo.minValue) / infoSpan;
-                            teRaw = paramInfo.teMinValue + normInInfo * teSpan;
-                        } else {
-                            teRaw = paramInfo.teMinValue + static_cast<float>(norm) * teSpan;
-                        }
-                        auto text = paramInfo.displayText->format(teRaw);
-                        gridValues.push_back(
-                            {norm, text.isNotEmpty()
-                                       ? text
-                                       : juce::String(static_cast<int>(norm * 100)) + "%"});
-                    }
-                } else if (!paramInfo.valueTable.empty()) {
-                    for (double norm : {0.0, 0.25, 0.5, 0.75, 1.0}) {
-                        int idx = juce::jlimit(
-                            0, static_cast<int>(paramInfo.valueTable.size()) - 1,
-                            static_cast<int>(std::round(norm * (paramInfo.valueTable.size() - 1))));
-                        gridValues.push_back(
-                            {norm, paramInfo.valueTable[static_cast<size_t>(idx)].trim()});
-                    }
-                } else {
-                    for (int i = 1; i < 10; ++i)
-                        gridValues.push_back({i / 10.0, juce::String(i * 10) + "%"});
-                }
-
-                g.setFont(FontManager::getInstance().getUIFont(8.0f));
-                constexpr int labelH = 10;
-                // Thin labels to what vertically fits. Very short lanes
-                // collapse to a single centre label; otherwise evenly spaced
-                // samples are picked across the range (endpoints included
-                // whenever at least two labels fit), while tall lanes show
-                // every sample. Spacing ~= labelH + 6 matches the minimum
-                // gap before adjacent 8pt labels start to touch.
-                constexpr int labelSpacing = labelH + 6;
-                int maxLabels = juce::jmax(1, contentHeight / labelSpacing);
-                if (maxLabels < static_cast<int>(gridValues.size())) {
-                    std::vector<std::pair<double, juce::String>> thinned;
-                    thinned.reserve(static_cast<size_t>(maxLabels));
-                    if (maxLabels == 1) {
-                        thinned.push_back(gridValues[gridValues.size() / 2]);
-                    } else {
-                        const double srcMax = static_cast<double>(gridValues.size() - 1);
-                        for (int i = 0; i < maxLabels; ++i) {
-                            int srcIdx = static_cast<int>(
-                                std::round(static_cast<double>(i) * srcMax / (maxLabels - 1)));
-                            thinned.push_back(gridValues[static_cast<size_t>(srcIdx)]);
-                        }
-                    }
-                    gridValues = std::move(thinned);
-                }
-                for (const auto& [norm, label] : gridValues) {
-                    int tickY = contentTop + static_cast<int>((1.0 - norm) * contentHeight);
-                    // Tick
-                    g.setColour(juce::Colour(0x66FFFFFF));
-                    g.drawHorizontalLine(tickY, rightEdge - tickLen, rightEdge);
-                    // Label — clamp vertically so min/max labels flush against
-                    // the lane edges instead of clipping against the header /
-                    // resize handle.
-                    g.setColour(juce::Colour(0xFF777777));
-                    int labelTop = juce::jlimit(contentTop, contentBottom - labelH, tickY - 5);
-                    auto labelBounds = juce::Rectangle<int>(2, labelTop, getWidth() - 10, labelH);
-                    g.drawText(label, labelBounds, juce::Justification::centredRight);
-                }
-            }
-        }
-
-        // Bottom border — matches the resize handle area on the content side
-        int borderY = y + laneHeight - AutomationLaneComponent::RESIZE_HANDLE_HEIGHT;
-        g.setColour(juce::Colour(0xFF333333));
-        g.fillRect(0, borderY, getWidth(), AutomationLaneComponent::RESIZE_HANDLE_HEIGHT);
-        g.setColour(juce::Colour(0xFF444444));
-        g.drawHorizontalLine(borderY, 0.0f, static_cast<float>(getWidth()));
+        paintAutomationLaneHeader(g, *lane, y, getWidth(), laneHeight);
 
         y += laneHeight;
     }
@@ -4145,8 +3423,7 @@ void TrackHeadersPanel::paintAutomationLaneHeaders(juce::Graphics& g, int trackI
 // Automation Lane Header Buttons
 // ============================================================================
 
-TrackHeadersPanel::AutoLaneHeaderButtons* TrackHeadersPanel::findLaneHeaderButtons(
-    AutomationLaneId laneId) {
+AutoLaneHeaderButtons* TrackHeadersPanel::findLaneHeaderButtons(AutomationLaneId laneId) {
     for (auto& entry : laneHeaderButtons_) {
         if (entry->laneId == laneId)
             return entry.get();
@@ -4176,83 +3453,18 @@ void TrackHeadersPanel::rebuildLaneHeaderButtons() {
     for (auto laneId : wantedIds) {
         if (findLaneHeaderButtons(laneId))
             continue;
-
-        auto entry = std::make_unique<AutoLaneHeaderButtons>();
-        entry->laneId = laneId;
-
-        entry->snapEditGridBtn = std::make_unique<SnapIconLaneButton>(
-            "snapEditsToBeatGrid", BinaryData::horizontal_snap_svg,
-            BinaryData::horizontal_snap_svgSize);
-        entry->snapEditGridBtn->setTooltip("Snap edits to beat grid");
-        addAndMakeVisible(*entry->snapEditGridBtn);
-
-        entry->snapValueBtn = std::make_unique<SnapIconLaneButton>(
-            "snapValue", BinaryData::vertical_snap_svg, BinaryData::vertical_snap_svgSize);
-        entry->snapValueBtn->setTooltip("Snap values to parameter grid");
-        addAndMakeVisible(*entry->snapValueBtn);
-
-        // Bypass button uses a power glyph, so the "on" visual (cyan fill)
-        // represents automation-enabled — not automation-bypassed. Toggle
-        // state is the inverse of lane->bypass, and the click handler flips
-        // the underlying bypass flag accordingly.
-        entry->bypassBtn = std::make_unique<PowerGlyphButton>();
-        entry->bypassBtn->setTooltip("Automation on/off");
-        addAndMakeVisible(*entry->bypassBtn);
-
-        // Delete button: matches the device-header × in NodeComponent — same
-        // reddish-purple fill, same × glyph. Replaces the old "lane options"
-        // menu; clearing points is handled via the Backspace key instead.
-        entry->deleteBtn = std::make_unique<DeleteLaneButton>();
-        entry->deleteBtn->setTooltip("Delete automation lane");
-        addAndMakeVisible(*entry->deleteBtn);
-
-        // Wire click handlers. Capture laneId by value so the lambda survives
-        // rebuilds (the raw pointer `entry.get()` would dangle if the entry
-        // is later destroyed, but the laneId lookup is safe).
-        AutomationLaneId id = laneId;
-        entry->snapEditGridBtn->onClick = [id]() {
-            auto& mgr = AutomationManager::getInstance();
-            if (const auto* lane = mgr.getLane(id))
-                mgr.setLaneSnapEditsToBeatGrid(id, !lane->snapEditsToBeatGrid);
-        };
-        entry->snapValueBtn->onClick = [id]() {
-            auto& mgr = AutomationManager::getInstance();
-            if (const auto* lane = mgr.getLane(id))
-                mgr.setLaneSnapValue(id, !lane->snapValue);
-        };
-        entry->bypassBtn->onClick = [id]() {
-            auto& mgr = AutomationManager::getInstance();
-            if (const auto* lane = mgr.getLane(id))
-                mgr.setLaneBypass(id, !lane->bypass);
-        };
-        entry->deleteBtn->onClick = [id]() {
-            UndoManager::getInstance().executeCommand(
-                std::make_unique<DeleteAutomationLaneCommand>(id));
-        };
-
-        laneHeaderButtons_.push_back(std::move(entry));
+        laneHeaderButtons_.push_back(makeAutoLaneHeaderButtons(laneId, *this));
     }
 
     // Sync toggle state from lane data.
     for (auto& entry : laneHeaderButtons_) {
-        const auto* lane = manager.getLane(entry->laneId);
-        if (!lane)
-            continue;
-        entry->snapEditGridBtn->setToggleState(lane->snapEditsToBeatGrid,
-                                               juce::dontSendNotification);
-        entry->snapValueBtn->setToggleState(lane->snapValue, juce::dontSendNotification);
-        // Power glyph: inverted — "on" means automation active, not bypassed.
-        entry->bypassBtn->setToggleState(!lane->bypass, juce::dontSendNotification);
+        if (const auto* lane = manager.getLane(entry->laneId))
+            syncAutoLaneHeaderButtonStates(*entry, *lane);
     }
 }
 
 void TrackHeadersPanel::positionLaneHeaderButtons() {
     auto& manager = AutomationManager::getInstance();
-
-    constexpr int kBtnSize = 20;
-    constexpr int kBtnGap = 3;
-    constexpr int kLeftMargin = 6;
-    constexpr int kTopMargin = 4;
 
     for (int trackIndex = 0; trackIndex < static_cast<int>(visibleTrackIds_.size()); ++trackIndex) {
         TrackId trackId = visibleTrackIds_[trackIndex];
@@ -4273,27 +3485,8 @@ void TrackHeadersPanel::positionLaneHeaderButtons() {
                                                AutomationLaneComponent::RESIZE_HANDLE_HEIGHT)
                                             : AutomationLaneComponent::HEADER_HEIGHT;
 
-            if (auto* entry = findLaneHeaderButtons(laneId)) {
-                int btnY = y + AutomationLaneComponent::HEADER_HEIGHT + kTopMargin;
-                bool inView = lane->expanded;
-
-                entry->snapEditGridBtn->setVisible(inView);
-                entry->snapValueBtn->setVisible(inView);
-                entry->bypassBtn->setVisible(inView);
-                entry->deleteBtn->setVisible(inView);
-
-                if (inView) {
-                    int x = kLeftMargin;
-                    auto place = [&](juce::Button& b) {
-                        b.setBounds(x, btnY, kBtnSize, kBtnSize);
-                        x += (kBtnSize + kBtnGap);
-                    };
-                    place(*entry->snapEditGridBtn);
-                    place(*entry->snapValueBtn);
-                    place(*entry->bypassBtn);
-                    place(*entry->deleteBtn);
-                }
-            }
+            if (auto* entry = findLaneHeaderButtons(laneId))
+                layoutAutoLaneHeaderButtons(*entry, *lane, y);
 
             y += laneHeight;
         }

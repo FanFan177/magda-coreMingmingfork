@@ -29,6 +29,7 @@
 #include "ui/components/pianoroll/NoteComponent.hpp"
 #include "ui/components/pianoroll/NoteGridHost.hpp"
 #include "ui/components/timeline/TimeRuler.hpp"
+#include "ui/layout/LayoutConfig.hpp"
 #include "ui/state/TimelineController.hpp"
 #include "ui/state/TimelineEvents.hpp"
 
@@ -303,6 +304,12 @@ class DrumGridClipGrid : public juce::Component,
 
     juce::Point<int> getGridScreenPosition() const override {
         return localPointToGlobal(juce::Point<int>());
+    }
+
+    // The drum grid has no folded pitch axis; a row delta is a plain semitone
+    // delta (preserves the pre-fold behaviour).
+    int noteNumberByRowDelta(int startNote, int rowsUp) const override {
+        return juce::jlimit(0, 127, startNote + rowsUp);
     }
 
     void updateNotePosition(magda::NoteComponent* note, double beat, int noteNumber,
@@ -673,7 +680,7 @@ class DrumGridClipGrid : public juce::Component,
                 int playheadX = beatToPixel(displayBeat);
 
                 if (playheadX >= 0 && playheadX <= bounds.getWidth()) {
-                    g.setColour(juce::Colour(0xFFFF4444));
+                    g.setColour(DarkTheme::getColour(DarkTheme::ACCENT_BLUE));
                     g.fillRect(playheadX - 1, 0, 2, numRows * rowHeight_);
                 }
             }
@@ -1110,7 +1117,7 @@ class DrumGridClipGrid : public juce::Component,
     double defaultNoteLengthBeats_ = 0.0;  // <= 0 follows current grid
     int defaultNoteVelocity_ = 100;
 
-    static constexpr int GRID_LEFT_PADDING = 2;
+    static constexpr int GRID_LEFT_PADDING = magda::LayoutConfig::MIDI_GRID_LEFT_PADDING;
     double pixelsPerBeat_ = 50.0;
     int rowHeight_ = 24;
     magda::ClipId clipId_ = magda::INVALID_CLIP_ID;
@@ -2004,12 +2011,40 @@ DrumGridClipContent::DrumGridClipContent() {
         "ControlsToggle", BinaryData::bar_chart_svg, BinaryData::bar_chart_svgSize);
     controlsToggle_->setTooltip("Toggle velocity lane");
     controlsToggle_->setOriginalColor(juce::Colour(0xFFB3B3B3));
-    controlsToggle_->setActive(velocityDrawerOpen_);
+    controlsToggle_->setActive(velocityLaneVisible_);
     controlsToggle_->onClick = [this]() {
-        setVelocityDrawerVisible(!velocityDrawerOpen_);
-        controlsToggle_->setActive(velocityDrawerOpen_);
+        velocityLaneVisible_ = !velocityLaneVisible_;
+        refreshLaneDrawer();
+        updateLaneToggleStates();
     };
     addAndMakeVisible(controlsToggle_.get());
+
+    // Fold toggle (collapse to pads that have notes) — mirrors the piano roll.
+    foldToggle_ = std::make_unique<magda::SvgButton>("FoldToggle", BinaryData::iconfoldboldm_svg,
+                                                     BinaryData::iconfoldboldm_svgSize);
+    foldToggle_->setTooltip("Fold to used pads");
+    foldToggle_->setOriginalColor(juce::Colour(0xFFB3B3B3));
+    foldToggle_->setActive(foldEnabled_);
+    foldToggle_->onClick = [this]() {
+        foldEnabled_ = !foldEnabled_;
+        foldToggle_->setActive(foldEnabled_);
+        applyFold();
+    };
+    addAndMakeVisible(foldToggle_.get());
+
+    // CC lanes button (opens the drawer + the add-lane menu) — same affordance
+    // as the piano roll so drum clips can add CC / pitchbend lanes.
+    ccLanesBtn_ = std::make_unique<magda::SvgButton>("CCLanes", BinaryData::iconccboldm_svg,
+                                                     BinaryData::iconccboldm_svgSize);
+    ccLanesBtn_->setTooltip("Add CC / pitchbend lane");
+    ccLanesBtn_->setOriginalColor(juce::Colour(0xFFB3B3B3));
+    ccLanesBtn_->onClick = [this]() {
+        // Adding a CC lane opens the drawer on its own (without the velocity
+        // lane) via onLanesChanged.
+        if (midiDrawer_)
+            midiDrawer_->showAddLaneMenu();
+    };
+    addAndMakeVisible(ccLanesBtn_.get());
 
     verticalZoomStrip_ = std::make_unique<VerticalZoomStrip>(MIN_ROW_HEIGHT, MAX_ROW_HEIGHT);
     verticalZoomStrip_->setGestureContext(magda::GestureContext::DrumGrid);
@@ -2379,10 +2414,16 @@ void DrumGridClipContent::resized() {
     // Skip sidebar (painted in paint())
     bounds.removeFromLeft(SIDEBAR_WIDTH);
 
-    // Position sidebar icon at the bottom of the sidebar
+    // Sidebar icons: fold toggle at the top, controls (velocity/CC) at the
+    // bottom — mirrors the piano roll's sidebar layout.
     int iconSize = 22;
     int iconPadding = (SIDEBAR_WIDTH - iconSize) / 2;
+    if (foldToggle_)
+        foldToggle_->setBounds(iconPadding, RULER_HEIGHT + iconPadding, iconSize, iconSize);
     controlsToggle_->setBounds(iconPadding, getHeight() - iconSize - iconPadding, iconSize,
+                               iconSize);
+    if (ccLanesBtn_)
+        ccLanesBtn_->setBounds(iconPadding, getHeight() - 2 * (iconSize + iconPadding), iconSize,
                                iconSize);
 
     // MIDI drawer at bottom (if open)
@@ -2728,6 +2769,24 @@ void DrumGridClipContent::drawSidebar(juce::Graphics& g, juce::Rectangle<int> ar
     g.setColour(DarkTheme::getColour(DarkTheme::BORDER));
     g.drawVerticalLine(area.getRight() - 1, static_cast<float>(area.getY()),
                        static_cast<float>(area.getBottom()));
+
+    // Hairline dividers framing the icon clusters, matching the piano roll:
+    // the top tool group (fold) and the bottom lane-toggle group (CC /
+    // velocity). Layout mirrors resized() so the lines sit in the gaps.
+    const int iconSize = 22;
+    const int padding = (SIDEBAR_WIDTH - iconSize) / 2;
+
+    const int topClusterBottom = RULER_HEIGHT + padding + iconSize;
+    const int bottomClusterTop = getHeight() - 2 * (iconSize + padding);
+    const int topDividerY = topClusterBottom + padding / 2;
+    const int bottomDividerY = bottomClusterTop - padding / 2;
+
+    const float x1 = static_cast<float>(area.getX() + 5);
+    const float x2 = static_cast<float>(area.getRight() - 5);
+    if (foldToggle_ && bottomDividerY - topDividerY > padding) {
+        g.drawHorizontalLine(topDividerY, x1, x2);
+        g.drawHorizontalLine(bottomDividerY, x1, x2);
+    }
 }
 
 void DrumGridClipContent::updateVelocityLane() {
@@ -2817,13 +2876,51 @@ juce::String DrumGridClipContent::resolvePadName(int padIndex) const {
     return juce::MidiMessage::getMidiNoteName(noteNumber, true, true, 3);
 }
 
+void DrumGridClipContent::onFoldMapChanged() {
+    // Drum fold works off the pad-row set (not the pitch fold map): rebuild it
+    // with the current fold filter, then re-point and repaint the grid + labels.
+    buildPadRows();
+    if (gridComponent_) {
+        gridComponent_->setPadRows(&padRows_);
+        gridComponent_->refreshNotes();
+        gridComponent_->repaint();
+    }
+    if (rowLabels_) {
+        rowLabels_->setPadRows(&padRows_);
+        rowLabels_->repaint();
+    }
+}
+
+void DrumGridClipContent::recenterOnNotes() {
+    // After a fold toggle the row set changes height; bring the (now top-packed)
+    // used rows into view.
+    if (viewport_)
+        viewport_->setViewPosition(viewport_->getViewPositionX(), 0);
+}
+
+void DrumGridClipContent::updateLaneToggleStates() {
+    if (controlsToggle_)
+        controlsToggle_->setActive(velocityLaneVisible_);
+    if (ccLanesBtn_ && midiDrawer_)
+        ccLanesBtn_->setActive(midiDrawer_->hasExtraLanes());
+}
+
 void DrumGridClipContent::buildPadRows() {
     padRows_.clear();
 
     auto inst = primaryInstanceForClip(editingClipId_);
 
+    // Fold: when enabled, keep only pads that actually have notes in the clip
+    // (hide empty drum lanes). Falls back to the full kit when the clip has no
+    // notes so there's always something to edit.
+    const std::vector<int> usedNotes = foldEnabled_ ? collectUsedPitches() : std::vector<int>{};
+    const bool filterToUsed = foldEnabled_ && !usedNotes.empty();
+
     for (int i = 0; i < numPads_; ++i) {
         int noteNumber = baseNote_ + i;
+        if (filterToUsed &&
+            std::find(usedNotes.begin(), usedNotes.end(), noteNumber) == usedNotes.end())
+            continue;
         bool hasChain = false;
         if (drumGrid_) {
             hasChain = (drumGrid_->getChainForNote(noteNumber) != nullptr);

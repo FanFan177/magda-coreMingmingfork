@@ -18,9 +18,12 @@ class MenuManager : public juce::MenuBarModel, public UndoManagerListener {
         std::function<void()> onCloseProject;
         std::function<void()> onSaveProject;
         std::function<void()> onSaveProjectAs;
+        std::function<void()> onProjectSettings;
         std::function<void()> onCollectFiles;
         std::function<void()> onExportAudio;
         std::function<void()> onExportMidi;
+        std::function<void()> onImportDawProject;
+        std::function<void()> onExportDawProject;
         std::function<void()> onQuit;
         std::function<void(const juce::String&)> onOpenRecentProject;
 
@@ -66,11 +69,15 @@ class MenuManager : public juce::MenuBarModel, public UndoManagerListener {
         std::function<void()> onToggleLoop;
         std::function<void()> onGoToStart;
         std::function<void()> onGoToEnd;
+        std::function<void()> onAddMarker;
+        std::function<void()> onGoToPreviousMarker;
+        std::function<void()> onGoToNextMarker;
 
         // Track menu
         std::function<void()> onAddTrack;
         std::function<void()> onAddGroupTrack;
         std::function<void()> onAddAuxTrack;
+        std::function<void()> onAddChordTrack;
         std::function<void()> onDeleteTrack;
         std::function<void()> onDuplicateTrack;
         std::function<void()> onDuplicateTrackNoContent;
@@ -151,7 +158,10 @@ class MenuManager : public juce::MenuBarModel, public UndoManagerListener {
         SaveProjectAs,
         ExportAudio = 111,
         ExportMidi,
+        ImportDawProject = 113,
+        ExportDawProject,
         CollectFiles = 115,
+        ProjectSettings = 116,
         RecentProjectBase = 150,  // 150-159 reserved for recent projects
         Quit = 199,
 
@@ -198,11 +208,15 @@ class MenuManager : public juce::MenuBarModel, public UndoManagerListener {
         ToggleLoop = 410,
         GoToStart = 420,
         GoToEnd,
+        AddMarker,
+        GoToPreviousMarker,
+        GoToNextMarker,
 
         // Track menu (500-599)
         AddTrack = 500,
         AddGroupTrack,
         AddAuxTrack,
+        AddChordTrack,
         DeleteTrack = 510,
         DuplicateTrack,
         DuplicateTrackNoContent,

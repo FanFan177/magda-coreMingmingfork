@@ -15,7 +15,8 @@ void setVisibleIfPresent(juce::Component* component, bool shouldBeVisible) {
 }
 
 bool isMidiUtility(const DeviceSlotTraits& traits) {
-    return traits.isChordEngine || traits.isArpeggiator || traits.isStepSequencer;
+    return traits.isChordEngine || traits.isArpeggiator || traits.isStepSequencer ||
+           traits.isPolyStepSequencer;
 }
 
 void layoutPluginPresetButton(juce::Rectangle<int> secondHeaderArea, const DeviceSlotTraits& traits,
@@ -43,6 +44,7 @@ void layoutMeterStrip(juce::Rectangle<int>& contentArea, const DeviceSlotTraits&
         setVisibleIfPresent(controls.levelMeter, false);
         setVisibleIfPresent(controls.midiNoteStrip, false);
         setVisibleIfPresent(controls.gainSlider, false);
+        setVisibleIfPresent(controls.mixKnob, false);
         return;
     }
 
@@ -72,9 +74,11 @@ void layoutMeterStrip(juce::Rectangle<int>& contentArea, const DeviceSlotTraits&
     }
 
     if (controls.gainSlider != nullptr) {
-        // Analysis devices (oscilloscope / spectrum) are transparent passthroughs:
-        // no volume control. The level meter still shows.
-        if (traits.isAnalysis) {
+        // Analysis devices (oscilloscope / spectrum) are transparent passthroughs
+        // and MIDI utilities emit no audio: neither has a volume control. (The
+        // level meter still shows on analysis; MIDI utilities show the note
+        // strip instead.)
+        if (traits.isAnalysis || usesNoteStrip) {
             controls.gainSlider->setVisible(false);
         } else {
             controls.gainSlider->setBounds(stripBounds);
@@ -82,6 +86,10 @@ void layoutMeterStrip(juce::Rectangle<int>& contentArea, const DeviceSlotTraits&
             controls.gainSlider->toFront(false);
         }
     }
+
+    // No wet/dry mix on MIDI utilities — they have no audio to blend.
+    if (usesNoteStrip)
+        setVisibleIfPresent(controls.mixKnob, false);
 }
 
 void hideBodyControls(DeviceSlotContentFrameControls controls, bool collapsed) {
@@ -98,9 +106,10 @@ void showExpandedHeaderControls(const DeviceSlotTraits& traits, const magda::Dev
                                 bool internalDevice, DeviceSlotContentFrameControls controls) {
     setVisibleIfPresent(controls.modButton,
                         drum_grid_slot::shouldShowModButton(traits.isDrumGrid, device.deviceType));
-    setVisibleIfPresent(controls.macroButton, drum_grid_slot::shouldShowMacroButton(
-                                                  traits.isDrumGrid, device.deviceType,
-                                                  traits.isArpeggiator, traits.isStepSequencer));
+    setVisibleIfPresent(controls.macroButton,
+                        drum_grid_slot::shouldShowMacroButton(
+                            traits.isDrumGrid, device.deviceType, traits.isArpeggiator,
+                            traits.isStepSequencer || traits.isPolyStepSequencer));
     setVisibleIfPresent(controls.uiButton, !internalDevice || traits.isAnalysis);
     setVisibleIfPresent(controls.powerButton, true);
     setVisibleIfPresent(controls.gainLabel, !isMidiUtility(traits) && !traits.isAnalysis);
@@ -149,7 +158,14 @@ bool prepareDeviceSlotContentFrame(juce::Rectangle<int>& contentArea,
             setVisibleIfPresent(controls.pluginPresetsButton, false);
         }
 
-        layoutMeterStrip(contentArea, traits, controls, meterStripWidth);
+        // MIDI devices emit no audio, so they get no peak meter / gain fader /
+        // wet-dry mix. Note-strip utilities keep the strip for their MIDI
+        // activity display (gain + mix hidden inside layoutMeterStrip); any other
+        // MIDI device drops the strip entirely so the body uses the full width.
+        const bool isMidiDevice = device.deviceType == magda::DeviceType::MIDI;
+        const int effectiveMeterWidth =
+            (isMidiDevice && !isMidiUtility(traits)) ? 0 : meterStripWidth;
+        layoutMeterStrip(contentArea, traits, controls, effectiveMeterWidth);
     }
 
     contentArea.removeFromBottom(2);

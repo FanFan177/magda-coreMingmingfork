@@ -12,14 +12,17 @@ namespace magda {
  */
 struct LayoutConfig {
     // Timeline area heights
-    int chordRowHeight = 0;         // Chord row disabled (now in piano roll only)
-    int arrangementBarHeight = 18;  // Reduced to give more space for time labels
-    int timeRulerHeight = 52;       // Increased to accommodate labels
+    int chordRowHeight = 0;        // Chord row disabled (now in piano roll only)
+    int markerLaneHeight = 24;     // Named timeline markers above the existing ruler
+    int arrangementBarHeight = 0;  // Arrangement sections disabled in the compact ruler
+    int timeRulerHeight = 60;      // Full compact ruler height
 
     // Time ruler details
     int rulerMajorTickHeight = 14;              // Shortened to avoid overlap with loop markers
     int rulerMinorTickHeight = 6;               // Shortened to avoid overlap with loop markers
-    static constexpr int loopStripHeight = 12;  // Loop region strip above tick area
+    static constexpr int loopStripHeight = 12;  // Loop row (loop region strip)
+    int secondsRowHeight = 11;                  // Seconds row (when shown)
+    int playheadRowHeight = 12;                 // Bottom row: just tall enough for the triangle
     int rulerLabelFontSize = 11;
     int rulerLabelTopMargin = 10;  // Space between separator line and time labels
 
@@ -40,6 +43,10 @@ struct LayoutConfig {
 
     // Computed total timeline height
     int getTimelineHeight() const {
+        return markerLaneHeight + getTimelineBodyHeight();
+    }
+
+    int getTimelineBodyHeight() const {
         return chordRowHeight + arrangementBarHeight + timeRulerHeight;
     }
 
@@ -59,7 +66,12 @@ struct LayoutConfig {
     int panelPadding = 8;
 
     // Timeline content left padding - shared across timeline, track content, automation lanes
-    static constexpr int TIMELINE_LEFT_PADDING = 7;
+    static constexpr int TIMELINE_LEFT_PADDING = 8;
+
+    // Left padding for the MIDI/drum grid bodies + their ruler, sized so the
+    // playhead triangle (6px half-width) at bar 1 clears the left column. Single
+    // source for both the piano-roll and drum-grid editors so they can't drift.
+    static constexpr int MIDI_GRID_LEFT_PADDING = 8;
 
     // Zoom controls
     int zoomButtonSize = 24;
@@ -98,6 +110,7 @@ struct LayoutConfig {
         juce::String info;
         info << "=== LayoutConfig ===\n";
         info << "Timeline Total: " << getTimelineHeight() << "px\n";
+        info << "  markerLaneHeight: " << markerLaneHeight << "\n";
         info << "  chordRowHeight: " << chordRowHeight << "\n";
         info << "  arrangementBarHeight: " << arrangementBarHeight << "\n";
         info << "  timeRulerHeight: " << timeRulerHeight << "\n";

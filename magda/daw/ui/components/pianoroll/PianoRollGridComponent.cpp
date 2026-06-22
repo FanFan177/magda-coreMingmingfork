@@ -3,6 +3,7 @@
 #include <juce_audio_formats/juce_audio_formats.h>
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 
 #include "../../state/TimelineController.hpp"
@@ -12,9 +13,11 @@
 #include "../../utils/SelectionPolicy.hpp"
 #include "../../windows/CommandIDs.hpp"
 #include "PhaseMarker.hpp"
+#include "PitchFoldMap.hpp"
 #include "core/ChordAnnotationCommands.hpp"
 #include "core/ClipManager.hpp"
 #include "core/GestureRouter.hpp"
+#include "core/MidiChordMarkers.hpp"
 #include "core/MidiNoteCommands.hpp"
 #include "core/SelectionManager.hpp"
 #include "core/TrackManager.hpp"
@@ -23,6 +26,11 @@
 namespace magda {
 
 namespace {
+// Clip start/end boundary marker (the vertical edge + soft fade where the
+// editable clip region begins/ends). A muted slate reads as a frame edge that
+// sits in the dark grid instead of glaring like the old near-white grey.
+constexpr juce::uint32 kClipBoundaryColour = 0xFF6A7280;
+
 double timelineStartBeats(const ClipInfo& clip, double bpm) {
     return clip.getStartBeats(bpm);
 }
@@ -33,6 +41,49 @@ double timelineLengthBeats(const ClipInfo& clip, double bpm) {
 
 double timelineEndBeats(const ClipInfo& clip, double bpm) {
     return clip.getEndBeats(bpm);
+}
+
+double effectiveLoopStartBeats(const ClipInfo& clip, double bpm) {
+    if (clip.loopStartBeats > 0.0)
+        return clip.loopStartBeats;
+
+    if (clip.loopStart > 0.0 && bpm > 0.0)
+        return clip.loopStart * bpm / 60.0;
+
+    return 0.0;
+}
+
+double effectiveLoopLengthBeats(const ClipInfo& clip, double bpm) {
+    if (clip.loopLengthBeats > 0.0)
+        return clip.loopLengthBeats;
+
+    if (clip.loopLength > 0.0 && bpm > 0.0)
+        return clip.loopLength * bpm / 60.0;
+
+    return timelineLengthBeats(clip, bpm);
+}
+
+// Grid clicks use the same relative-loop contract as the ruler: display beat is
+// loop phase, and the global target stays in the current playhead cycle.
+double globalBeatForRelativeLoopClick(double displayBeat, double currentGlobalBeat,
+                                      const ClipInfo& clip, double bpm) {
+    const double clipStart = timelineStartBeats(clip, bpm);
+    const double loopStart = effectiveLoopStartBeats(clip, bpm);
+    const double loopLength = effectiveLoopLengthBeats(clip, bpm);
+    const double phase = wrapPhase(displayBeat - loopStart, loopLength);
+    const double currentElapsed = currentGlobalBeat - clipStart;
+    const double cycle =
+        currentElapsed >= loopStart ? std::floor((currentElapsed - loopStart) / loopLength) : 0.0;
+
+    double target = clipStart + loopStart + cycle * loopLength + phase;
+
+    const double clipEnd = timelineEndBeats(clip, bpm);
+    while (target < clipStart)
+        target += loopLength;
+    while (target > clipEnd)
+        target -= loopLength;
+
+    return juce::jlimit(clipStart, clipEnd, target);
 }
 }  // namespace
 
@@ -121,12 +172,7 @@ void PianoRollGridComponent::paint(juce::Graphics& g) {
         // Clip start boundary
         int clipStartX = beatToPixel(clipStartBeats_);
         if (clipStartX >= 0 && clipStartX <= bounds.getRight()) {
-            juce::ColourGradient grad(juce::Colour(0xFFAAAAAA), clipStartX - 1.0f, 0.0f,
-                                      juce::Colour(0xFFAAAAAA).withAlpha(0.0f), clipStartX - 6.0f,
-                                      0.0f, false);
-            g.setGradientFill(grad);
-            g.fillRect(clipStartX - 6, 0, 6, bounds.getHeight());
-            g.setColour(juce::Colour(0xFFAAAAAA));
+            g.setColour(juce::Colour(kClipBoundaryColour));
             g.fillRect(clipStartX - 1, 0, 2, bounds.getHeight());
         }
 
@@ -141,13 +187,8 @@ void PianoRollGridComponent::paint(juce::Graphics& g) {
         if (!loopEnabled_) {
             int clipEndX = beatToPixel(clipStartBeats_ + clipLengthBeats_);
             if (clipEndX >= 0 && clipEndX <= bounds.getRight()) {
-                juce::ColourGradient grad(juce::Colour(0xFFAAAAAA), clipEndX + 1.0f, 0.0f,
-                                          juce::Colour(0xFFAAAAAA).withAlpha(0.0f), clipEndX + 6.0f,
-                                          0.0f, false);
-                g.setGradientFill(grad);
-                g.fillRect(clipEndX + 1, 0, 6, bounds.getHeight());
-                g.setColour(juce::Colour(0xFFAAAAAA));
-                g.fillRect(clipEndX - 1, 0, 3, bounds.getHeight());
+                g.setColour(juce::Colour(kClipBoundaryColour));
+                g.fillRect(clipEndX - 1, 0, 2, bounds.getHeight());
             }
 
             if (clipEndX < bounds.getRight()) {
@@ -161,13 +202,8 @@ void PianoRollGridComponent::paint(juce::Graphics& g) {
         if (!loopEnabled_) {
             int clipEndX = beatToPixel(clipLengthBeats_);
             if (clipEndX >= 0 && clipEndX <= bounds.getRight()) {
-                juce::ColourGradient grad(juce::Colour(0xFFAAAAAA), clipEndX + 1.0f, 0.0f,
-                                          juce::Colour(0xFFAAAAAA).withAlpha(0.0f), clipEndX + 6.0f,
-                                          0.0f, false);
-                g.setGradientFill(grad);
-                g.fillRect(clipEndX + 1, 0, 6, bounds.getHeight());
-                g.setColour(juce::Colour(0xFFAAAAAA));
-                g.fillRect(clipEndX - 1, 0, 3, bounds.getHeight());
+                g.setColour(juce::Colour(kClipBoundaryColour));
+                g.fillRect(clipEndX - 1, 0, 2, bounds.getHeight());
             }
 
             if (clipEndX < bounds.getRight()) {
@@ -308,34 +344,11 @@ void PianoRollGridComponent::paint(juce::Graphics& g) {
     }
 
     // Draw playhead line if playing
-    if (playheadPosition_ >= 0.0 && clipLengthBeats_ > 0.0) {
-        // Convert seconds to beats
-        double tempo = 120.0;
-        if (auto* controller = TimelineController::getCurrent()) {
-            tempo = controller->getState().tempo.bpm;
-        }
-        double secondsPerBeat = 60.0 / tempo;
-        double playheadBeats = playheadPosition_ / secondsPerBeat;
-
-        // Only draw when playhead falls within the clip's time range
-        double relBeat = playheadBeats - clipStartBeats_;
-        if (relBeat >= 0.0 && relBeat <= clipLengthBeats_) {
-            double displayBeat = relativeMode_ ? (playheadBeats - clipStartBeats_) : playheadBeats;
-
-            // Wrap playhead within loop region when looping is enabled
-            if (loopEnabled_ && loopLengthBeats_ > 0.0) {
-                double beatPos = relativeMode_ ? displayBeat : (displayBeat - clipStartBeats_);
-                beatPos = std::fmod(beatPos, loopLengthBeats_);
-                if (beatPos < 0.0)
-                    beatPos += loopLengthBeats_;
-                displayBeat = relativeMode_ ? beatPos : (clipStartBeats_ + beatPos);
-            }
-
-            int playheadX = beatToPixel(displayBeat);
-            if (playheadX >= 0 && playheadX <= bounds.getRight()) {
-                g.setColour(juce::Colour(0xFFFF4444));
-                g.fillRect(playheadX - 1, 0, 2, bounds.getHeight());
-            }
+    {
+        int playheadX = 0;
+        if (getPlayheadDisplayX(playheadX) && playheadX >= 0 && playheadX <= bounds.getRight()) {
+            g.setColour(DarkTheme::getColour(DarkTheme::ACCENT_BLUE));
+            g.fillRect(playheadX - 1, 0, 2, bounds.getHeight());
         }
     }
 
@@ -354,7 +367,52 @@ void PianoRollGridComponent::setOverlayTracks(std::vector<TrackId> trackIds) {
     repaint();
 }
 
+void PianoRollGridComponent::setOverlayNotes(std::vector<MidiNote> notes, juce::Colour colour) {
+    overlayNotes_ = std::move(notes);
+    overlayNotesColour_ = colour;
+    repaint();
+}
+
+void PianoRollGridComponent::clearOverlayNotes() {
+    if (overlayNotes_.empty())
+        return;
+    overlayNotes_.clear();
+    repaint();
+}
+
+void PianoRollGridComponent::paintOverlayNoteSet(juce::Graphics& g) {
+    if (overlayNotes_.empty())
+        return;
+    const auto visibleArea = g.getClipBounds();
+    for (const auto& note : overlayNotes_) {
+        // Comp-take notes are relative to the clip; place them like the active
+        // notes (content-relative beats, shifted by clipStartBeats_ in absolute
+        // mode).
+        const double displayBeat =
+            relativeMode_ ? note.startBeat : (clipStartBeats_ + note.startBeat);
+        const int x = beatToPixel(displayBeat);
+        const int w = juce::jmax(4, static_cast<int>(note.lengthBeats * pixelsPerBeat_));
+        if (x + w < visibleArea.getX() || x > visibleArea.getRight())
+            continue;
+        if (foldMap_ && foldMap_->isActive() &&
+            foldMap_->noteForRow(foldMap_->rowForNote(note.noteNumber)) != note.noteNumber)
+            continue;
+        const int y = noteNumberToY(note.noteNumber);
+        if (y + noteHeight_ < visibleArea.getY() || y > visibleArea.getBottom())
+            continue;
+        const auto rect =
+            juce::Rectangle<float>(static_cast<float>(x), static_cast<float>(y + 1),
+                                   static_cast<float>(w), static_cast<float>(noteHeight_ - 2));
+        g.setColour(overlayNotesColour_.withAlpha(0.22f));
+        g.fillRoundedRectangle(rect, 2.0f);
+        g.setColour(overlayNotesColour_.withAlpha(0.5f));
+        g.drawRoundedRectangle(rect, 2.0f, 1.0f);
+    }
+}
+
 void PianoRollGridComponent::paintOverlayNotes(juce::Graphics& g) {
+    paintOverlayNoteSet(g);
+
     if (overlayTrackIds_.empty())
         return;
 
@@ -391,6 +449,13 @@ void PianoRollGridComponent::paintOverlayNotes(juce::Graphics& g) {
                 if (!ClipOperations::clipMidiNoteToVisibleRange(*clip, note))
                     continue;
 
+                // When folded the axis only has rows for the edited clip's own
+                // pitches; ghost notes on other pitches have no row, so hide
+                // them rather than snapping them onto an unrelated row.
+                if (foldMap_ && foldMap_->isActive() &&
+                    foldMap_->noteForRow(foldMap_->rowForNote(note.noteNumber)) != note.noteNumber)
+                    continue;
+
                 const double displayBeat = clipOffsetBeats + note.startBeat - visibleStart;
                 const int x = beatToPixel(displayBeat);
                 const int w = juce::jmax(4, static_cast<int>(note.lengthBeats * pixelsPerBeat_));
@@ -424,16 +489,18 @@ void PianoRollGridComponent::paintGrid(juce::Graphics& g, juce::Rectangle<int> a
     // The grid area starts after left padding
     auto gridArea = area.withTrimmedLeft(leftPadding_);
 
-    // Draw row backgrounds - alternate for black/white keys (only in grid area)
-    for (int note = MIN_NOTE; note <= MAX_NOTE; note++) {
-        int y = noteNumberToY(note);
+    // Draw row backgrounds - alternate for black/white keys (only in grid area).
+    // Iterate rows (not pitches) so folded mode draws exactly the visible rows.
+    const int rows = foldRowCount();
+    for (int row = 0; row < rows; row++) {
+        int y = row * noteHeight_;
 
         if (y + noteHeight_ < area.getY() || y > area.getBottom()) {
             continue;
         }
 
         // Black key rows are darker
-        if (isBlackKey(note)) {
+        if (isBlackKey(noteForRow(row))) {
             g.setColour(juce::Colour(0xFF2a2a2a));
             g.fillRect(gridArea.getX(), y, gridArea.getWidth(), noteHeight_);
         }
@@ -455,11 +522,11 @@ void PianoRollGridComponent::paintGrid(juce::Graphics& g, juce::Rectangle<int> a
         g.fillRect(area.getX(), area.getY(), leftPadding_, area.getHeight());
     }
 
-    // Draw horizontal grid lines at each note boundary (at bottom of each row, -1 to match
+    // Draw horizontal grid lines at each row boundary (at bottom of each row, -1 to match
     // keyboard)
     g.setColour(juce::Colour(0xFF505050));
-    for (int note = MIN_NOTE; note <= MAX_NOTE; note++) {
-        int y = noteNumberToY(note) + noteHeight_ - 1;
+    for (int row = 0; row < rows; row++) {
+        int y = row * noteHeight_ + noteHeight_ - 1;
         if (y >= area.getY() && y <= area.getBottom()) {
             g.drawHorizontalLine(y, static_cast<float>(gridArea.getX()),
                                  static_cast<float>(area.getRight()));
@@ -552,6 +619,7 @@ void PianoRollGridComponent::mouseDown(const juce::MouseEvent& e) {
     }
 
     isEditCursorClick_ = false;
+    isPendingPlayheadClick_ = false;
 
     // Right-click context menu
     if (e.mods.isPopupMenu()) {
@@ -688,6 +756,9 @@ void PianoRollGridComponent::mouseDown(const juce::MouseEvent& e) {
     dragSelectStart_ = e.getPosition();
     dragSelectEnd_ = e.getPosition();
     isDragSelecting_ = false;
+    isPendingPlayheadClick_ =
+        !e.mods.isShiftDown() && !e.mods.isCommandDown() && !e.mods.isAltDown();
+    playheadClickStart_ = e.getPosition();
 }
 
 void PianoRollGridComponent::mouseDrag(const juce::MouseEvent& e) {
@@ -705,6 +776,12 @@ void PianoRollGridComponent::mouseDrag(const juce::MouseEvent& e) {
         return;
     }
 
+    const int deltaX = std::abs(e.x - playheadClickStart_.x);
+    const int deltaY = std::abs(e.y - playheadClickStart_.y);
+    if (juce::jmax(deltaX, deltaY) <= PLAYHEAD_CLICK_DRAG_THRESHOLD)
+        return;
+
+    isPendingPlayheadClick_ = false;
     isDragSelecting_ = true;
     dragSelectEnd_ = e.getPosition();
     setMouseCursor(juce::MouseCursor::CrosshairCursor);
@@ -731,6 +808,7 @@ void PianoRollGridComponent::mouseUp(const juce::MouseEvent& e) {
         if (onNoteAdded && clipId != INVALID_CLIP_ID) {
             const auto* clip = ClipManager::getInstance().getClip(clipId);
             if (clip && ClipOperations::clipMidiNoteToVisibleRange(*clip, note)) {
+                rememberAddedNoteLength(note.lengthBeats);
                 onNoteAdded(clipId, note.startBeat, note.noteNumber, note.lengthBeats,
                             defaultNoteVelocity_);
             }
@@ -766,6 +844,17 @@ void PianoRollGridComponent::mouseUp(const juce::MouseEvent& e) {
         }
         return;
     }
+
+    if (isPendingPlayheadClick_ && e.getNumberOfClicks() == 1) {
+        const int deltaX = std::abs(e.x - playheadClickStart_.x);
+        const int deltaY = std::abs(e.y - playheadClickStart_.y);
+        if (juce::jmax(deltaX, deltaY) <= PLAYHEAD_CLICK_DRAG_THRESHOLD) {
+            if (onPlayheadPositionBeatsChanged)
+                onPlayheadPositionBeatsChanged(
+                    absolutePlayheadBeatForDisplayX(playheadClickStart_.x));
+        }
+    }
+    isPendingPlayheadClick_ = false;
 
     if (isDragSelecting_) {
         // Build normalized selection rectangle
@@ -870,6 +959,7 @@ void PianoRollGridComponent::mouseMove(const juce::MouseEvent& e) {
 
 void PianoRollGridComponent::mouseExit(const juce::MouseEvent& /*e*/) {
     setMouseCursor(juce::MouseCursor::NormalCursor);
+    isPendingPlayheadClick_ = false;
     if (nearPhaseMarker_) {
         nearPhaseMarker_ = false;
         repaint();
@@ -909,6 +999,7 @@ void PianoRollGridComponent::mouseDoubleClick(const juce::MouseEvent& e) {
             return;
         }
 
+        rememberAddedNoteLength(previewNote.lengthBeats);
         onNoteAdded(insertPos->clipId, previewNote.startBeat, previewNote.noteNumber,
                     previewNote.lengthBeats, defaultNoteVelocity_);
     }
@@ -1162,14 +1253,24 @@ void PianoRollGridComponent::setGridResolutionBeats(double beats) {
 }
 
 double PianoRollGridComponent::getDefaultNoteLengthBeats() const {
+    if (rememberLastNoteLength_ && lastAddedNoteLengthBeats_ > 0.0)
+        return lastAddedNoteLengthBeats_;
     if (defaultNoteLengthBeats_ > 0.0)
         return defaultNoteLengthBeats_;
     return juce::jmax(1.0 / 16.0, gridResolutionBeats_);
 }
 
+void PianoRollGridComponent::rememberAddedNoteLength(double lengthBeats) {
+    if (lengthBeats > 0.0)
+        lastAddedNoteLengthBeats_ = lengthBeats;
+}
+
 void PianoRollGridComponent::addDefaultNoteMenuItems(juce::PopupMenu& menu) const {
     juce::PopupMenu lengthMenu;
-    lengthMenu.addItem(100, "Current Grid", true, defaultNoteLengthBeats_ <= 0.0);
+    lengthMenu.addItem(100, "Current Grid", true,
+                       !rememberLastNoteLength_ && defaultNoteLengthBeats_ <= 0.0);
+    lengthMenu.addItem(108, "Remember Note Lengths", true, rememberLastNoteLength_);
+    lengthMenu.addSeparator();
 
     struct LengthOption {
         int id;
@@ -1181,7 +1282,8 @@ void PianoRollGridComponent::addDefaultNoteMenuItems(juce::PopupMenu& menu) cons
         {105, "1/16", 0.25}, {106, "1/32", 0.125}, {107, "1/8T", 1.0 / 3.0}};
     for (const auto& option : lengths)
         lengthMenu.addItem(option.id, option.name, true,
-                           std::abs(defaultNoteLengthBeats_ - option.beats) < 0.000001);
+                           !rememberLastNoteLength_ &&
+                               std::abs(defaultNoteLengthBeats_ - option.beats) < 0.000001);
     menu.addSubMenu("Default Length", lengthMenu);
 
     juce::PopupMenu velocityMenu;
@@ -1195,6 +1297,12 @@ void PianoRollGridComponent::addDefaultNoteMenuItems(juce::PopupMenu& menu) cons
 bool PianoRollGridComponent::handleDefaultNoteMenuResult(int result) {
     if (result == 100) {
         defaultNoteLengthBeats_ = 0.0;
+        rememberLastNoteLength_ = false;
+        return true;
+    }
+
+    if (result == 108) {
+        rememberLastNoteLength_ = !rememberLastNoteLength_;
         return true;
     }
 
@@ -1207,6 +1315,7 @@ bool PianoRollGridComponent::handleDefaultNoteMenuResult(int result) {
     for (const auto& option : lengths) {
         if (result == option.id) {
             defaultNoteLengthBeats_ = option.beats;
+            rememberLastNoteLength_ = false;
             return true;
         }
     }
@@ -1283,13 +1392,39 @@ void PianoRollGridComponent::setTimelineLengthBeats(double lengthBeats) {
     }
 }
 
+void PianoRollGridComponent::setFoldMap(const PitchFoldMap* map) {
+    if (foldMap_ == map)
+        return;
+    foldMap_ = map;
+    updateNoteComponentBounds();
+    repaint();
+}
+
+int PianoRollGridComponent::foldRowCount() const {
+    return foldMap_ ? foldMap_->rowCount() : NOTE_COUNT;
+}
+
+int PianoRollGridComponent::noteForRow(int row) const {
+    return foldMap_ ? foldMap_->noteForRow(row) : (MAX_NOTE - row);
+}
+
 int PianoRollGridComponent::noteNumberToY(int noteNumber) const {
-    return (MAX_NOTE - noteNumber) * noteHeight_;
+    const int row = foldMap_ ? foldMap_->rowForNote(noteNumber) : (MAX_NOTE - noteNumber);
+    return row * noteHeight_;
 }
 
 int PianoRollGridComponent::yToNoteNumber(int y) const {
-    int note = MAX_NOTE - (y / noteHeight_);
-    return juce::jlimit(MIN_NOTE, MAX_NOTE, note);
+    int row = juce::jlimit(0, foldRowCount() - 1, y / noteHeight_);
+    return juce::jlimit(MIN_NOTE, MAX_NOTE, noteForRow(row));
+}
+
+int PianoRollGridComponent::noteNumberByRowDelta(int startNote, int rowsUp) const {
+    // Rows increase downward, pitch increases upward — moving `rowsUp` rows up
+    // means decreasing the row index by that many.
+    if (!foldMap_)
+        return juce::jlimit(MIN_NOTE, MAX_NOTE, startNote + rowsUp);
+    const int targetRow = foldMap_->rowForNote(startNote) - rowsUp;
+    return juce::jlimit(MIN_NOTE, MAX_NOTE, noteForRow(targetRow));
 }
 
 void PianoRollGridComponent::updateNotePosition(NoteComponent* note, double beat, int noteNumber,
@@ -1827,13 +1962,42 @@ double PianoRollGridComponent::clipBeatForDisplayX(ClipId clipId, int mouseX) co
     return clipBeat;
 }
 
+double PianoRollGridComponent::absolutePlayheadBeatForDisplayX(int mouseX) const {
+    double beat = pixelToBeat(mouseX);
+    if (snapEnabled_)
+        beat = snapBeatToGrid(beat);
+
+    if (relativeMode_) {
+        const auto* clip =
+            clipId_ != INVALID_CLIP_ID ? ClipManager::getInstance().getClip(clipId_) : nullptr;
+
+        if (clip && clip->loopEnabled) {
+            double bpm = 120.0;
+            double currentGlobalBeat = 0.0;
+            if (auto* controller = TimelineController::getCurrent()) {
+                const auto& state = controller->getState();
+                bpm = state.tempo.bpm > 0.0 ? state.tempo.bpm : bpm;
+                currentGlobalBeat = state.playhead.getCurrentPositionBeats();
+            }
+
+            const double loopLength = effectiveLoopLengthBeats(*clip, bpm);
+            if (loopLength > 0.0)
+                return globalBeatForRelativeLoopClick(beat, currentGlobalBeat, *clip, bpm);
+        }
+
+        return juce::jmax(0.0, beat + clipStartBeats_);
+    }
+
+    return juce::jlimit(0.0, timelineLengthBeats_, beat);
+}
+
 void PianoRollGridComponent::updateEmptyGridCursor(const juce::ModifierKeys& mods, int mouseX) {
     if (mods.isAltDown() && isNearGridLine(mouseX)) {
         setMouseCursor(juce::MouseCursor::IBeamCursor);
     } else if (mods.isShiftDown()) {
         setMouseCursor(CursorManager::getInstance().getNoteDrawCursor());
     } else {
-        setMouseCursor(juce::MouseCursor::NormalCursor);
+        setMouseCursor(juce::MouseCursor::IBeamCursor);
     }
 }
 
@@ -2306,12 +2470,16 @@ juce::Colour PianoRollGridComponent::getColourForClip(ClipId clipId) const {
         return juce::Colours::grey;
     }
 
-    // Use clip's color, but slightly desaturated for multi-clip view
-    if (clipIds_.size() == 1) {
-        return clip->colour;
-    } else {
-        return clip->colour.withSaturation(0.7f);
-    }
+    // Chord clips follow the chord track's colour live (rather than the colour
+    // snapshotted onto clip->colour at creation), so their notes match the
+    // chord-lane blocks even after the track colour changes.
+    juce::Colour base = clip->colour;
+    if (const auto* track = TrackManager::getInstance().getTrack(clip->trackId);
+        track != nullptr && track->type == TrackType::Chord)
+        base = track->colour;
+
+    // Use the colour as-is, but slightly desaturated for multi-clip view
+    return clipIds_.size() == 1 ? base : base.withSaturation(0.7f);
 }
 
 bool PianoRollGridComponent::isClipSelected(ClipId clipId) const {
@@ -2337,6 +2505,37 @@ void PianoRollGridComponent::setPlayheadPosition(double positionSeconds) {
         playheadPosition_ = positionSeconds;
         repaint();
     }
+}
+
+bool PianoRollGridComponent::getPlayheadDisplayX(int& gridLocalX) const {
+    if (playheadPosition_ < 0.0 || clipLengthBeats_ <= 0.0)
+        return false;
+
+    // Convert seconds to beats
+    double tempo = 120.0;
+    if (auto* controller = TimelineController::getCurrent())
+        tempo = controller->getState().tempo.bpm;
+    double secondsPerBeat = 60.0 / tempo;
+    double playheadBeats = playheadPosition_ / secondsPerBeat;
+
+    // Only visible when the playhead falls within the clip's time range
+    double relBeat = playheadBeats - clipStartBeats_;
+    if (relBeat < 0.0 || relBeat > clipLengthBeats_)
+        return false;
+
+    double displayBeat = relativeMode_ ? (playheadBeats - clipStartBeats_) : playheadBeats;
+
+    // Wrap playhead within loop region when looping is enabled
+    if (loopEnabled_ && loopLengthBeats_ > 0.0) {
+        double beatPos = relativeMode_ ? displayBeat : (displayBeat - clipStartBeats_);
+        beatPos = std::fmod(beatPos, loopLengthBeats_);
+        if (beatPos < 0.0)
+            beatPos += loopLengthBeats_;
+        displayBeat = relativeMode_ ? beatPos : (clipStartBeats_ + beatPos);
+    }
+
+    gridLocalX = beatToPixel(displayBeat);
+    return true;
 }
 
 void PianoRollGridComponent::setEditCursorPosition(double positionSeconds, bool blinkVisible) {
@@ -2461,13 +2660,9 @@ void PianoRollGridComponent::filesDropped(const juce::StringArray& files, int x,
     if (ticksPerQN <= 0)
         return;
 
-    // Extract chord markers (MIDI marker meta events type 6, format "CHORD:name:length")
-    struct ChordMarker {
-        double beatPosition = 0.0;
-        double lengthBeats = 4.0;
-        juce::String chordName;
-    };
-    std::vector<ChordMarker> chordMarkers;
+    // Extract embedded chord markers (the reverse of MidiFileWriter's marker
+    // writing). Parsed up front; note linkage to each chord happens below.
+    const auto chordMarkers = magda::daw::readChordMarkers(midi);
 
     // Extract full note data (with timing) and simple note list
     struct NoteData {
@@ -2485,24 +2680,6 @@ void PianoRollGridComponent::filesDropped(const juce::StringArray& files, int x,
             continue;
         for (int i = 0; i < track->getNumEvents(); ++i) {
             auto& msg = track->getEventPointer(i)->message;
-            if (msg.isTextMetaEvent() && msg.getMetaEventType() == 6) {
-                auto text = msg.getTextFromTextMetaEvent();
-                if (text.startsWith("CHORD:")) {
-                    auto parts = juce::StringArray::fromTokens(text.substring(6), ":", "");
-                    if (parts.size() >= 2) {
-                        ChordMarker marker;
-                        marker.beatPosition = msg.getTimeStamp() / ticksPerQN;
-                        // Last token is length; everything before is the chord name
-                        // (chord names can contain colons, e.g. "C:maj7")
-                        marker.lengthBeats = parts[parts.size() - 1].getDoubleValue();
-                        parts.remove(parts.size() - 1);
-                        marker.chordName = parts.joinIntoString(":");
-                        if (marker.lengthBeats <= 0.0)
-                            marker.lengthBeats = 4.0;
-                        chordMarkers.push_back(marker);
-                    }
-                }
-            }
             if (msg.isNoteOn()) {
                 simpleNotes.emplace_back(msg.getNoteNumber(), msg.getVelocity());
 
@@ -2610,9 +2787,11 @@ void PianoRollGridComponent::confirmPendingChord(double endBeat) {
     if (length < gridResolutionBeats_)
         length = gridResolutionBeats_;
 
-    if (onChordDropped)
+    if (onChordDropped) {
+        rememberAddedNoteLength(length);
         onChordDropped(pendingChord_.clipId, pendingChord_.startBeat, length,
                        std::move(pendingChord_.notes), pendingChord_.chordName);
+    }
 
     cancelPendingChord();
 }

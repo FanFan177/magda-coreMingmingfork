@@ -3,6 +3,7 @@
 #include <cmath>
 
 #include "audio/plugins/compiled/MagdaUtilityCompiledPlugin.hpp"
+#include "ui/components/mixer/LevelMeter.hpp"
 #include "ui/themes/DarkTheme.hpp"
 #include "ui/themes/SmallButtonLookAndFeel.hpp"
 
@@ -52,11 +53,14 @@ void styleReadoutLabel(juce::Label& label) {
 CompiledUtilityView::CompiledUtilityView(juce::String /*pluginId*/) {
     using Util = magda::daw::audio::compiled::MagdaUtilityCompiledPlugin;
 
-    const auto fillColour = DarkTheme::getColour(DarkTheme::ACCENT_BLUE).withAlpha(0.2f);
+    const auto fillColour = DarkTheme::getColour(DarkTheme::CONTROL_VALUE_FILL);
 
     gainFader_.setRange(-60.0, 12.0, 0.0);
     gainFader_.setValue(0.0, juce::dontSendNotification);
     gainFader_.setFillColour(fillColour);
+    // Curve the fill to match the level meter's power scale (consistent with the
+    // track and master volume fills).
+    gainFader_.setFillExponent(static_cast<double>(magda::LevelMeter::METER_CURVE_EXPONENT));
     gainFader_.setVertical(true);
     gainFader_.setShowText(false);
     gainFader_.onValueChange = [this]() {
@@ -64,6 +68,10 @@ CompiledUtilityView::CompiledUtilityView(juce::String /*pluginId*/) {
         gainValue_.setText(formatGainDb(v), juce::dontSendNotification);
         writeParameter(Util::kGainSlot, static_cast<float>(v));
     };
+    // Right-click the gain fader gets the exact same menu as any other device
+    // param (link to mod / macro, show automation lane, MIDI learn) by routing
+    // to the overlay link slot that sits on top of the fader.
+    gainFader_.onRightClick = [this]() { gainLinkSlot_.showContextMenu(); };
     addAndMakeVisible(gainFader_);
 
     styleReadoutLabel(gainValue_);
@@ -223,6 +231,15 @@ void CompiledUtilityView::configureLinkSlots() {
 
     configure(gainLinkSlot_, Util::kGainSlot, "Gain", true);
     configure(panLinkSlot_, Util::kPanSlot, "Pan", false);
+
+    gainLinkSlot_.onShowAutomationLane = [this]() {
+        if (onShowAutomationLane)
+            onShowAutomationLane(Util::kGainSlot);
+    };
+    panLinkSlot_.onShowAutomationLane = [this]() {
+        if (onShowAutomationLane)
+            onShowAutomationLane(Util::kPanSlot);
+    };
 }
 
 void CompiledUtilityView::refreshLinkSlotContext() {
@@ -243,6 +260,28 @@ void CompiledUtilityView::refreshLinkSlotContext() {
     apply(panLinkSlot_);
     gainLinkSlot_.refreshLinkModeState();
     panLinkSlot_.refreshLinkModeState();
+
+    // The overlay link slots hide their own valueSlider_ (the part that paints
+    // the "automated" purple tint), so bind the automation target onto the
+    // visible DraggableValueLabels directly so they highlight like the track
+    // volume / pan readouts.
+    auto bindTarget = [this](magda::DraggableValueLabel& label, int slotIndex) {
+        if (!hasLinkContext_) {
+            label.clearAutomationTarget();
+            return;
+        }
+        magda::AutomationTarget target;
+        target.kind = magda::ControlTarget::Kind::PluginParam;
+        target.devicePath = linkContext_.devicePath;
+        target.paramIndex = slotIndex;
+        label.setAutomationTarget(target);
+    };
+    using Util = magda::daw::audio::compiled::MagdaUtilityCompiledPlugin;
+    bindTarget(gainFader_, Util::kGainSlot);
+    bindTarget(panLabel_, Util::kPanSlot);
+    bindTarget(widthLabel_, Util::kWidthSlot);
+    bindTarget(xoverLabel_, Util::kLowMonoFreqSlot);
+
     updateLinkSlotValues();
 }
 

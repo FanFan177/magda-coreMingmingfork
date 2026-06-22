@@ -132,6 +132,12 @@ class AutomationManager : public TrackManagerListener {
     std::vector<AutomationLaneId> getLanesForTrack(TrackId trackId) const;
 
     /**
+     * @brief Get edit-scoped lanes (global targets with no owning track/device,
+     *        e.g. Tempo). These render in a pinned host rather than under a track.
+     */
+    std::vector<AutomationLaneId> getEditScopedLanes() const;
+
+    /**
      * @brief Get lane for a specific target
      * @return INVALID_AUTOMATION_LANE_ID if not found
      */
@@ -302,6 +308,13 @@ class AutomationManager : public TrackManagerListener {
      * @brief Delete all points from an absolute lane
      */
     void clearLanePoints(AutomationLaneId laneId);
+
+    /**
+     * @brief Replace every point on an absolute lane in one shot (fresh ids),
+     *        then notify once. Used by the tempo-lane bridge to mirror
+     *        te::Edit::tempoSequence into the lane without per-point churn.
+     */
+    void replaceLanePoints(AutomationLaneId laneId, const std::vector<AutomationPoint>& points);
 
     /**
      * @brief Delete a point from a clip

@@ -88,6 +88,7 @@ void Config::save() {
     root->setProperty("arrangementScrollbarsAutoHide", arrangementScrollbarsAutoHide);
     root->setProperty("uiScale", uiScale);
     root->setProperty("uiFontScale", uiFontScale);
+    root->setProperty("localizedUIFontScale", localizedUIFontScale);
     root->setProperty("confirmTrackDelete", confirmTrackDelete);
     root->setProperty("showTooltips", showTooltips);
     root->setProperty("autoMonitorSelectedTrack", autoMonitorSelectedTrack);
@@ -220,6 +221,8 @@ void Config::save() {
     root->setProperty("scanPluginsOnStartup", scanPluginsOnStartup);
     root->setProperty("loadModelOnStartup", loadModelOnStartup);
     root->setProperty("stopUpdatesPlayhead", stopUpdatesPlayhead);
+    root->setProperty("followPlayhead", followPlayhead);
+    root->setProperty("chordPreviewOnByDefault", chordPreviewOnByDefault);
 
     // Clip colour mode
     root->setProperty("clipColourMode", clipColourMode);
@@ -395,6 +398,11 @@ void Config::load() {
         getBool("arrangementScrollbarsAutoHide", arrangementScrollbarsAutoHide);
     uiScale = getDouble("uiScale", uiScale);
     setUIFontScale(getDouble("uiFontScale", uiFontScale));
+    localizedUIFontScaleExplicit = obj->hasProperty("localizedUIFontScale");
+    if (localizedUIFontScaleExplicit)
+        setLocalizedUIFontScale(getDouble("localizedUIFontScale", localizedUIFontScale));
+    else
+        localizedUIFontScale = defaultLocalizedUIFontScaleForLanguage(juce::String(language));
     confirmTrackDelete = getBool("confirmTrackDelete", confirmTrackDelete);
     showTooltips = getBool("showTooltips", showTooltips);
     autoMonitorSelectedTrack = getBool("autoMonitorSelectedTrack", autoMonitorSelectedTrack);
@@ -611,6 +619,8 @@ void Config::load() {
     scanPluginsOnStartup = getBool("scanPluginsOnStartup", scanPluginsOnStartup);
     loadModelOnStartup = getBool("loadModelOnStartup", loadModelOnStartup);
     stopUpdatesPlayhead = getBool("stopUpdatesPlayhead", stopUpdatesPlayhead);
+    followPlayhead = getBool("followPlayhead", followPlayhead);
+    chordPreviewOnByDefault = getBool("chordPreviewOnByDefault", chordPreviewOnByDefault);
 
     clipColourMode = getInt("clipColourMode", clipColourMode);
 

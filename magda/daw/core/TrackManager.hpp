@@ -201,6 +201,18 @@ class TrackManager {
     // Track operations
     TrackId createTrack(const juce::String& name = "", TrackType type = TrackType::Audio);
     TrackId createGroupTrack(const juce::String& name = "");
+
+    // Chord track is a strict singleton (TrackType::Chord). It lives in the
+    // normal track list so it gets clip hosting / arrangement rendering for
+    // free, but it is monitor-only: its instrument voices chord previews and it
+    // is excluded from the render/bounce graph. ensureChordTrack() creates it on
+    // first use (idempotent) and returns its id; getChordTrackId() returns the
+    // existing one or INVALID_TRACK_ID.
+    TrackId ensureChordTrack();
+    TrackId getChordTrackId() const;
+    bool hasChordTrack() const {
+        return getChordTrackId() != INVALID_TRACK_ID;
+    }
     TrackId groupTracks(const std::vector<TrackId>& trackIds, const juce::String& name = "Group");
     std::vector<TrackId> ungroupTrack(TrackId groupId);
     void deleteTrack(TrackId trackId);
@@ -274,6 +286,8 @@ class TrackManager {
     void setAllTracksPlaybackMode(TrackPlaybackMode mode);
     bool isAnyTrackInSessionMode() const;
     void setTrackType(TrackId trackId, TrackType type);
+    void setTrackMixerChannelWidth(TrackId trackId, int width);
+    void setTrackMixerFaderTopInset(TrackId trackId, int inset);
 
     // Track routing setters (notify listeners and forward to bridges)
     void setTrackMidiInput(TrackId trackId, const juce::String& deviceId);
@@ -607,9 +621,20 @@ class TrackManager {
     void setModSyncDivision(const ChainNodePath& path, int modIndex, SyncDivision division);
     void setModTriggerMode(const ChainNodePath& path, int modIndex, LFOTriggerMode mode);
     void setModCurvePreset(const ChainNodePath& path, int modIndex, CurvePreset preset);
+    void setModCurveState(const ChainNodePath& path, int modIndex, CurvePreset preset,
+                          const std::vector<CurvePointData>& points);
     void notifyModCurveChanged(const ChainNodePath& path);
     void setModAudioAttack(const ChainNodePath& path, int modIndex, float ms);
     void setModAudioRelease(const ChainNodePath& path, int modIndex, float ms);
+    // Copies the ADSR envelope fields (attack/decay/sustain/release + per-segment
+    // curves) from `src` into the stored mod and re-syncs the TE modifier.
+    void setModEnvelope(const ChainNodePath& path, int modIndex, const ModInfo& src);
+    // Copies the Random distribution fields (type/shape/smooth/stepDepth) from
+    // `src` into the stored mod and re-syncs the TE modifier.
+    void setModRandom(const ChainNodePath& path, int modIndex, const ModInfo& src);
+    // Copies the envelope follower fields (gain/attack/hold/release) from `src`
+    // into the stored mod and re-syncs the TE modifier.
+    void setModFollower(const ChainNodePath& path, int modIndex, const ModInfo& src);
     void removeModLink(const ChainNodePath& path, int modIndex, ControlTarget target);
     void clearAllModLinks(const ChainNodePath& path, int modIndex);
     void setModEnabled(const ChainNodePath& path, int modIndex, bool enabled);
@@ -785,6 +810,18 @@ class TrackManager {
         }
         BatchScope(const BatchScope&) = delete;
         BatchScope& operator=(const BatchScope&) = delete;
+    };
+
+    /// Test-only guard for model assertions that must not drive engine/UI listeners.
+    class ScopedListenerMuteForTests {
+      public:
+        ScopedListenerMuteForTests();
+        ~ScopedListenerMuteForTests();
+        ScopedListenerMuteForTests(const ScopedListenerMuteForTests&) = delete;
+        ScopedListenerMuteForTests& operator=(const ScopedListenerMuteForTests&) = delete;
+
+      private:
+        std::vector<TrackManagerListener*> savedListeners_;
     };
 
   private:

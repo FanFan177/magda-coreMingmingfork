@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "../../themes/MixerLookAndFeel.hpp"
+#include "../automation/AutomationLaneHeader.hpp"
 #include "../common/DraggableValueLabel.hpp"
 #include "../common/SideColumn.hpp"
 #include "../common/SvgButton.hpp"
@@ -141,11 +142,12 @@ class TrackHeadersPanel : public juce::Component,
     struct TrackHeader {
         juce::String name;
         TrackId trackId = INVALID_TRACK_ID;
-        int depth = 0;             // Hierarchy depth for indentation
-        bool isGroup = false;      // Is this a group track?
-        bool isMultiOut = false;   // Is this a multi-out child track?
-        bool isMaster = false;     // Is this the master track?
-        bool isCollapsed = false;  // Is group collapsed?
+        int depth = 0;              // Hierarchy depth for indentation
+        bool isGroup = false;       // Is this a group track?
+        bool isMultiOut = false;    // Is this a multi-out child track?
+        bool isMaster = false;      // Is this the master track?
+        bool isChordTrack = false;  // Is this the singleton chord track?
+        bool isCollapsed = false;   // Is group collapsed?
         bool selected = false;
         bool muted = false;
         bool solo = false;
@@ -167,7 +169,10 @@ class TrackHeadersPanel : public juce::Component,
         std::unique_ptr<juce::TextButton> muteButton;
         // Master-only mute: a speaker toggle matching the inspector/mixer, used
         // in place of the "M" muteButton when isMaster.
-        std::unique_ptr<juce::DrawableButton> masterMuteButton;
+        std::unique_ptr<magda::SvgButton> masterMuteButton;
+        // Chord-track-only: speaker toggle for "preview chords on playback"
+        // (blue = audible, faint grey = silent). Replaces the "M" button.
+        std::unique_ptr<SvgButton> chordAuditionButton;
         std::unique_ptr<juce::TextButton> soloButton;
         std::unique_ptr<juce::TextButton> recordButton;        // Record arm button
         std::unique_ptr<juce::TextButton> monitorButton;       // Input monitor button
@@ -207,18 +212,10 @@ class TrackHeadersPanel : public juce::Component,
     std::vector<TrackId> visibleTrackIds_;  // Track IDs in display order
     std::unordered_map<TrackId, std::vector<AutomationLaneId>> visibleAutomationLanes_;
 
-    // Per-lane header buttons (snap beat grid / snap value / bypass / delete).
-    // All four are custom LaneHeaderButton subclasses defined in the .cpp, but
-    // the struct only needs to hold them as juce::Button base pointers. Real
+    // Per-lane header buttons (snap beat grid / snap value / bypass / delete),
+    // shared with the master automation band via AutomationLaneHeader. Real
     // child components — rebuilt on automationLanesChanged and positioned in
     // updateTrackHeaderLayout.
-    struct AutoLaneHeaderButtons {
-        AutomationLaneId laneId = INVALID_AUTOMATION_LANE_ID;
-        std::unique_ptr<juce::Button> snapEditGridBtn;
-        std::unique_ptr<juce::Button> snapValueBtn;
-        std::unique_ptr<juce::Button> bypassBtn;
-        std::unique_ptr<juce::Button> deleteBtn;
-    };
     std::vector<std::unique_ptr<AutoLaneHeaderButtons>> laneHeaderButtons_;
     std::unordered_set<int> selectedTrackIndices_;
 
@@ -340,6 +337,7 @@ class TrackHeadersPanel : public juce::Component,
 
     // Context menu
     void showContextMenu(int trackIndex, juce::Point<int> position);
+    void showAddTrackContextMenu(juce::Point<int> position);
     void showAutomationMenu(TrackId trackId, juce::Component* relativeTo);
     void handleCollapseToggle(TrackId trackId);
     void toggleRouting(int trackIndex, RoutingType type);

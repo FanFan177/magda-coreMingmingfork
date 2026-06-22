@@ -138,6 +138,55 @@ void TracktionEngineWrapper::recordingFinished(
             double startSeconds = audioClip->getPosition().getStart().inSeconds();
             double lengthSeconds = audioClip->getPosition().getLength().inSeconds();
 
+            // NOTE: loop recording is loop-aligned. Tracktion anchors the clip
+            // at the loop region and splits the capture into one take per loop
+            // pass, so if recording started before the loop, the pre-loop
+            // lead-in is NOT preserved as part of a take. By design: our take
+            // model (AudioTake) has no per-take time offset and comping assumes
+            // all takes share the clip start (take 0 at t=0), so loop-only takes
+            // could not be aligned inside a clip that began before the loop.
+            // Recording before the loop with Loop on therefore yields a
+            // loop-region clip, not a lead-in plus takes.
+
+            // Loop recording: Tracktion split the continuous capture into one
+            // take (audio file) per loop pass and registered them on the clip.
+            // Harvest them before we drop TE's clip, so no pass is lost. Each
+            // take is a direct file reference (we record outside a TE project),
+            // so resolve via SourceFileReference. The active take is the last
+            // full pass; only the final pass can be partial (mid-pass stop).
+            std::vector<AudioTake> takes;
+            int activeTakeIndex = 0;
+            if (audioClip->hasAnyTakes()) {
+                auto takesTree = audioClip->state.getChildWithName(tracktion::IDs::TAKES);
+                for (int i = 0; i < takesTree.getNumChildren(); ++i) {
+                    auto takeChild = takesTree.getChild(i);
+                    tracktion::SourceFileReference sfr(audioClip->edit, takeChild,
+                                                       tracktion::IDs::source);
+                    juce::File takeFile = sfr.getFile();
+                    if (takeFile == juce::File())
+                        continue;
+                    AudioTake take;
+                    take.filePath = takeFile.getFullPathName();
+                    take.durationSeconds =
+                        tracktion::AudioFile(audioClip->edit.engine, takeFile).getLength();
+                    takes.push_back(take);
+                }
+
+                if (!takes.empty()) {
+                    double loopLen = 0.0;
+                    for (const auto& t : takes)
+                        loopLen = std::max(loopLen, t.durationSeconds);
+                    activeTakeIndex = static_cast<int>(takes.size()) - 1;
+                    if (takes.size() > 1 && takes[activeTakeIndex].durationSeconds < loopLen * 0.95)
+                        activeTakeIndex = static_cast<int>(takes.size()) - 2;
+
+                    // Front the active take as the clip's source + length.
+                    audioFilePath = takes[activeTakeIndex].filePath;
+                    if (takes[activeTakeIndex].durationSeconds > 0.0)
+                        lengthSeconds = takes[activeTakeIndex].durationSeconds;
+                }
+            }
+
             if (lengthSeconds <= 0.0 || audioFilePath.isEmpty() || trackId == INVALID_TRACK_ID) {
                 audioClip->removeFromParent();
                 continue;
@@ -158,6 +207,10 @@ void TracktionEngineWrapper::recordingFinished(
                 if (isValidBpm(projectBPM)) {
                     newClip->audio().interpretation.bpm = projectBPM;
                     newClip->audio().interpretation.totalBeats = lengthSeconds * projectBPM / 60.0;
+                }
+                if (!takes.empty()) {
+                    newClip->audio().takes = std::move(takes);
+                    newClip->audio().currentTakeIndex = activeTakeIndex;
                 }
             }
 
@@ -288,25 +341,37 @@ void TracktionEngineWrapper::drainRecordingNoteQueue() {
         DBG("RecPreview::drain: popped=" << eventsPopped);
     }
 
-    // Grow each preview's length to match the playhead, in beats.
+    // Grow each preview's length to match the playhead and sample its waveform.
     double currentBeat = transportSecondsToBeats(edit, getCurrentPosition());
     for (auto& [trackId, preview] : recordingPreviews_) {
-        juce::ignoreUnused(trackId);
         double newLength = currentBeat - preview.startBeat;
-        if (newLength > preview.currentLengthBeats)
+        const bool extending = newLength > preview.currentLengthBeats;
+        if (extending)
             preview.currentLengthBeats = newLength;
-    }
 
-    // Sample metering data for audio-recording tracks
-    if (audioBridge_) {
-        auto& meteringBuffer = audioBridge_->getRecordingMeteringBuffer();
-        for (auto& [trackId, preview] : recordingPreviews_) {
-            if (!preview.isAudioRecording)
-                continue;
-
+        if (preview.isAudioRecording && audioBridge_) {
             MeterData data;
-            if (meteringBuffer.drainToLatest(trackId, data)) {
-                preview.audioPeaks.push_back({data.peakL, data.peakR});
+            if (audioBridge_->getRecordingMeteringBuffer().drainToLatest(trackId, data)) {
+                const AudioPeakSample peak{data.peakL, data.peakR};
+                if (extending || preview.audioPeaks.empty() || preview.currentLengthBeats <= 0.0) {
+                    // First pass (incl. any pre-loop lead-in): append as the
+                    // preview grows.
+                    preview.audioPeaks.push_back(peak);
+                } else {
+                    // Loop recording wrapped the playhead back: the preview
+                    // length is frozen at the first pass, so overwrite the peak
+                    // at the current playhead position instead of appending.
+                    // Each loop pass then redraws its own take live — the
+                    // pre-loop lead-in stays put while the loop region updates
+                    // every cycle — rather than the preview freezing or every
+                    // pass piling into the same rectangle (which looked like the
+                    // waveform scrolling backwards past the loop end).
+                    const int n = static_cast<int>(preview.audioPeaks.size());
+                    const double frac =
+                        (currentBeat - preview.startBeat) / preview.currentLengthBeats;
+                    const int idx = juce::jlimit(0, n - 1, static_cast<int>(frac * n));
+                    preview.audioPeaks[static_cast<size_t>(idx)] = peak;
+                }
             }
         }
     }
@@ -692,43 +757,70 @@ void TracktionEngineWrapper::finalizeMidiRecording(TrackId trackId) {
     double startSeconds = midiClip->getPosition().getStart().inSeconds();
     double lengthSeconds = midiClip->getPosition().getLength().inSeconds();
 
-    std::vector<MidiNote> recordedNotes;
-    std::vector<MidiCCData> recordedCC;
-    std::vector<MidiPitchBendData> recordedPB;
+    // Extract a TE MidiList (one take's sequence) into a MAGDA MidiTake.
+    auto extractTake = [](tracktion::MidiList& midiList) {
+        MidiTake take;
+        for (auto* note : midiList.getNotes()) {
+            if (!note)
+                continue;
+            MidiNote mn;
+            mn.noteNumber = note->getNoteNumber();
+            mn.velocity = note->getVelocity();
+            mn.startBeat = note->getStartBeat().inBeats();
+            mn.lengthBeats = note->getLengthBeats().inBeats();
+            take.notes.push_back(mn);
+        }
+        for (auto* ce : midiList.getControllerEvents()) {
+            if (!ce)
+                continue;
+            int eventType = ce->getType();
+            if (eventType == tracktion::MidiControllerEvent::pitchWheelType) {
+                MidiPitchBendData pb;
+                pb.value = ce->getControllerValue();
+                pb.beatPosition = ce->getBeatPosition().inBeats();
+                take.pitchBend.push_back(pb);
+            } else if (eventType < 128) {
+                MidiCCData cc;
+                cc.controller = eventType;
+                cc.value = ce->getControllerValue();
+                cc.beatPosition = ce->getBeatPosition().inBeats();
+                take.cc.push_back(cc);
+            }
+        }
+        return take;
+    };
 
-    auto& midiList = midiClip->getSequence();
-    for (auto* note : midiList.getNotes()) {
-        if (!note)
-            continue;
-        MidiNote mn;
-        mn.noteNumber = note->getNoteNumber();
-        mn.velocity = note->getVelocity();
-        mn.startBeat = note->getStartBeat().inBeats();
-        mn.lengthBeats = note->getLengthBeats().inBeats();
-        recordedNotes.push_back(mn);
-    }
-
-    for (auto* ce : midiList.getControllerEvents()) {
-        if (!ce)
-            continue;
-        int eventType = ce->getType();
-        if (eventType == tracktion::MidiControllerEvent::pitchWheelType) {
-            MidiPitchBendData pb;
-            pb.value = ce->getControllerValue();
-            pb.beatPosition = ce->getBeatPosition().inBeats();
-            recordedPB.push_back(pb);
-        } else if (eventType < 128) {
-            MidiCCData cc;
-            cc.controller = eventType;
-            cc.value = ce->getControllerValue();
-            cc.beatPosition = ce->getBeatPosition().inBeats();
-            recordedCC.push_back(cc);
+    // Loop recording: each pass is a TE take (channelSequence entry). Harvest
+    // them all so no pass is lost; a single (non-loop) recording has none, in
+    // which case the active sequence is the only content.
+    std::vector<MidiTake> takes;
+    if (midiClip->hasAnyTakes()) {
+        const int numTakes = midiClip->getNumTakes(/*includeComps=*/false);
+        for (int i = 0; i < numTakes; ++i) {
+            if (auto* takeList = midiClip->getTakeSequence(i))
+                takes.push_back(extractTake(*takeList));
         }
     }
 
-    DBG("finalizeMidiRecording: track=" << trackId << " notes=" << (int)recordedNotes.size()
-                                        << " cc=" << (int)recordedCC.size()
-                                        << " pb=" << (int)recordedPB.size());
+    // Active take = the last full pass. Only the final pass can be partial (a
+    // mid-loop stop); if it has fewer notes than the prior pass, fall back to
+    // that one. Mirrors the audio take heuristic.
+    int activeTakeIndex = 0;
+    if (takes.size() > 1) {
+        activeTakeIndex = static_cast<int>(takes.size()) - 1;
+        if (takes[activeTakeIndex].notes.size() <
+            takes[static_cast<size_t>(activeTakeIndex) - 1].notes.size())
+            activeTakeIndex -= 1;
+    }
+
+    // The content the clip plays: the active take, or the single recorded
+    // sequence when there are no takes.
+    MidiTake active = takes.empty() ? extractTake(midiClip->getSequence())
+                                    : takes[static_cast<size_t>(activeTakeIndex)];
+
+    DBG("finalizeMidiRecording: track=" << trackId << " takes=" << (int)takes.size()
+                                        << " active=" << activeTakeIndex
+                                        << " notes=" << (int)active.notes.size());
 
     midiClip->removeFromParent();
 
@@ -738,9 +830,13 @@ void TracktionEngineWrapper::finalizeMidiRecording(TrackId trackId) {
     activeRecordingClips_[trackId] = clipId;
 
     if (auto* clipInfo = clipManager.getClip(clipId)) {
-        clipInfo->midiNotes = std::move(recordedNotes);
-        clipInfo->midiCCData = std::move(recordedCC);
-        clipInfo->midiPitchBendData = std::move(recordedPB);
+        clipInfo->midiNotes = active.notes;
+        clipInfo->midiCCData = active.cc;
+        clipInfo->midiPitchBendData = active.pitchBend;
+        if (takes.size() > 1) {
+            clipInfo->midi().takes = std::move(takes);
+            clipInfo->midi().currentTakeIndex = activeTakeIndex;
+        }
     }
 
     if (audioBridge_)

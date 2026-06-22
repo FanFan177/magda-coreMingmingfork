@@ -1,10 +1,12 @@
 #include "ExportAudioDialog.hpp"
 
 #include "../../core/Config.hpp"
+#include "../../project/ProjectManager.hpp"
 #include "../themes/DarkTheme.hpp"
 #include "../themes/DialogLookAndFeel.hpp"
 #include "../themes/FontManager.hpp"
 #include "core/StringTable.hpp"
+#include "core/TechnicalText.hpp"
 
 namespace magda {
 
@@ -21,9 +23,9 @@ ExportAudioDialog::ExportAudioDialog() {
     formatComboBox_.addItem("WAV 24-bit", 2);
     formatComboBox_.addItem("WAV 32-bit Float", 3);
     formatComboBox_.addItem("FLAC", 4);
-    // Initialise format from render bit depth preference
-    auto& config = Config::getInstance();
-    int bd = config.getRenderBitDepth();
+    // Initialise format from the project's render bit depth
+    const auto& projectInfo = ProjectManager::getInstance().getCurrentProjectInfo();
+    int bd = projectInfo.renderBitDepth;
     int formatId = 2;  // Default WAV 24-bit
     if (bd >= 32)
         formatId = 3;
@@ -44,8 +46,8 @@ ExportAudioDialog::ExportAudioDialog() {
     sampleRateComboBox_.addItem("48 kHz", 2);
     sampleRateComboBox_.addItem("96 kHz", 3);
     sampleRateComboBox_.addItem("192 kHz", 4);
-    // Initialise sample rate from render preference
-    double savedRate = config.getRenderSampleRate();
+    // Initialise sample rate from the project's sample rate
+    double savedRate = projectInfo.sampleRate;
     int rateId = 1;  // Default 44.1kHz
     if (savedRate >= 192000.0)
         rateId = 4;
@@ -305,8 +307,11 @@ void ExportAudioDialog::updateBitDepthOptions() {
         case 3:  // WAV 32-bit Float
             bitDepthText = tr("export_audio.bit_depth.32_float");
             break;
-        case 4:  // FLAC
-            bitDepthText = tr("export_audio.bit_depth.24_flac");
+        case 4:  // FLAC — "24-bit (FLAC)"; the format suffix is a fixed technical
+                 // token, so compose from the translatable 24-bit label rather
+                 // than a separate (untranslatable) string.
+            bitDepthText = tr("export_audio.bit_depth.24") + " (" +
+                           magda::technicalText(magda::TechnicalTextToken::Flac) + ")";
             break;
         default:
             bitDepthText = tr("export_audio.bit_depth.24");
