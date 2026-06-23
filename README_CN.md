@@ -15,6 +15,7 @@
   Multi-Agent Digital Audio
 </p>
 <p align="center"><img src="assets/treaktion-engine-logo.png" alt="Powered by Tracktion Engine" width="250" height="80"></p>
+
 ---
 **简体中文** | [English](README.md) 
 ---
