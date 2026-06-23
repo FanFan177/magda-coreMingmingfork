@@ -46,7 +46,7 @@ MAGDA是免费的, 一款原生深度集成 AI 的开源数字音频工作站（
 
 ## 构建
 
-### Prerequisites   # # #先决条件
+### Prerequisites前置准备
 
 - C++20 标准编译器（GCC 10 及以上、Clang 12 及以上，或 Xcode）
 - CMake 3.20 及以上版本
@@ -55,7 +55,7 @@ MAGDA是免费的, 一款原生深度集成 AI 的开源数字音频工作站（
   `apt install git-lfs` (Debian/Ubuntu), or `choco install git-lfs` (Windows),
   then run `git lfs install` once per machine.
 
-### 快速上手
+### Quick Start快速上手
 
 ```bash
 # Clone with submodules and LFS assets
@@ -94,21 +94,21 @@ The project includes automated GitHub Actions workflows:
 
 See [docs/AUTOMATED_WORKFLOWS.md](docs/AUTOMATED_WORKFLOWS.md) for details on automated analysis and periodic workflows.
 
-## Security
+## Security安全机制
 
-MAGDA takes security seriously. The repository implements comprehensive security measures:
+MAGDA 高度重视安全问题，代码仓库内置了全方位安全防护机制:
 
-- 🔒 **Branch Protection**: Main branch protected with required reviews and status checks
-- 🔍 **Automated Scanning**: CodeQL security analysis for C++ vulnerabilities
-- 🔐 **Secret Detection**: Automated scanning to prevent credential leaks
-- 🛡️ **Dependency Monitoring**: Dependabot for security updates
-- ⚡ **CI/CD Security**: All security checks must pass before merge
+- 🔒 **分支保护**: 主分支启用保护机制，代码合并需经过指定审核与状态校验
+- 🔍 **自动安全扫描**: 通过 CodeQL 对 C++ 代码开展漏洞安全分析
+- 🔐 **密钥检测**: 自动扫描代码，杜绝账号密钥等敏感信息泄露
+- 🛡️ **依赖监控**: 使用 Dependabot 自动跟进依赖包安全更新
+- ⚡ **CI/CD 安全管控**: 所有安全检测项必须全部通过，代码才可合并
 
 **Found a security issue?** Please review our [Security Policy](SECURITY.md) for responsible disclosure.
 
 For detailed information about branch protection and security architecture, see [docs/BRANCH_PROTECTION.md](docs/BRANCH_PROTECTION.md).
 
-## Architecture
+## 系统架构
 
 ```
 magda/
@@ -128,7 +128,7 @@ docs/           # Documentation
 ```
 
 
-## Dependencies
+## 项目依赖库 / 依赖组件
 
 - [Tracktion Engine](https://github.com/Tracktion/tracktion_engine) - Audio engine
 - [JUCE](https://juce.com/) - C++ application framework (GUI, audio I/O, plugin hosting, MIDI, DSP)
