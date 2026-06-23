@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  Multi-Agent Digital Audio
+  数字音频工作站
 </p>
 <p align="center"><img src="assets/treaktion-engine-logo.png" alt="Powered by Tracktion Engine" width="250" height="80"></p>
 
