@@ -16,7 +16,7 @@
 </p>
 <p align="center"><img src="assets/treaktion-engine-logo.png" alt="Powered by Tracktion Engine" width="250" height="80"></p>
 ---
-**简体中文** | [English](README.md)
+**简体中文** | [English](README.md) 
 ---
 
 MAGDA是免费的, 一款原生深度集成 AI 的开源数字音频工作站（DAW），基于 C++20、JUCE 框架与 Tracktion 音频引擎开发.
