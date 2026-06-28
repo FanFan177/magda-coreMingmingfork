@@ -14,6 +14,7 @@
 #include "params/ParamSlotComponent.hpp"
 #include "slot/DeviceCustomUIManager.hpp"
 #include "slot/DeviceParameterChangeHandler.hpp"
+#include "slot/DevicePresetMenu.hpp"
 #include "slot/DeviceSlotTraits.hpp"
 #include "ui/components/common/DraggableValueLabel.hpp"
 #include "ui/components/common/SvgButton.hpp"
@@ -23,6 +24,7 @@
 namespace magda::daw::ui {
 
 class AnalyzerWindow;
+struct DeviceSlotModMacroCommandCallbacks;
 class FaustCustomView;
 class FaustUI;
 
@@ -216,6 +218,7 @@ class DeviceSlotComponent : public NodeComponent,
   private:
     magda::DeviceInfo device_;
     DeviceSlotTraits traits_;
+    DeviceSlotModMacroCommandCallbacks modMacroCommandCallbacks();
     std::unique_ptr<juce::Drawable> tracktionLogo_;
 
     // Header controls
@@ -228,10 +231,11 @@ class DeviceSlotComponent : public NodeComponent,
     std::unique_ptr<magda::SvgButton> uiButton_;
     std::unique_ptr<magda::SvgButton> learnButton_;
     std::unique_ptr<magda::SvgButton> onButton_;
-    std::unique_ptr<magda::SvgButton> exportClipButton_;  // Export pattern/chords as MIDI clip
-    std::unique_ptr<magda::SvgButton> randomButton_;      // Step-sequencer pattern randomize
-    std::unique_ptr<magda::SvgButton> midiThruButton_;    // Step-sequencer MIDI thru toggle
-    std::unique_ptr<magda::SvgButton> stepRecordButton_;  // Step-sequencer step record toggle
+    std::unique_ptr<magda::SvgButton> exportClipButton_;    // Export pattern/chords as MIDI clip
+    std::unique_ptr<magda::SvgButton> randomButton_;        // Step-sequencer pattern randomize
+    std::unique_ptr<magda::SvgButton> midiThruButton_;      // Step-sequencer MIDI thru toggle
+    std::unique_ptr<magda::SvgButton> stepRecordButton_;    // Step-sequencer step record toggle
+    std::unique_ptr<magda::SvgButton> instMidiThruButton_;  // MIDI source/thru toggle
 
     // Parameter host (owns slots + pagination, delegates layout to a
     // DeviceParamLayout strategy chosen at construction).
@@ -269,6 +273,9 @@ class DeviceSlotComponent : public NodeComponent,
     // when the device exposes that wrapper pair (external plugins via TE).
     // The meter and gain slider shrink to leave room above when present.
     std::unique_ptr<juce::Slider> mixKnob_;
+    void setupGainMeterControls();
+    void syncGainControlsFromDevice();
+    void refreshMixKnobFromDevice(bool relayoutOnVisibilityChange);
     bool hasWrapperMixPair() const;
     double currentMixPosition() const;
     void syncMixKnobFromDevice();
@@ -286,25 +293,12 @@ class DeviceSlotComponent : public NodeComponent,
     void loadPluginPresetFile(const juce::File& file);
     void showSavePluginPresetDialog();
 
-    // Most-recently loaded plugin preset (cleared when the device's pluginId
-    // changes). pluginPresetName_ is the display label; currentPluginPresetFile_
-    // is the source file used to tick the entry in the popup menu.
-    juce::File currentPluginPresetFile_;
-    juce::String pluginPresetName_;
+    // Plugin preset menu state/actions.
+    PluginDevicePresetPresenter pluginPresetPresenter_;
 
-    // MAGDA preset dialogs / actions
+    // MAGDA preset menu state/actions.
+    MagdaDevicePresetPresenter magdaPresetPresenter_;
     void showPresetMenu();
-    void showSaveMagdaPresetDialog();
-    void saveCurrentMagdaPreset();  // overwrite currentPresetName_
-    void loadMagdaPreset(const juce::String& presetRelativePath);
-    // Trigger PluginManager::capturePluginState and return a fresh DeviceInfo
-    // copy from TrackManager — used as the source-of-truth for a save.
-    magda::DeviceInfo snapshotForPreset();
-
-    // Name of the .mps file last loaded (or saved-as) on this device.
-    // Empty until the user touches the preset surface; cleared when the
-    // device's pluginId changes (different plugin loaded into the slot).
-    juce::String currentPresetName_;
 
     void updateParameterSlots();   // Reload parameter data for current page
     void updateParameterValues();  // Update only parameter values (for polling)
@@ -331,19 +325,13 @@ class DeviceSlotComponent : public NodeComponent,
 
     // Helper to create custom UI for internal devices
     void createCustomUI();
-    void updateCustomUI();
     void refreshInlinePluginBindings();
-    // Lightweight per-frame refresh: push current device_.parameters values
-    // into any active custom UI's sliders/knobs, without the heavy plugin-state
-    // reads (waveforms, drum pad info, etc) that updateCustomUI does. Safe to
-    // call from timerCallback.
-    void refreshCustomUIParameterValues();
-    void readAndPushModMatrix();  // Read FourOsc mod matrix and push to UI
     void setupCustomUILinking();
     void wirePadChainLinkCallbacks();  // Wire link mode on PadDeviceSlot param slots
+    template <typename LinkTarget>
+    void wireSharedModMacroLinkCallbacks(LinkTarget& target, bool expandMacroPanelOnDirectLink);
 
     void showAutomationLaneForParam(int paramIndex);
-    void openMacroPanelForSelectionIfNeeded();
 
     // Dynamic layout helpers
     int getVisibleParamCount() const;
