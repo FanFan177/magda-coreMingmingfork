@@ -3,7 +3,9 @@
 #include <unordered_set>
 #include <vector>
 
+#include "../../core/ChainRoutingModel.hpp"
 #include "../../core/InternalDeviceKind.hpp"
+#include "../../core/PluginCapabilities.hpp"
 #include "../../core/RackInfo.hpp"
 #include "../../core/TrackManager.hpp"
 #include "../../core/aliases/AutoAliasGenerator.hpp"
@@ -23,6 +25,8 @@
 #include "plugins/InternalPluginRegistry.hpp"
 #include "plugins/MagdaSamplerPlugin.hpp"
 #include "plugins/MidiChordEnginePlugin.hpp"
+#include "plugins/MidiDevicePlugin.hpp"
+#include "plugins/MidiInThruSync.hpp"
 #include "plugins/MidiReceivePlugin.hpp"
 #include "plugins/SidechainMonitorPlugin.hpp"
 #include "plugins/StepSequencerPlugin.hpp"
@@ -56,6 +60,74 @@ void removeSourceFromPlugins(const std::vector<te::Plugin*>& plugins,
                              te::AutomatableParameter::ModifierSource& source) {
     for (auto* plugin : plugins)
         removeSourceFromPlugin(plugin, source);
+}
+
+const char* pluginFormatText(PluginFormat format) {
+    switch (format) {
+        case PluginFormat::VST3:
+            return "VST3";
+        case PluginFormat::AU:
+            return "AU";
+        case PluginFormat::VST:
+            return "VST";
+        case PluginFormat::Internal:
+            return "Internal";
+    }
+
+    return "Unknown";
+}
+
+bool pluginProducesMidi(te::Plugin& plugin) {
+    if (auto* processor = plugin.getWrappedAudioProcessor())
+        return processor->producesMidi() || processor->isMidiEffect();
+
+    return dynamic_cast<daw::audio::MidiDevicePlugin*>(&plugin) != nullptr;
+}
+
+PluginCapabilitySnapshot makePluginCapabilitySnapshot(const DeviceInfo& device,
+                                                      te::Plugin& plugin) {
+    PluginCapabilitySnapshot snapshot;
+    snapshot.pluginIdentifier = PluginCapabilityCache::identifierForDevice(device);
+    snapshot.name = device.name.isNotEmpty() ? device.name : plugin.getName();
+    snapshot.manufacturer =
+        device.manufacturer.isNotEmpty() ? device.manufacturer : plugin.getVendor();
+    snapshot.format = pluginFormatText(device.format);
+    snapshot.tracktionTakesMidiInput = plugin.takesMidiInput();
+    snapshot.tracktionTakesAudioInput = plugin.takesAudioInput();
+    snapshot.tracktionProducesAudioWhenNoAudioInput = plugin.producesAudioWhenNoAudioInput();
+    snapshot.hasMidiOutput = pluginProducesMidi(plugin);
+    snapshot.hasMidiInput = snapshot.tracktionTakesMidiInput;
+    snapshot.hasAudioInput = snapshot.tracktionTakesAudioInput;
+    snapshot.hasAudioOutput = plugin.getNumOutputChannelsGivenInputs(0) > 0 ||
+                              plugin.getNumOutputChannelsGivenInputs(2) > 0;
+
+    if (auto* processor = plugin.getWrappedAudioProcessor()) {
+        snapshot.processorAcceptsMidi = processor->acceptsMidi();
+        snapshot.processorProducesMidi = processor->producesMidi();
+        snapshot.processorIsMidiEffect = processor->isMidiEffect();
+        snapshot.audioInputChannels = processor->getTotalNumInputChannels();
+        snapshot.audioOutputChannels = processor->getTotalNumOutputChannels();
+        snapshot.inputBusCount = processor->getBusCount(true);
+        snapshot.outputBusCount = processor->getBusCount(false);
+        snapshot.hasMidiInput = snapshot.hasMidiInput || snapshot.processorAcceptsMidi;
+        snapshot.hasMidiOutput = snapshot.hasMidiOutput || snapshot.processorProducesMidi ||
+                                 snapshot.processorIsMidiEffect;
+        snapshot.hasAudioInput = snapshot.hasAudioInput || snapshot.audioInputChannels > 0;
+        snapshot.hasAudioOutput = snapshot.hasAudioOutput || snapshot.audioOutputChannels > 0;
+    }
+
+    return snapshot;
+}
+
+void updateDeviceCapabilityFlags(DeviceInfo& device, te::Plugin& plugin) {
+    const auto snapshot = makePluginCapabilitySnapshot(device, plugin);
+    PluginCapabilityCache::getInstance().update(snapshot);
+
+    if (plugin.canSidechain())
+        device.canSidechain = true;
+    if (snapshot.hasMidiInput && !device.isInstrument)
+        device.canReceiveMidi = true;
+    device.producesMidi = snapshot.hasMidiOutput;
 }
 
 void removeSourceFromModifierParams(const std::map<ModId, te::Modifier::Ptr>& modifiers,
@@ -1244,11 +1316,7 @@ void PluginManager::pollAsyncPluginLoad(const ChainNodePath& devicePath, te::Plu
                 if (auto* devInfo = getDeviceInfoForPath(devicePath)) {
                     processor->populateParameters(*devInfo);
 
-                    // Update capability flags
-                    if (plugin->canSidechain())
-                        devInfo->canSidechain = true;
-                    if (plugin->takesMidiInput() && !devInfo->isInstrument)
-                        devInfo->canReceiveMidi = true;
+                    updateDeviceCapabilityFlags(*devInfo, *plugin);
                     AutoAliasGenerator::regenerateForDevice(devicePath);
                 }
             }
@@ -1267,12 +1335,15 @@ void PluginManager::pollAsyncPluginLoad(const ChainNodePath& devicePath, te::Plu
                     auto* track = self.trackController_.getAudioTrack(trackId);
                     int pluginIdx = track ? track->pluginList.indexOf(plugin.get()) : -1;
 
+                    const bool passRawMidi =
+                        routing::makeRoutingNode(*devInfo).passesRawMidiInput();
                     te::Plugin::Ptr rackPlugin;
                     if (numOutputChannels > 2) {
                         rackPlugin = self.instrumentRackManager_.wrapMultiOutInstrument(
-                            plugin, numOutputChannels);
+                            plugin, numOutputChannels, passRawMidi);
                     } else {
-                        rackPlugin = self.instrumentRackManager_.wrapInstrument(plugin);
+                        rackPlugin =
+                            self.instrumentRackManager_.wrapInstrument(plugin, passRawMidi);
                     }
 
                     if (rackPlugin) {
@@ -1716,10 +1787,7 @@ void PluginManager::syncMasterPlugins() {
 
         // Update capability flags on the DeviceInfo
         if (auto* devInfo = TrackManager::getInstance().getDevice(MASTER_TRACK_ID, device.id)) {
-            if (plugin->canSidechain())
-                devInfo->canSidechain = true;
-            if (plugin->takesMidiInput() && !device.isInstrument)
-                devInfo->canReceiveMidi = true;
+            updateDeviceCapabilityFlags(*devInfo, *plugin);
         }
 
         // Handle async loading for external plugins
@@ -1768,10 +1836,7 @@ void PluginManager::syncMasterPlugins() {
         // Post-fx devices are addressed by a post-fx path, not the top-level
         // getDevice() lookup used for fx devices above.
         if (auto* devInfo = TrackManager::getInstance().getDeviceInChainByPath(postPath)) {
-            if (plugin->canSidechain())
-                devInfo->canSidechain = true;
-            if (plugin->takesMidiInput() && !device.isInstrument)
-                devInfo->canReceiveMidi = true;
+            updateDeviceCapabilityFlags(*devInfo, *plugin);
         }
 
         if (auto* extPlugin = dynamic_cast<te::ExternalPlugin*>(plugin.get())) {
@@ -1814,10 +1879,7 @@ void PluginManager::syncMasterPlugins() {
         registerRackPluginProcessor(miniPath, plugin, device);
 
         if (auto* devInfo = TrackManager::getInstance().getDeviceInChainByPath(miniPath)) {
-            if (plugin->canSidechain())
-                devInfo->canSidechain = true;
-            if (plugin->takesMidiInput() && !device.isInstrument)
-                devInfo->canReceiveMidi = true;
+            updateDeviceCapabilityFlags(*devInfo, *plugin);
         }
 
         if (auto* extPlugin = dynamic_cast<te::ExternalPlugin*>(plugin.get())) {
@@ -2129,8 +2191,10 @@ te::Plugin::Ptr PluginManager::loadDeviceAsPlugin(const ChainNodePath& devicePat
             }
 
             // Adopt the resolved plugin's instrument classification (the imported
-            // deviceRole may be wrong), so MAGDA wraps/routes it correctly.
-            if (found) {
+            // deviceRole may be wrong), so MAGDA wraps/routes it correctly. A
+            // DeviceType::MIDI device is an explicit MAGDA role override for
+            // instrument-form MIDI generators, so preserve it.
+            if (found && device.deviceType != DeviceType::MIDI) {
                 if (auto* live = getDeviceInfoForPath(devicePath);
                     live && live->isInstrument != desc.isInstrument) {
                     live->isInstrument = desc.isInstrument;
@@ -2186,10 +2250,7 @@ te::Plugin::Ptr PluginManager::loadDeviceAsPlugin(const ChainNodePath& devicePat
     if (plugin) {
         // Update capability flags on the DeviceInfo in TrackManager
         if (auto* devInfo = getDeviceInfoForPath(devicePath)) {
-            if (plugin->canSidechain())
-                devInfo->canSidechain = true;
-            if (plugin->takesMidiInput() && !device.isInstrument)
-                devInfo->canReceiveMidi = true;
+            updateDeviceCapabilityFlags(*devInfo, *plugin);
         }
 
         // Store the processor if we created one
@@ -2219,6 +2280,7 @@ te::Plugin::Ptr PluginManager::loadDeviceAsPlugin(const ChainNodePath& devicePat
 
         // Apply device state
         plugin->setEnabled(!device.bypassed);
+        daw::audio::syncPluginMidiInThru(plugin.get(), device.midiInThru);
 
         // Wrap instruments in a RackType with audio passthrough so both synth
         // output and audio clips on the same track are summed together.
@@ -2234,12 +2296,13 @@ te::Plugin::Ptr PluginManager::loadDeviceAsPlugin(const ChainNodePath& devicePat
             // Remember the plugin's position before wrapping removes it from the track
             int pluginIdx = track->pluginList.indexOf(plugin.get());
 
+            const bool passRawMidi = routing::makeRoutingNode(device).passesRawMidiInput();
             te::Plugin::Ptr rackPlugin;
             if (numOutputChannels > 2) {
-                rackPlugin =
-                    instrumentRackManager_.wrapMultiOutInstrument(plugin, numOutputChannels);
+                rackPlugin = instrumentRackManager_.wrapMultiOutInstrument(
+                    plugin, numOutputChannels, passRawMidi);
             } else {
-                rackPlugin = instrumentRackManager_.wrapInstrument(plugin);
+                rackPlugin = instrumentRackManager_.wrapInstrument(plugin, passRawMidi);
             }
 
             if (rackPlugin) {

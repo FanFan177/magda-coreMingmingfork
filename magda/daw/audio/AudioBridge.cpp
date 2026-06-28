@@ -4,6 +4,7 @@
 #include <unordered_set>
 
 #include "../core/AutomationManager.hpp"
+#include "../core/ChainRoutingModel.hpp"
 #include "../core/ClipOperations.hpp"
 #include "../core/Config.hpp"
 #include "../core/ModulatorEngine.hpp"
@@ -13,6 +14,7 @@
 #include "AudioThumbnailManager.hpp"
 #include "Vst3Preset.hpp"
 #include "modifiers/ADSRDebugLog.hpp"
+#include "plugins/MidiInThruSync.hpp"
 #include "session/SessionMonitorPlugin.hpp"
 
 namespace magda {
@@ -148,11 +150,6 @@ AudioBridge::~AudioBridge() {
         });
 
         // Unregister live input meter clients
-        for (auto& [trackId, entry] : inputMeterClients_) {
-            juce::ignoreUnused(trackId);
-            if (entry.measurer)
-                entry.measurer->removeClient(entry.client);
-        }
         inputMeterClients_.clear();
 
         // Clear baked automation curves BEFORE PluginManager mappings are
@@ -184,11 +181,6 @@ void AudioBridge::resetTestState() {
         }
     });
 
-    for (auto& [trackId, entry] : inputMeterClients_) {
-        juce::ignoreUnused(trackId);
-        if (entry.measurer)
-            entry.measurer->removeClient(entry.client);
-    }
     inputMeterClients_.clear();
 
     automationPlayback_.clearAllLanes();
@@ -468,14 +460,21 @@ void AudioBridge::devicePropertyChanged(const ChainNodePath& devicePath) {
             tePlugin->setEnabled(!device->bypassed);
     }
 
+    if (auto tePlugin = pluginManager_.getPlugin(devicePath))
+        daw::audio::syncPluginMidiInThru(tePlugin.get(), device->midiInThru);
+
     // Wrapped instruments consume MIDI while active. Only top-level devices own
     // instrument wrapper racks; post-fx/mixer-analysis ids are section-local and
     // can overlap with a top-level instrument id.
     if (devicePath.getType() == ChainNodeType::TopLevelDevice) {
-        if (auto* rackInstance =
-                pluginManager_.getInstrumentRackManager().getRackInstance(deviceId)) {
+        auto& rackManager = pluginManager_.getInstrumentRackManager();
+        if (auto* rackInstance = rackManager.getRackInstance(deviceId)) {
             rackInstance->setEnabled(!device->bypassed);
         }
+        // Keep the wrapper's raw-MIDI passthrough in sync with the routing model
+        // (always on for a plain instrument; midiInThru-controlled for a
+        // MIDI-output device), so notes keep reaching downstream devices.
+        rackManager.setMidiInThru(deviceId, routing::makeRoutingNode(*device).passesRawMidiInput());
     }
 
     // Push gain to the audio-graph atomic so DeviceGainNode picks it up.
@@ -935,9 +934,12 @@ void AudioBridge::refreshInputMeterClients(const std::map<TrackId, te::AudioTrac
             if (!track)
                 continue;
 
+            auto* trackInfo = TrackManager::getInstance().getTrack(trackId);
+            if (!trackInfo || trackInfo->audioInputDevice.isEmpty())
+                continue;
+
             for (auto* inputDeviceInstance : playbackContext->getAllInputs()) {
-                if (!inputDeviceInstance ||
-                    dynamic_cast<te::MidiInputDevice*>(&inputDeviceInstance->owner) != nullptr)
+                if (!inputDeviceInstance || inputDeviceInstance->owner.isMidi())
                     continue;
 
                 if (!inputHasTarget(*inputDeviceInstance, track->itemID))
@@ -952,6 +954,12 @@ void AudioBridge::refreshInputMeterClients(const std::map<TrackId, te::AudioTrac
         }
     }
 
+    std::unordered_set<te::LevelMeasurer*> liveInputMeasurers;
+    for (auto& [trackId, measurer] : desired) {
+        juce::ignoreUnused(trackId);
+        liveInputMeasurers.insert(measurer);
+    }
+
     for (auto& [trackId, measurer] : desired) {
         if (!measurer)
             continue;
@@ -963,7 +971,7 @@ void AudioBridge::refreshInputMeterClients(const std::map<TrackId, te::AudioTrac
             entry.measurer = measurer;
             measurer->addClient(entry.client);
         } else if (entry.measurer != measurer) {
-            if (entry.measurer)
+            if (entry.measurer && liveInputMeasurers.count(entry.measurer) != 0)
                 entry.measurer->removeClient(entry.client);
             entry.measurer = measurer;
             measurer->addClient(entry.client);
@@ -976,7 +984,7 @@ void AudioBridge::refreshInputMeterClients(const std::map<TrackId, te::AudioTrac
             continue;
         }
 
-        if (it->second.measurer)
+        if (it->second.measurer && liveInputMeasurers.count(it->second.measurer) != 0)
             it->second.measurer->removeClient(it->second.client);
         it = inputMeterClients_.erase(it);
     }

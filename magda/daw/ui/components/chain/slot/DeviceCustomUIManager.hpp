@@ -1,6 +1,7 @@
 #pragma once
 
 #include <juce_gui_basics/juce_gui_basics.h>
+#include <tracktion_engine/tracktion_engine.h>
 
 #include <memory>
 #include <vector>
@@ -11,6 +12,7 @@
 namespace magda::daw::audio {
 class ArpeggiatorPlugin;
 class MidiChordEnginePlugin;
+class MidiStrumPlugin;
 class OscilloscopePlugin;
 class PolyStepSequencerPlugin;
 class SpectrumAnalyzerPlugin;
@@ -27,6 +29,7 @@ class DelayUI;
 class DrumGridUI;
 class EqualiserUI;
 class FaustUI;
+class FaustInstrumentTabbedUI;
 class FilterUI;
 class FourOscUI;
 class ImpulseResponseUI;
@@ -35,11 +38,19 @@ class LinkableTextSlider;
 class OscilloscopeUI;
 class PhaserUI;
 class PolyStepSequencerUI;
+class PolySynthUI;
+class FMUI;
+class MateriaUI;
+class HaloUI;
+class NimbusUI;
+class DrumVoiceUI;
+class StruckInstrumentUI;
 class SpectrumAnalyzerUI;
 class PitchShiftUI;
 class ReverbUI;
 class SamplerUI;
 class StepSequencerUI;
+class StrumUI;
 class ToneGeneratorUI;
 
 /**
@@ -74,6 +85,9 @@ class DeviceCustomUIManager {
         std::function<void()> onUpdateMacroPanel;
         // Returns the current node path of the parent (queried at callback time, not capture time)
         std::function<magda::ChainNodePath()> getNodePath;
+        // Optional live-plugin resolver for embedded device contexts that do
+        // not have an AudioBridge-resolvable ChainNodePath, such as DrumGrid pad chains.
+        std::function<tracktion::engine::Plugin::Ptr()> getLivePlugin;
     };
 
     DeviceCustomUIManager();
@@ -157,6 +171,9 @@ class DeviceCustomUIManager {
     daw::audio::ArpeggiatorPlugin* getArpPlugin() const {
         return arpPlugin_;
     }
+    daw::audio::MidiStrumPlugin* getStrumPlugin() const {
+        return strumPlugin_;
+    }
     daw::audio::StepSequencerPlugin* getStepSeqPlugin() const {
         return stepSeqPlugin_;
     }
@@ -173,6 +190,9 @@ class DeviceCustomUIManager {
     }
     void setPolyStepSeqPlugin(daw::audio::PolyStepSequencerPlugin* p) {
         polyStepSeqPlugin_ = p;
+    }
+    void setStrumPlugin(daw::audio::MidiStrumPlugin* p) {
+        strumPlugin_ = p;
     }
 
     // Tab index for FourOscUI persistence across rebuilds
@@ -194,6 +214,9 @@ class DeviceCustomUIManager {
     FourOscUI* getFourOscUI() const {
         return fourOscUI_.get();
     }
+    FaustInstrumentTabbedUI* getFaustInstrumentUI() const {
+        return faustInstrumentUI_.get();
+    }
     ChordPanelContent* getChordEngineUI() const {
         return chordEngineUI_.get();
     }
@@ -202,6 +225,9 @@ class DeviceCustomUIManager {
     }
     StepSequencerUI* getStepSequencerUI() const {
         return stepSequencerUI_.get();
+    }
+    StrumUI* getStrumUI() const {
+        return strumUI_.get();
     }
     PolyStepSequencerUI* getPolyStepSequencerUI() const {
         return polyStepSequencerUI_.get();
@@ -212,17 +238,43 @@ class DeviceCustomUIManager {
     // from the current devicePath_ and hand it to them. Safe to call before the
     // path or plugin exists (it simply binds nothing).
     void bindAnalyzerPlugins();
+    tracktion::engine::Plugin::Ptr getLivePlugin() const;
+    void createToneGeneratorUI(const magda::DeviceInfo& device, juce::Component& parent,
+                               const Callbacks& callbacks);
+    bool createSamplerUI(const magda::DeviceInfo& device, juce::Component& parent,
+                         const Callbacks& callbacks);
+    bool createDrumGridUI(const magda::DeviceInfo& device, juce::Component& parent,
+                          const Callbacks& callbacks);
+    bool createAnalyzerUI(const magda::DeviceInfo& device, juce::Component& parent);
+    bool createMidiUtilityUI(const magda::DeviceInfo& device, juce::Component& parent);
+    bool createFourOscUI(const magda::DeviceInfo& device, juce::Component& parent,
+                         const Callbacks& callbacks);
+    bool createCustomInstrumentUI(const magda::DeviceInfo& device, juce::Component& parent,
+                                  const Callbacks& callbacks);
+    bool createSimpleEffectUI(const magda::DeviceInfo& device, juce::Component& parent,
+                              const Callbacks& callbacks);
+    bool createImpulseResponseUI(const magda::DeviceInfo& device, juce::Component& parent,
+                                 const Callbacks& callbacks);
 
     // Path of the device this manager is bound to. Used by every internal
     // plugin lookup; the bare device.id is no longer sufficient under
     // section-scoped device ids.
     magda::ChainNodePath devicePath_;
+    std::function<tracktion::engine::Plugin::Ptr()> livePluginProvider_;
 
     // Custom UI unique_ptrs
     std::unique_ptr<ToneGeneratorUI> toneGeneratorUI_;
     std::unique_ptr<SamplerUI> samplerUI_;
     std::unique_ptr<DrumGridUI> drumGridUI_;
     std::unique_ptr<FourOscUI> fourOscUI_;
+    std::unique_ptr<FaustInstrumentTabbedUI> faustInstrumentUI_;
+    std::unique_ptr<PolySynthUI> polySynthUI_;
+    std::unique_ptr<FMUI> fmUI_;
+    std::unique_ptr<MateriaUI> materiaUI_;
+    std::unique_ptr<HaloUI> haloUI_;
+    std::unique_ptr<NimbusUI> nimbusUI_;
+    std::unique_ptr<DrumVoiceUI> drumVoiceUI_;
+    std::unique_ptr<StruckInstrumentUI> struckUI_;
     std::unique_ptr<EqualiserUI> eqUI_;
     std::unique_ptr<CompressorUI> compressorUI_;
     std::unique_ptr<ReverbUI> reverbUI_;
@@ -235,6 +287,7 @@ class DeviceCustomUIManager {
     std::unique_ptr<FaustUI> faustUI_;
     std::unique_ptr<ChordPanelContent> chordEngineUI_;
     std::unique_ptr<ArpeggiatorUI> arpeggiatorUI_;
+    std::unique_ptr<StrumUI> strumUI_;
     std::unique_ptr<StepSequencerUI> stepSequencerUI_;
     std::unique_ptr<PolyStepSequencerUI> polyStepSequencerUI_;
     std::unique_ptr<OscilloscopeUI> oscilloscopeUI_;
@@ -243,6 +296,7 @@ class DeviceCustomUIManager {
 
     // Plugin raw pointers for timer polling / setNodePath updates
     daw::audio::ArpeggiatorPlugin* arpPlugin_ = nullptr;
+    daw::audio::MidiStrumPlugin* strumPlugin_ = nullptr;
     daw::audio::StepSequencerPlugin* stepSeqPlugin_ = nullptr;
     daw::audio::PolyStepSequencerPlugin* polyStepSeqPlugin_ = nullptr;
     daw::audio::MidiChordEnginePlugin* chordPlugin_ = nullptr;

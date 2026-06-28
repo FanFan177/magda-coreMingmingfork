@@ -6,6 +6,7 @@
 #include "magda/daw/audio/AudioBridge.hpp"
 #include "magda/daw/audio/DeviceMeteringManager.hpp"
 #include "magda/daw/audio/plugin_manager/PluginManager.hpp"
+#include "magda/daw/audio/plugins/DrumGridPlugin.hpp"
 #include "magda/daw/audio/plugins/InstrumentMeterTapPlugin.hpp"
 #include "magda/daw/audio/plugins/MagdaSamplerPlugin.hpp"
 #include "magda/daw/audio/plugins/MidiReceivePlugin.hpp"
@@ -57,7 +58,9 @@ class MidiSignalRoutingTest final : public juce::UnitTest {
 
     void runTest() override {
         magda::test::runWithCleanJuceState([this] { testInstrumentRackPassesMidiThrough(); });
-        magda::test::runWithCleanJuceState([this] { testStepSequencerDefaultsToReplacingMidi(); });
+        magda::test::runWithCleanJuceState([this] { testStepSequencerDefaultsToMidiThru(); });
+        magda::test::runWithCleanJuceState(
+            [this] { testStepSequencerMidiThruMirrorsDeviceState(); });
         magda::test::runWithCleanJuceState(
             [this] { testStepSequencerMidiThruPassesWhileStopped(); });
         magda::test::runWithCleanJuceState([this] { testStepSequencerStepRecordingStopsAtEnd(); });
@@ -69,6 +72,10 @@ class MidiSignalRoutingTest final : public juce::UnitTest {
         magda::test::runWithCleanJuceState(
             [this] { testPolyStepSequencerCopyPatternToClipboard(); });
         magda::test::runWithCleanJuceState([this] { testRackSyncWiresNestedRackAsGraphNode(); });
+        magda::test::runWithCleanJuceState(
+            [this] { testRackSyncKeepsRawMidiPassthroughOrderedThroughProcessors(); });
+        magda::test::runWithCleanJuceState(
+            [this] { testRackSyncMergesRawAndPluginMidiForThruProducer(); });
         magda::test::runWithCleanJuceState([this] { testRackTypeRejectsRecursiveRackInstances(); });
         magda::test::runWithCleanJuceState([this] { testRackSyncBypassedChainPreservesMidi(); });
         magda::test::runWithCleanJuceState(
@@ -84,6 +91,8 @@ class MidiSignalRoutingTest final : public juce::UnitTest {
         magda::test::runWithCleanJuceState(
             [this] { testMoveDeviceIntoRackRemovesTrackRuntimePlugin(); });
         magda::test::runWithCleanJuceState([this] { testPostFxRoutesAfterFxBeforeFader(); });
+        magda::test::runWithCleanJuceState(
+            [this] { testDrumGridLoadsInternalInstrumentAsPadVoice(); });
     }
 
   private:
@@ -129,8 +138,25 @@ class MidiSignalRoutingTest final : public juce::UnitTest {
 
         expect(hasConnection(rackType, rackIO, 0, synthId, 0),
                "Rack MIDI input must feed the instrument");
+        expect(hasConnection(rackType, synthId, 0, rackIO, 0),
+               "Instrument's own MIDI output must always reach the rack output so a "
+               "wrapped sequencer/arp triggers downstream instruments");
         expect(hasConnection(rackType, rackIO, 0, rackIO, 0),
-               "Instrument wrapper must pass MIDI to later track-chain devices");
+               "Raw MIDI in thru is on by default (preserves historic passthrough)");
+
+        // Toggling MIDI in thru adds/removes only the raw-input passthrough.
+        rackManager.recordWrapping(magda::ChainNodePath::topLevelDevice(0, 1), rackInstance->type,
+                                   instrument, rackPlugin);
+        rackManager.setMidiInThru(1, true);
+        expect(hasConnection(rackType, rackIO, 0, rackIO, 0),
+               "Enabling MIDI in thru wires the raw-input passthrough");
+        expect(hasConnection(rackType, synthId, 0, rackIO, 0),
+               "Plugin MIDI output stays wired when in-thru is enabled");
+        rackManager.setMidiInThru(1, false);
+        expect(!hasConnection(rackType, rackIO, 0, rackIO, 0),
+               "Disabling MIDI in thru removes the raw-input passthrough");
+        expect(hasConnection(rackType, synthId, 0, rackIO, 0),
+               "Plugin MIDI output stays wired when in-thru is disabled");
 
         expect(hasConnection(rackType, rackIO, 1, rackIO, 1),
                "Rack must preserve left audio passthrough");
@@ -348,6 +374,92 @@ class MidiSignalRoutingTest final : public juce::UnitTest {
         }
 
         rackSync.removeRack(outer.id);
+    }
+
+    void testRackSyncKeepsRawMidiPassthroughOrderedThroughProcessors() {
+        beginTest("Rack sync keeps raw MIDI passthrough ordered through processors");
+
+        magda::RackInfo rack;
+        rack.id = 9150;
+        rack.name = "Ordered MIDI Passthrough Rack";
+
+        magda::ChainInfo chain;
+        chain.id = 9151;
+        auto first = makeInternalDevice(9152, "First MIDI FX", "magda_filter");
+        auto second = makeInternalDevice(9153, "Second MIDI FX", "magda_filter");
+        first.canReceiveMidi = true;
+        second.canReceiveMidi = true;
+        chain.elements.push_back(magda::makeDeviceElement(first));
+        chain.elements.push_back(magda::makeDeviceElement(second));
+        rack.chains.push_back(std::move(chain));
+
+        auto* rackType = syncTestRack(rack, 915);
+        if (!rackType)
+            return;
+
+        auto& rackSync = magda::test::getSharedEngine()
+                             .getAudioBridge()
+                             ->getPluginManager()
+                             .getRackSyncManager();
+        auto* firstPlugin = rackSync.getInnerPlugin(first.id);
+        auto* secondPlugin = rackSync.getInnerPlugin(second.id);
+        expect(firstPlugin != nullptr, "First processor should be loaded into the rack");
+        expect(secondPlugin != nullptr, "Second processor should be loaded into the rack");
+        if (!firstPlugin || !secondPlugin)
+            return;
+
+        const auto rackIO = te::EditItemID();
+        expect(hasConnection(*rackType, rackIO, 0, firstPlugin->itemID, 0),
+               "Rack MIDI input should feed the first processor");
+        expect(hasConnection(*rackType, firstPlugin->itemID, 0, secondPlugin->itemID, 0),
+               "Raw MIDI passthrough should advance through the first processor");
+        expect(!hasConnection(*rackType, rackIO, 0, secondPlugin->itemID, 0),
+               "Second processor should not bypass the ordered MIDI graph");
+        expect(hasConnection(*rackType, secondPlugin->itemID, 0, rackIO, 0),
+               "Rack MIDI output should come from the final passthrough processor");
+
+        rackSync.removeRack(rack.id);
+    }
+
+    void testRackSyncMergesRawAndPluginMidiForThruProducer() {
+        beginTest("Rack sync merges raw and plugin MIDI for thru producers");
+
+        magda::RackInfo rack;
+        rack.id = 9160;
+        rack.name = "MIDI Merge Rack";
+
+        magda::ChainInfo chain;
+        chain.id = 9161;
+        auto sequencer = makeInternalDevice(9162, "Step Sequencer",
+                                            magda::daw::audio::StepSequencerPlugin::xmlTypeName);
+        sequencer.canReceiveMidi = true;
+        sequencer.producesMidi = true;
+        sequencer.midiInThru = true;
+        chain.elements.push_back(magda::makeDeviceElement(sequencer));
+        rack.chains.push_back(std::move(chain));
+
+        auto* rackType = syncTestRack(rack, 916);
+        if (!rackType)
+            return;
+
+        auto& rackSync = magda::test::getSharedEngine()
+                             .getAudioBridge()
+                             ->getPluginManager()
+                             .getRackSyncManager();
+        auto* sequencerPlugin = rackSync.getInnerPlugin(sequencer.id);
+        expect(sequencerPlugin != nullptr, "MIDI producer should be loaded into the rack");
+        if (!sequencerPlugin)
+            return;
+
+        const auto rackIO = te::EditItemID();
+        expect(hasConnection(*rackType, rackIO, 0, sequencerPlugin->itemID, 0),
+               "Rack MIDI input should feed the MIDI producer");
+        expect(hasConnection(*rackType, rackIO, 0, rackIO, 0),
+               "MIDI thru should keep raw input connected to rack output");
+        expect(hasConnection(*rackType, sequencerPlugin->itemID, 0, rackIO, 0),
+               "MIDI thru should also connect plugin MIDI output to rack output");
+
+        rackSync.removeRack(rack.id);
     }
 
     void testRackTypeRejectsRecursiveRackInstances() {
@@ -852,8 +964,8 @@ class MidiSignalRoutingTest final : public juce::UnitTest {
         trackManager.setAudioEngine(nullptr);
     }
 
-    void testStepSequencerDefaultsToReplacingMidi() {
-        beginTest("Step sequencer defaults to MIDI replace and restores MIDI thru state");
+    void testStepSequencerDefaultsToMidiThru() {
+        beginTest("Step sequencer defaults to MIDI thru and restores MIDI thru state");
 
         auto& wrapper = magda::test::getSharedEngine();
         auto edit = te::test_utilities::createTestEdit(*wrapper.getEngine(), 1);
@@ -868,15 +980,119 @@ class MidiSignalRoutingTest final : public juce::UnitTest {
         if (seq == nullptr)
             return;
 
-        expect(!seq->midiThru.get(), "Fresh step sequencers should block incoming MIDI");
+        expect(seq->midiThru.get(), "Fresh step sequencers should pass incoming MIDI");
 
         juce::ValueTree saved(te::IDs::PLUGIN);
         saved.setProperty(te::IDs::type, magda::daw::audio::StepSequencerPlugin::xmlTypeName,
                           nullptr);
-        saved.setProperty("seqMidiThru", true, nullptr);
+        saved.setProperty("seqMidiThru", false, nullptr);
         seq->restorePluginStateFromValueTree(saved);
 
-        expect(seq->midiThru.get(), "Saved MIDI thru state should be restored");
+        expect(!seq->midiThru.get(), "Saved MIDI thru state should be restored");
+    }
+
+    void testDrumGridLoadsInternalInstrumentAsPadVoice() {
+        beginTest("DrumGrid loads internal instruments as pad voices");
+
+        auto& wrapper = magda::test::getSharedEngine();
+        auto edit = te::test_utilities::createTestEdit(*wrapper.getEngine(), 1);
+        expect(edit != nullptr, "Test edit must be created");
+        if (!edit)
+            return;
+
+        auto plugin = createCustomPlugin(*edit, magda::daw::audio::DrumGridPlugin::xmlTypeName);
+        auto* drumGrid = dynamic_cast<magda::daw::audio::DrumGridPlugin*>(plugin.get());
+        expect(drumGrid != nullptr, "DrumGrid plugin must be created");
+        if (drumGrid == nullptr)
+            return;
+
+        constexpr int padIndex = 0;
+        drumGrid->loadInternalPluginToPad(padIndex, "magda_polysynth");
+
+        const int midiNote = magda::daw::audio::DrumGridPlugin::baseNote + padIndex;
+        auto* chain = drumGrid->getChainForNote(midiNote);
+        expect(chain != nullptr, "Loading an internal instrument should create the pad chain");
+        if (chain == nullptr)
+            return;
+
+        expectEquals(static_cast<int>(chain->plugins.size()), 1,
+                     "Internal instrument should become the single pad voice");
+        expect(chain->plugins[0] != nullptr, "Pad voice plugin must exist");
+        if (chain->plugins[0] == nullptr)
+            return;
+        expect(chain->plugins[0]->getPluginType() == juce::String("magda_polysynth"),
+               "Pad voice should be the requested compiled instrument");
+        expect(drumGrid->getPluginDeviceId(chain->index, 0) != magda::INVALID_DEVICE_ID,
+               "Pad voice should get a stable MAGDA device id");
+
+        drumGrid->addInternalPluginToChain(chain->index, "eq");
+        expectEquals(static_cast<int>(chain->plugins.size()), 2,
+                     "Internal FX should append after the pad voice");
+
+        drumGrid->loadInternalPluginToPad(padIndex, "magda_fm");
+        chain = drumGrid->getChainForNote(midiNote);
+        expect(chain != nullptr, "Pad chain should still exist after replacing the voice");
+        if (chain == nullptr)
+            return;
+        expectEquals(static_cast<int>(chain->plugins.size()), 1,
+                     "Loading another instrument should replace the pad voice and clear old FX");
+        expect(chain->plugins[0] != nullptr &&
+                   chain->plugins[0]->getPluginType() == juce::String("magda_fm"),
+               "Pad voice should be replaced by the new internal instrument");
+    }
+
+    void testStepSequencerMidiThruMirrorsDeviceState() {
+        beginTest("Step sequencer MIDI thru mirrors DeviceInfo state");
+
+        auto& wrapper = magda::test::getSharedEngine();
+        auto* bridge = wrapper.getAudioBridge();
+        expect(bridge != nullptr, "Audio bridge must be available");
+        if (bridge == nullptr)
+            return;
+
+        auto& trackManager = magda::TrackManager::getInstance();
+        trackManager.clearAllTracks();
+        trackManager.setAudioEngine(&wrapper);
+
+        const auto trackId = trackManager.createTrack("MIDI Thru Mirror");
+        auto sequencer = makeInternalDevice(magda::INVALID_DEVICE_ID, "Step Sequencer",
+                                            magda::daw::audio::StepSequencerPlugin::xmlTypeName);
+        sequencer.canReceiveMidi = true;
+        sequencer.producesMidi = true;
+        sequencer.midiInThru = false;
+
+        const auto deviceId = trackManager.addDeviceToTrack(trackId, sequencer);
+        expect(deviceId != magda::INVALID_DEVICE_ID, "Step sequencer device must be added");
+        if (deviceId == magda::INVALID_DEVICE_ID) {
+            trackManager.clearAllTracks();
+            trackManager.setAudioEngine(nullptr);
+            return;
+        }
+
+        const auto devicePath = magda::ChainNodePath::topLevelDevice(trackId, deviceId);
+        bridge->syncTrackPlugins(trackId);
+
+        auto plugin = bridge->getPlugin(devicePath);
+        auto* seq = dynamic_cast<magda::daw::audio::StepSequencerPlugin*>(plugin.get());
+        expect(seq != nullptr, "Step sequencer runtime plugin must be created");
+        if (seq == nullptr) {
+            trackManager.clearAllTracks();
+            trackManager.setAudioEngine(nullptr);
+            return;
+        }
+
+        expect(!seq->midiThru.get(), "Runtime MIDI thru should load from DeviceInfo::midiInThru");
+
+        trackManager.setDeviceInChainMidiInThruByPath(devicePath, true);
+        expect(seq->midiThru.get(),
+               "Runtime MIDI thru should follow DeviceInfo when the header control enables it");
+
+        trackManager.setDeviceInChainMidiInThruByPath(devicePath, false);
+        expect(!seq->midiThru.get(),
+               "Runtime MIDI thru should follow DeviceInfo when the header control disables it");
+
+        trackManager.clearAllTracks();
+        trackManager.setAudioEngine(nullptr);
     }
 
     void testStepSequencerMidiThruPassesWhileStopped() {

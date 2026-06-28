@@ -1,6 +1,7 @@
 #include <algorithm>
 
 #include "../../core/InternalDeviceKind.hpp"
+#include "../../core/PluginCapabilities.hpp"
 #include "../../core/ViewModeState.hpp"
 #include "ProjectSerializer.hpp"
 #include "SerializationHelpers.hpp"
@@ -398,6 +399,8 @@ juce::var ProjectSerializer::serializeDeviceInfo(const DeviceInfo& device) {
     obj->setProperty("format", static_cast<int>(device.format));
     obj->setProperty("isInstrument", device.isInstrument);
     obj->setProperty("deviceType", static_cast<int>(device.deviceType));
+    if (device.browserCategoryOverride.isNotEmpty())
+        obj->setProperty("browserCategoryOverride", device.browserCategoryOverride);
     obj->setProperty("uniqueId", device.uniqueId);
     obj->setProperty("fileOrIdentifier", device.fileOrIdentifier);
     obj->setProperty("bypassed", device.bypassed);
@@ -481,6 +484,12 @@ juce::var ProjectSerializer::serializeDeviceInfo(const DeviceInfo& device) {
     if (device.canReceiveMidi) {
         obj->setProperty("canReceiveMidi", true);
     }
+    if (device.producesMidi) {
+        obj->setProperty("producesMidi", true);
+    }
+    // Always persisted: default is true, so a missing field must read back as
+    // true (old projects) and an explicit user-disabled false must survive.
+    obj->setProperty("midiInThru", device.midiInThru);
 
     // Per-instance drum kit rows
     if (!device.kitRows.empty()) {
@@ -527,6 +536,7 @@ bool ProjectSerializer::deserializeDeviceInfo(const juce::var& json, DeviceInfo&
             static_cast<DeviceType>(static_cast<int>(obj->getProperty("deviceType")));
     else
         outDevice.deviceType = outDevice.isInstrument ? DeviceType::Instrument : DeviceType::Effect;
+    outDevice.browserCategoryOverride = obj->getProperty("browserCategoryOverride").toString();
     outDevice.uniqueId = obj->getProperty("uniqueId").toString();
     outDevice.fileOrIdentifier = obj->getProperty("fileOrIdentifier").toString();
     outDevice.bypassed = obj->getProperty("bypassed");
@@ -638,6 +648,14 @@ bool ProjectSerializer::deserializeDeviceInfo(const juce::var& json, DeviceInfo&
     if (!canReceiveMidiVar.isVoid()) {
         outDevice.canReceiveMidi = static_cast<bool>(canReceiveMidiVar);
     }
+    auto producesMidiVar = obj->getProperty("producesMidi");
+    if (!producesMidiVar.isVoid()) {
+        outDevice.producesMidi = static_cast<bool>(producesMidiVar);
+    }
+    auto midiInThruVar = obj->getProperty("midiInThru");
+    if (!midiInThruVar.isVoid()) {
+        outDevice.midiInThru = static_cast<bool>(midiInThruVar);
+    }
 
     // Plugin native state
     if (obj->hasProperty("pluginState"))
@@ -667,6 +685,7 @@ bool ProjectSerializer::deserializeDeviceInfo(const juce::var& json, DeviceInfo&
         outDevice.sidechain.sourceTrackId = scObj->getProperty("sourceTrackId");
     }
 
+    applyCachedCapabilitiesToDevice(outDevice);
     return true;
 }
 
