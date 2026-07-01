@@ -1,5 +1,6 @@
 #include "AudioSettingsDialog.hpp"
 
+#include "../../audio/AudioDriverUtils.hpp"
 #include "../../core/Config.hpp"
 #include "../themes/DarkTheme.hpp"
 #include "../themes/DialogLookAndFeel.hpp"
@@ -368,6 +369,10 @@ AudioSettingsDialog::AudioSettingsDialog(juce::AudioDeviceManager* deviceManager
     );
     addAndMakeVisible(*deviceSelector_);
 
+    // Refresh the device combos whenever the driver type / device changes via the
+    // selector above, so they keep listing devices for the active driver.
+    deviceManager_->addChangeListener(this);
+
     // Create custom channel selectors for inputs and outputs
     inputChannelSelector_ =
         std::make_unique<CustomChannelSelector>(deviceManager, true, teDeviceManager);
@@ -405,7 +410,24 @@ AudioSettingsDialog::AudioSettingsDialog(juce::AudioDeviceManager* deviceManager
 }
 
 AudioSettingsDialog::~AudioSettingsDialog() {
+    deviceManager_->removeChangeListener(this);
     setLookAndFeel(nullptr);
+}
+
+void AudioSettingsDialog::changeListenerCallback(juce::ChangeBroadcaster* source) {
+    if (source != deviceManager_)
+        return;
+
+    // The active driver / device may have changed (e.g. user switched to ASIO in
+    // the selector). Re-list the combos against the now-current driver type.
+    populateDeviceLists();
+
+    if (auto* device = deviceManager_->getCurrentAudioDevice()) {
+        juce::String labelText = "Current Device: " + device->getName();
+        labelText += " (" + juce::String(device->getInputChannelNames().size()) + " in, ";
+        labelText += juce::String(device->getOutputChannelNames().size()) + " out)";
+        deviceNameLabel_.setText(labelText, juce::dontSendNotification);
+    }
 }
 
 void AudioSettingsDialog::paint(juce::Graphics& g) {
@@ -463,12 +485,12 @@ void AudioSettingsDialog::populateDeviceLists() {
     inputDeviceComboBox_.clear();
     outputDeviceComboBox_.clear();
 
-    auto& deviceTypes = deviceManager_->getAvailableDeviceTypes();
-    if (deviceTypes.isEmpty())
+    // List devices from the ACTIVE driver type (see activeDeviceTypeFor): using
+    // getAvailableDeviceTypes()[0] listed the wrong driver's devices once a
+    // non-first driver was selected, failing with "No such device".
+    auto* deviceType = activeDeviceTypeFor(*deviceManager_);
+    if (deviceType == nullptr)
         return;
-
-    // Get first device type (CoreAudio on macOS)
-    auto* deviceType = deviceTypes[0];
     deviceType->scanForDevices();
 
     auto inputDevices = deviceType->getDeviceNames(true);    // Get input devices
