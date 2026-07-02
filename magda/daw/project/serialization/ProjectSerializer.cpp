@@ -12,6 +12,8 @@
 
 namespace magda {
 
+thread_local juce::String ProjectSerializer::lastError_;
+
 // ============================================================================
 // File I/O with gzip compression
 // ============================================================================
@@ -598,39 +600,77 @@ void ProjectSerializer::commitStagedData(std::vector<TrackInfo>& stagedTracks,
     // are properly notified (prevents stale selection after project load)
     SelectionManager::getInstance().clearSelection();
 
-    // Clear all existing data from managers
-    trackManager.clearAllTracks();
-    clipManager.clearAllClips();
-    automationManager.clearAll();
+    // Coalesce the per-item structural notifications fired by the clear + restore
+    // below into a single one per manager. Without this, restoring N tracks fires
+    // notifyTracksChanged() N times, and each one rebuilds every track/mixer panel
+    // AND re-runs AudioBridge::syncAll() over all tracks -- O(N^2) work that hangs
+    // the UI for seconds on a large project. The batch fires one notification when
+    // the scope closes.
+    {
+        ClipManager::BatchScope clipBatch;
+        AutomationManager::BatchScope automationBatch;
 
-    // Restore tracks
-    for (auto& track : stagedTracks) {
-        trackManager.restoreTrack(track);
+        // Clear all existing data from managers
+        clipManager.clearAllClips();
+        automationManager.clearAll();
+
+        // Tear down the previous project's tracks OUTSIDE the restore batch, so
+        // clearAllTracks()'s notifyTracksChanged() fires immediately and runs
+        // AudioBridge::syncAll() against an empty track set. That removes the old
+        // TE AudioTracks and their synced plugins. If the clear is coalesced into
+        // the restore batch below, syncAll only ever sees the FINAL state, so the
+        // additive, path-keyed plugin sync finds Track[N] > Device[M] still
+        // present -- track/device IDs reset to 1 every project, so the paths
+        // collide across projects -- and skips recreating the plugin (it only
+        // creates devices whose path is absent). The device then becomes a dead
+        // husk: no editor, no processing. This is the "open A, open B, open A
+        // again -> VST has no UI and does nothing" bug. clearAllTracks fires a
+        // single teardown notification, so it does not reintroduce the O(N^2)
+        // fan-out the restore batch guards against.
+        trackManager.clearAllTracks();
+
+        // Restore tracks in their own batch that closes BEFORE clips are
+        // restored. Closing the track batch fires notifyTracksChanged() ->
+        // AudioBridge::syncAll(), which is what actually creates the TE
+        // AudioTracks (they are built lazily during plugin sync, not by
+        // restoreTrack). Clips must sync into existing TE tracks: ClipSynchronizer
+        // bails with "no TE track" if the track isn't there yet, silently dropping
+        // the clip's MIDI/audio. Restoring clips first (the previous behaviour)
+        // left arrangement clips out of the engine on load -> instruments silent.
+        {
+            TrackManager::BatchScope trackBatch;
+
+            for (auto& track : stagedTracks) {
+                trackManager.restoreTrack(track);
+            }
+
+            // After all tracks are restored, ensure TrackManager ID counters
+            // (track/device/rack/chain) are updated to avoid ID collisions.
+            trackManager.refreshIdCountersFromTracks();
+        }  // trackBatch closes here: TE AudioTracks now exist.
+
+        // Restore clips (synced into the now-existing TE tracks when clipBatch
+        // closes at the end of this scope).
+        for (auto& clip : stagedClips) {
+            clipManager.restoreClip(clip);
+        }
+
+        // Restore automation lanes
+        for (auto& lane : stagedAutomation) {
+            automationManager.restoreLane(lane);
+        }
+
+        // Restore automation clips
+        for (auto& clip : stagedAutomationClips) {
+            automationManager.restoreClip(clip);
+        }
+
+        // Update automation ID counters to avoid collisions
+        automationManager.refreshIdCountersFromLanes();
     }
 
-    // After all tracks are restored, ensure TrackManager ID counters
-    // (track/device/rack/chain) are updated to avoid ID collisions.
-    trackManager.refreshIdCountersFromTracks();
-
-    // Restore clips
-    for (auto& clip : stagedClips) {
-        clipManager.restoreClip(clip);
-    }
-
-    // Restore automation lanes
-    for (auto& lane : stagedAutomation) {
-        automationManager.restoreLane(lane);
-    }
-
-    // Restore automation clips
-    for (auto& clip : stagedAutomationClips) {
-        automationManager.restoreClip(clip);
-    }
-
-    // Update automation ID counters to avoid collisions
-    automationManager.refreshIdCountersFromLanes();
-
-    // Select the first track so the UI has a valid selection after load
+    // Select the first track so the UI has a valid selection after load. Done
+    // after the batch closes so panels exist and reflect the selection.
     if (!stagedTracks.empty()) {
         SelectionManager::getInstance().selectTrack(stagedTracks[0].id);
     }

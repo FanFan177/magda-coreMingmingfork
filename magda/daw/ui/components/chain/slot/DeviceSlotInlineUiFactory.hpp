@@ -1,9 +1,11 @@
 #pragma once
 
 #include <juce_gui_basics/juce_gui_basics.h>
+#include <tracktion_engine/tracktion_engine.h>
 
 #include <functional>
 #include <memory>
+#include <vector>
 
 #include "core/ChainNodePath.hpp"
 #include "core/DeviceInfo.hpp"
@@ -15,6 +17,8 @@ namespace magda::daw::ui {
 class CompiledDevicePanel;
 class FaustCustomView;
 class FaustUI;
+class LinkableTextSlider;
+struct DeviceSlotModulationContext;
 
 enum class DeviceSlotInlineUiKind {
     Compiled,
@@ -39,7 +43,23 @@ struct DeviceSlotInlineUiCallbacks {
     std::function<void(int, float)> onCompiledParamLinkAmountChanged;
     std::function<void(int)> onShowAutomationLane;
     std::function<magda::ChainNodePath()> getNodePath;
+    std::function<tracktion::engine::Plugin::Ptr()> getLivePlugin;
 };
+
+struct DeviceSlotInlineUiCallbackContext {
+    std::function<magda::ChainNodePath()> getNodePath;
+    std::function<void()> onLayoutChanged;
+    std::function<void()> onParamModulationChanged;
+    std::function<void()> onUpdateModsPanel;
+    std::function<void()> onUpdateMacroPanel;
+    std::function<void()> onShowDeviceModPanel;
+    std::function<void()> onShowDeviceMacroPanel;
+    std::function<void(int)> onShowAutomationLane;
+    std::function<tracktion::engine::Plugin::Ptr()> getLivePlugin;
+};
+
+DeviceSlotInlineUiCallbacks makeDeviceSlotInlineUiCallbacks(
+    DeviceSlotInlineUiCallbackContext context);
 
 DeviceSlotInlineUiKind createDeviceSlotInlineUi(const magda::DeviceInfo& device,
                                                 const DeviceSlotTraits& traits,
@@ -47,5 +67,26 @@ DeviceSlotInlineUiKind createDeviceSlotInlineUi(const magda::DeviceInfo& device,
                                                 juce::Component& parent,
                                                 DeviceSlotInlineUiStorage storage,
                                                 DeviceSlotInlineUiCallbacks callbacks);
+
+void bindDeviceSlotFaustInlineUi(const magda::ChainNodePath& nodePath, FaustUI* faustUI);
+
+void refreshDeviceSlotInlineUiPluginBindings(const magda::ChainNodePath& nodePath,
+                                             CompiledDevicePanel* compiledPanel,
+                                             DeviceCustomUIManager& customUI);
+
+void updateDeviceSlotInlineUi(const magda::DeviceInfo& device, CompiledDevicePanel* compiledPanel,
+                              DeviceCustomUIManager& customUI);
+
+void refreshDeviceSlotInlineUiParameterValues(const magda::DeviceInfo& device,
+                                              CompiledDevicePanel* compiledPanel,
+                                              DeviceCustomUIManager& customUI);
+
+void readAndPushDeviceSlotInlineUiModMatrix(magda::DeviceId deviceId,
+                                            DeviceCustomUIManager& customUI);
+
+void configureDeviceSlotLinkableSliders(
+    const std::vector<LinkableTextSlider*>& sliders, const magda::DeviceInfo& device,
+    const magda::ChainNodePath& nodePath, const DeviceSlotModulationContext& context,
+    std::function<void(LinkableTextSlider&)> configureCallbacks);
 
 }  // namespace magda::daw::ui

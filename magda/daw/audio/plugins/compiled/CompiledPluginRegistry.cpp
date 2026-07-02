@@ -1,11 +1,14 @@
 #include "CompiledPluginRegistry.hpp"
 
+#include "MagdaBellCompiledPlugin.hpp"
 #include "MagdaBitcrusherCompiledPlugin.hpp"
 #include "MagdaChorusCompiledPlugin.hpp"
+#include "MagdaClapCompiledPlugin.hpp"
 #include "MagdaClipperCompiledPlugin.hpp"
 #include "MagdaCompressorCompiledPlugin.hpp"
 #include "MagdaDelayCompiledPlugin.hpp"
 #include "MagdaDimensionCompiledPlugin.hpp"
+#include "MagdaDjembeCompiledPlugin.hpp"
 #include "MagdaEqCompiledPlugin.hpp"
 #include "MagdaFilterCompiledPlugin.hpp"
 #include "MagdaFlangerCompiledPlugin.hpp"
@@ -13,14 +16,20 @@
 #include "MagdaGateExpanderCompiledPlugin.hpp"
 #include "MagdaGrainDelayCompiledPlugin.hpp"
 #include "MagdaGritCompiledPlugin.hpp"
+#include "MagdaHatCompiledPlugin.hpp"
+#include "MagdaKickCompiledPlugin.hpp"
 #include "MagdaLimiterCompiledPlugin.hpp"
+#include "MagdaMarimbaCompiledPlugin.hpp"
 #include "MagdaModCompiledPlugin.hpp"
 #include "MagdaMultibandCompiledPlugin.hpp"
 #include "MagdaPhaserCompiledPlugin.hpp"
 #include "MagdaPitchCompiledPlugin.hpp"
+#include "MagdaPolySynthCompiledPlugin.hpp"
 #include "MagdaReverbCompiledPlugin.hpp"
 #include "MagdaRingModCompiledPlugin.hpp"
 #include "MagdaSaturatorCompiledPlugin.hpp"
+#include "MagdaSnareCompiledPlugin.hpp"
+#include "MagdaTomCompiledPlugin.hpp"
 #include "MagdaUtilityCompiledPlugin.hpp"
 #include "plugins/compiled/CompiledFaustInterface.hpp"
 #include "processors/CompiledFaustProcessor.hpp"
@@ -54,6 +63,16 @@ const CompiledPluginSpec& getMagdaDimensionSpec();
 const CompiledPluginSpec& getMagdaPitchSpec();
 const CompiledPluginSpec& getMagdaBitcrusherSpec();
 const CompiledPluginSpec& getMagdaUtilitySpec();
+const CompiledPluginSpec& getMagdaPolySynthSpec();
+const CompiledPluginSpec& getMagdaFMSpec();
+const CompiledPluginSpec& getMagdaKickSpec();
+const CompiledPluginSpec& getMagdaSnareSpec();
+const CompiledPluginSpec& getMagdaClapSpec();
+const CompiledPluginSpec& getMagdaHatSpec();
+const CompiledPluginSpec& getMagdaTomSpec();
+const CompiledPluginSpec& getMagdaMarimbaSpec();
+const CompiledPluginSpec& getMagdaDjembeSpec();
+const CompiledPluginSpec& getMagdaBellSpec();
 
 namespace {
 
@@ -65,7 +84,10 @@ const CompiledPluginSpec* const kAllSpecs[] = {
     &getMagdaFreqShiftSpec(),  &getMagdaLimiterSpec(),    &getMagdaGateExpanderSpec(),
     &getMagdaClipperSpec(),    &getMagdaReverbSpec(),     &getMagdaEqSpec(),
     &getMagdaDimensionSpec(),  &getMagdaPitchSpec(),      &getMagdaBitcrusherSpec(),
-    &getMagdaUtilitySpec(),
+    &getMagdaUtilitySpec(),    &getMagdaPolySynthSpec(),  &getMagdaFMSpec(),
+    &getMagdaKickSpec(),       &getMagdaSnareSpec(),      &getMagdaClapSpec(),
+    &getMagdaHatSpec(),        &getMagdaTomSpec(),        &getMagdaMarimbaSpec(),
+    &getMagdaDjembeSpec(),     &getMagdaBellSpec(),
 };
 
 }  // namespace

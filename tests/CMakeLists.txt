@@ -30,6 +30,7 @@ set(TEST_SOURCES
     test_plugin_loading.cpp
     test_plugin_format.cpp
     test_plugin_window_manager.cpp
+    test_plugin_capabilities.cpp
     test_plugin_preferences.cpp
     test_prune_missing_plugins.cpp
     test_known_plugin_list_duplicates.cpp
@@ -157,8 +158,8 @@ target_link_libraries(magda_tests
     magda_agents
     magda_scripting
     Catch2::Catch2WithMain
-    juce::juce_core
-    juce::juce_gui_basics
+    # JUCE (core + gui_basics) comes transitively from magda_daw, compiled once
+    # there; direct links would recompile the JUCE stack into this target.
 )
 
 # Include directories
@@ -241,6 +242,7 @@ target_sources(magda_juce_tests PRIVATE
     test_arrangement_transport_loop_juce.cpp
     test_external_plugin_state_restore_juce.cpp
     test_chord_progression_converter_juce.cpp
+    test_audio_driver_type_selection_juce.cpp
     ../magda/daw/ui/components/chain/slot/StepSequencerClipExport.cpp
 )
 
@@ -248,10 +250,8 @@ target_sources(magda_juce_tests PRIVATE
 target_link_libraries(magda_juce_tests
     PRIVATE
     magda_daw
-    magda_agents
-    juce::juce_core
-    juce::juce_events
-    juce::juce_gui_basics
+    # JUCE (core/events/gui_basics) comes transitively from magda_daw, compiled
+    # once there; direct links would recompile the JUCE stack into this target.
     # Linux: juce_gui_extra is pulled in transitively via magda_daw's
     # JUCE_MODULE_AVAILABLE flags (so its .cpp gets compiled into this
     # target). Its compilation requires GTK / WebKit headers — expose
@@ -303,7 +303,6 @@ add_test(NAME tempo_lane_sync_juce
 
 add_test(NAME midi_bridge_note_events_juce
          COMMAND magda_juce_tests "MidiBridge Note Events Tests")
-
 add_test(NAME external_plugin_state_restore_juce
          COMMAND magda_juce_tests "External Plugin State Restore Tests")
 

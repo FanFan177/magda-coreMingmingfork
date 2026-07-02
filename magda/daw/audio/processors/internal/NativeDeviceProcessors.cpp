@@ -3,6 +3,7 @@
 #include <utility>
 
 #include "core/ParameterUtils.hpp"
+#include "plugins/FaustInstrumentPlugin.hpp"
 #include "plugins/FaustParamInfo.hpp"
 #include "plugins/FaustParamPool.hpp"
 #include "plugins/FaustPlugin.hpp"
@@ -16,12 +17,47 @@ namespace magda {
 MagdaSamplerProcessor::MagdaSamplerProcessor(DeviceId deviceId, te::Plugin::Ptr plugin)
     : AutomatablePluginProcessor(deviceId, std::move(plugin)) {}
 
+MutableElementsProcessor::MutableElementsProcessor(DeviceId deviceId, te::Plugin::Ptr plugin)
+    : AutomatablePluginProcessor(deviceId, std::move(plugin)) {}
+
+MutableRingsProcessor::MutableRingsProcessor(DeviceId deviceId, te::Plugin::Ptr plugin)
+    : AutomatablePluginProcessor(deviceId, std::move(plugin)) {}
+
+MutableCloudsProcessor::MutableCloudsProcessor(DeviceId deviceId, te::Plugin::Ptr plugin)
+    : AutomatablePluginProcessor(deviceId, std::move(plugin)) {}
+
 // =============================================================================
 // FourOscProcessor
 // =============================================================================
 
 FourOscProcessor::FourOscProcessor(DeviceId deviceId, te::Plugin::Ptr plugin)
     : AutomatablePluginProcessor(deviceId, std::move(plugin)) {}
+
+std::optional<FourOscPluginState> FourOscProcessor::capturePluginState(te::Plugin* plugin) {
+    auto* fourOsc = dynamic_cast<te::FourOscPlugin*>(plugin);
+    if (fourOsc == nullptr)
+        return std::nullopt;
+
+    FourOscPluginState state;
+    for (int i = 0; i < 4; ++i) {
+        state.oscWaveShape[i] = fourOsc->oscParams[i]->waveShapeValue.get();
+        state.oscVoices[i] = fourOsc->oscParams[i]->voicesValue.get();
+    }
+    state.filterType = fourOsc->filterTypeValue.get();
+    state.filterSlope = fourOsc->filterSlopeValue.get();
+    state.ampAnalog = fourOsc->ampAnalogValue.get();
+    for (int i = 0; i < 2; ++i) {
+        state.lfoWaveShape[i] = fourOsc->lfoParams[i]->waveShapeValue.get();
+        state.lfoSync[i] = fourOsc->lfoParams[i]->syncValue.get();
+    }
+    state.distortionOn = fourOsc->distortionOnValue.get();
+    state.reverbOn = fourOsc->reverbOnValue.get();
+    state.delayOn = fourOsc->delayOnValue.get();
+    state.chorusOn = fourOsc->chorusOnValue.get();
+    state.voiceMode = fourOsc->voiceModeValue.get();
+    state.globalVoices = fourOsc->voicesValue.get();
+    return state;
+}
 
 void FourOscProcessor::customiseParameterInfo(int index, ParameterInfo& info) const {
     // filterFreq stores a MIDI note in 0..135.076 that TE turns into Hz via
@@ -122,6 +158,70 @@ void FaustProcessor::setParameterByIndex(int paramIndex, float value) {
 }
 
 float FaustProcessor::getParameterByIndex(int paramIndex) const {
+    if (!plugin_)
+        return 0.0f;
+    auto params = plugin_->getAutomatableParameters();
+    if (paramIndex >= 0 && paramIndex < params.size()) {
+        const auto info = getParameterInfo(paramIndex);
+        return ParameterUtils::normalizedToReal(params[paramIndex]->getCurrentValue(), info);
+    }
+    return 0.0f;
+}
+
+// =============================================================================
+// FaustInstrumentProcessor
+// =============================================================================
+
+FaustInstrumentProcessor::FaustInstrumentProcessor(DeviceId deviceId, te::Plugin::Ptr plugin)
+    : DeviceProcessor(deviceId, std::move(plugin)) {}
+
+int FaustInstrumentProcessor::getParameterCount() const {
+    auto* faust = dynamic_cast<daw::audio::FaustInstrumentPlugin*>(plugin_.get());
+    if (faust == nullptr)
+        return 0;
+    return faust->getPool().activeCount();
+}
+
+ParameterInfo FaustInstrumentProcessor::getParameterInfo(int index) const {
+    auto* faust = dynamic_cast<daw::audio::FaustInstrumentPlugin*>(plugin_.get());
+    if (faust == nullptr || index < 0 || index >= daw::audio::FaustParamPool::kSize)
+        return {};
+    return daw::audio::paramInfoFromSlot(faust->getPool().slot(index));
+}
+
+void FaustInstrumentProcessor::populateParameters(DeviceInfo& info) const {
+    info.parameters.clear();
+    auto* faust = dynamic_cast<daw::audio::FaustInstrumentPlugin*>(plugin_.get());
+    if (faust == nullptr)
+        return;
+    // Only push active slots; each ParameterInfo carries its real slot index in
+    // `paramIndex` so links / automation / MIDI Learn bind to the stable slot.
+    auto params = plugin_->getAutomatableParameters();
+    for (int i = 0; i < daw::audio::FaustParamPool::kSize; ++i) {
+        const auto& slot = faust->getPool().slot(i);
+        if (slot.active) {
+            auto paramInfo = daw::audio::paramInfoFromSlot(slot);
+            if (i >= 0 && i < params.size() && params[i]) {
+                paramInfo.currentValue =
+                    ParameterUtils::normalizedToReal(params[i]->getCurrentValue(), paramInfo);
+            }
+            info.parameters.push_back(std::move(paramInfo));
+        }
+    }
+}
+
+void FaustInstrumentProcessor::setParameterByIndex(int paramIndex, float value) {
+    if (!plugin_)
+        return;
+    auto params = plugin_->getAutomatableParameters();
+    if (paramIndex >= 0 && paramIndex < params.size()) {
+        const auto info = getParameterInfo(paramIndex);
+        const float normalised = ParameterUtils::realToNormalized(value, info);
+        params[paramIndex]->setParameterFromHost(normalised, juce::sendNotificationSync);
+    }
+}
+
+float FaustInstrumentProcessor::getParameterByIndex(int paramIndex) const {
     if (!plugin_)
         return 0.0f;
     auto params = plugin_->getAutomatableParameters();

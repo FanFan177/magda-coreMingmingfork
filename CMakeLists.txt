@@ -82,13 +82,29 @@ endif()
 
 # Compiler flags
 if(MSVC)
-    set(CMAKE_CXX_FLAGS_DEBUG "/Zi /Od /W3")
+    # Debug uses /Z7 (debug info embedded in each .obj) rather than /Zi (a
+    # separate, shared compile-time PDB). /Z7 has no shared PDB, so:
+    #   - parallel cl.exe workers never contend on a PDB (no /FS needed), and
+    #   - the .obj is self-contained, which is what makes ccache able to cache
+    #     MSVC Debug builds. /Zi can't be cached (the PDB write is a side effect
+    #     ccache can't replay) - that's what broke the earlier sccache attempt.
+    # Release still ships a real PDB for crash symbolication via per-target /Zi
+    # in magda/daw/CMakeLists.txt, so /FS is scoped to Release only.
+    # Override BOTH languages: C dependencies built via FetchContent (lua) still
+    # default to /Zi, which reintroduces the shared compile-time PDB this switch
+    # exists to remove. ccache can't replay the PDB side effect, so /Zi C objects
+    # race on mspdbsrv under -j and fail with "C1090 PDB API call failed".
+    set(CMAKE_C_FLAGS_DEBUG "/Z7 /Od /W3")
+    set(CMAKE_CXX_FLAGS_DEBUG "/Z7 /Od /W3")
     set(CMAKE_CXX_FLAGS_RELEASE "/O2 /DNDEBUG")
-    # /FS serialises PDB writes across parallel cl.exe workers (required with
-    # /Zi when the build runs with -j >1). Added via add_compile_options so it
-    # composes with CMake's default MSVC init flags (/DWIN32 /_WINDOWS /EHsc etc.)
-    # instead of replacing them like a top-level -DCMAKE_CXX_FLAGS would.
-    add_compile_options(/FS)
+    # /FS serialises PDB writes across parallel cl.exe workers, required with the
+    # Release per-target /Zi. Added via add_compile_options so it composes with
+    # CMake's default MSVC init flags instead of replacing them.
+    add_compile_options($<$<CONFIG:Release>:/FS>)
+    # NOMINMAX: stop <windows.h> defining min()/max() macros, which clobber
+    # std::min/std::max. The Faust poly instruments (poly-dsp.h) transitively
+    # pull in <windows.h>, so without this they fail to compile on MSVC.
+    add_compile_definitions(NOMINMAX)
     # /OPT:REF,ICF preserve release dead-stripping; /Zi + /DEBUG applied per-target (see magda/daw/CMakeLists.txt)
     string(APPEND CMAKE_EXE_LINKER_FLAGS_RELEASE " /OPT:REF /OPT:ICF")
 else()
@@ -148,6 +164,12 @@ set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 
 # gRPC removed - using simple in-process agent system instead
 
+# Hide host symbols by default so hosted plugins with their own static JUCE copy
+# cannot bind to MAGDA's JUCE definitions at load time.
+set(CMAKE_C_VISIBILITY_PRESET hidden)
+set(CMAKE_CXX_VISIBILITY_PRESET hidden)
+set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
+
 # Tracktion Engine for DAW functionality (using local submodule)
 add_subdirectory(third_party/tracktion_engine)
 
@@ -178,6 +200,14 @@ add_subdirectory(third_party/llama.cpp)
 # llama.cpp doesn't need C++20; building as C++17 avoids MSVC char8_t errors
 if(MSVC)
     set_target_properties(llama PROPERTIES CXX_STANDARD 17)
+    # Vendored llama.cpp leans on implicit numeric conversions (size_t->int,
+    # double->float, etc.), so MSVC emits ~750 benign C4244/C4267/C4305
+    # warnings from src/ and src/models/. Not our code, not actionable, and the
+    # diagnostic volume slows the build; silence them on the llama target.
+    # C4101 = unreferenced local variable (also upstream, also benign).
+    if(TARGET llama)
+        target_compile_options(llama PRIVATE /wd4244 /wd4267 /wd4305 /wd4101)
+    endif()
 endif()
 
 # Faust — runtime DSP compilation. Free tier uses the interpreter backend (no
@@ -243,14 +273,25 @@ add_library(faust::libfaust ALIAS staticlib)
 # error. Define `_MBCS` for Faust's staticlib AND the `faust` executable
 # (both compile compatibility.cpp) so they take the narrow branch
 # upstream Faust expects on Windows; other targets are untouched.
+# The Faust compiler library is vendored third-party code (~390 TUs) that
+# leans on implicit numeric conversions and variable shadowing, flooding the
+# build with benign warnings: MSVC C4244/C4267/C4305, GCC/Clang -Wshadow /
+# -Wunused-* / -Wcast-function-type, etc. None are actionable in code we don't
+# own, and the diagnostic volume slows the build, so silence warnings on both
+# Faust targets. MSVC additionally needs _MBCS (see above).
 if(MSVC)
-    if(TARGET staticlib)
-        target_compile_definitions(staticlib PRIVATE _MBCS)
-    endif()
-    if(TARGET faust)
-        target_compile_definitions(faust PRIVATE _MBCS)
-    endif()
+    set(_faust_quiet /wd4244 /wd4267 /wd4305)
+else()
+    set(_faust_quiet -w)
 endif()
+foreach(_faust_target staticlib faust)
+    if(TARGET ${_faust_target})
+        target_compile_options(${_faust_target} PRIVATE ${_faust_quiet})
+        if(MSVC)
+            target_compile_definitions(${_faust_target} PRIVATE _MBCS)
+        endif()
+    endif()
+endforeach()
 
 # ----------------------------------------------------------------------------
 # magda_compile_faust_dsp(<dsp_file> <class_name> <out_var>)
@@ -355,6 +396,64 @@ if(MAGDA_HAVE_CLAP)
 endif()
 
 # Simple agent system - no external dependencies needed
+
+# Mutable Instruments DSP (Elements / Rings / Clouds) - native ports (#1581).
+# Trimmed MIT fork at third_party/eurorack: stmlib + the three modules' DSP only.
+# Built with TEST so stmlib substitutes its portable C paths for the Cortex-M4
+# inline asm (saturating arithmetic, sqrt) and drops firmware section attrs;
+# the results are numerically equivalent. TEST is PUBLIC so any consumer that
+# includes these headers gets the same portable path (magda-core uses no bare
+# TEST macro of its own, so there is no collision).
+set(MI_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/third_party/eurorack)
+file(GLOB MI_SOURCES CONFIGURE_DEPENDS
+    ${MI_ROOT}/elements/dsp/*.cc
+    ${MI_ROOT}/elements/resources.cc
+    ${MI_ROOT}/rings/dsp/*.cc
+    ${MI_ROOT}/rings/resources.cc
+    ${MI_ROOT}/clouds/dsp/*.cc
+    ${MI_ROOT}/clouds/dsp/pvoc/*.cc
+    ${MI_ROOT}/clouds/resources.cc
+    ${MI_ROOT}/stmlib/utils/random.cc
+    ${MI_ROOT}/stmlib/dsp/atan.cc
+    ${MI_ROOT}/stmlib/dsp/units.cc
+)
+add_library(magda_mutable STATIC ${MI_SOURCES})
+target_include_directories(magda_mutable PUBLIC ${MI_ROOT})
+target_compile_definitions(magda_mutable PUBLIC TEST)
+if(MSVC)
+    target_compile_definitions(magda_mutable PUBLIC _USE_MATH_DEFINES)
+
+    # This is vendored Mutable Instruments DSP. It leans on implicit numeric
+    # conversions throughout (double literals -> float, size_t -> int32, etc.),
+    # so MSVC emits a flood of benign conversion warnings across stmlib headers
+    # and every dsp/*.cc - tens of thousands of them, whose formatting + log
+    # I/O measurably slow the build. We don't own this code and these are not
+    # actionable, so silence them for the whole target:
+    #   C4305 - truncation double -> float (the literal tables, the worst spam)
+    #   C4244 - conversion, possible loss of data
+    #   C4267 - size_t -> smaller int conversion
+    target_compile_options(magda_mutable PRIVATE /wd4305 /wd4244 /wd4267)
+
+    # The generated resources.cc files are giant brace-initialised const float
+    # lookup tables (elements/resources.cc alone is ~44k lines of FP literals).
+    # MSVC's optimiser is pathologically slow constant-folding huge static
+    # initialiser lists, so /O2 burns minutes on data it can't optimise. Disable
+    # optimisation for just these TUs: pure tables, zero runtime cost.
+    # TARGET_DIRECTORY scopes the per-file flag to magda_mutable (supported since
+    # CMake 3.18; verified the flag actually lands).
+    set_source_files_properties(
+        ${MI_ROOT}/elements/resources.cc
+        ${MI_ROOT}/rings/resources.cc
+        ${MI_ROOT}/clouds/resources.cc
+        TARGET_DIRECTORY magda_mutable
+        PROPERTIES COMPILE_OPTIONS "/Od")
+else()
+    # Same vendored-DSP rationale on GCC/Clang: shadowing + unused-var warnings
+    # from stmlib headers and dsp/*.cc that we won't fix. Silence them.
+    target_compile_options(magda_mutable PRIVATE -w)
+endif()
+set_target_properties(magda_mutable PROPERTIES POSITION_INDEPENDENT_CODE ON)
+add_library(magda::mutable ALIAS magda_mutable)
 
 # Product-based subdirectories
 add_subdirectory(magda/daw)
