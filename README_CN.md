@@ -18,7 +18,8 @@
 
 ---
 MAGDA是一款免费的, 深度集成 AI 的开源数字音频工作站（DAW），基于 C++20、JUCE 框架与 Tracktion 音频引擎开发.
- - [English](README.md) | **简体中文** 
+ - [English](README.md) | **简体中文**
+ - [**直接下载发行包**](https://github.com/Conceptual-Machines/magda-core/releases)
 
 ### 特性
 
@@ -56,6 +57,16 @@ macos下载 `brew install git-lfs`   ,
 Debian/Ubuntu下载 `apt install git-lfs`   ,
 Windows下载 `choco install git-lfs`   ,
 然后每台设备执行一次 `git lfs install` 完成初始化
+- **WIndows的额外操作:** [vcpkg](https://github.com/microsoft/vcpkg) 提供 libxml2 库
+  (**Windows 系统没有自带该库**). 只需克隆仓库并完成一次初始化引导，再配置环境变量 
+  `VCPKG_ROOT` 指向仓库本地目录 —— 构建流程会自动识别该变量，首次配置时会依据 `vcpkg.json`
+  清单文件自动安装 libxml2。(macOS / Linux 系统自带 libxml2，因此无需使用 vcpkg)
+
+  ```powershell
+  git clone https://github.com/microsoft/vcpkg C:\vcpkg
+  C:\vcpkg\bootstrap-vcpkg.bat
+  setx VCPKG_ROOT C:\vcpkg   # reopen the shell so it takes effect
+  ```
 
 ### Quick Start快速上手
 
